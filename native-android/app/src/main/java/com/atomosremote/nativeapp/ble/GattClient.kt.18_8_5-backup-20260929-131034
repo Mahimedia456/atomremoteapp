@@ -1,0 +1,3123 @@
+package com.atomosremote.nativeapp.ble
+
+import android.annotation.SuppressLint
+import android.bluetooth.*
+import android.content.BroadcastReceiver
+import android.content.Context
+import android.content.Intent
+import android.content.IntentFilter
+import android.os.Build
+import android.os.Handler
+import android.os.Looper
+import android.util.Log
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import java.io.ByteArrayOutputStream
+import java.nio.charset.Charset
+import java.security.SecureRandom
+import java.util.ArrayDeque
+import java.util.UUID
+
+/**
+ * Native BLE/GATT client for ATOMOS Shogun Ultra.
+ *
+ * 18.8 preserves the proven official TCS pairing state machine byte-for-byte and
+ * ports the supplied macOS TCSiOSC TCSPacketLink transport as a real
+ * READY -> WRITING -> READING state machine. Post-accept frame-count/timecode sync
+ * remains intact; pairing writes and acceptance math are not modified.
+ * 18.0 ports the application pairing state machine recovered from the official
+ * macOS AtomRemote 1.2.5 TCSiOSC framework. The Android app stays BLE central:
+ * read ID slots, write the 9-digit Connect Name, write CCID, receive BCID, then
+ * on explicit user confirmation write bitwise-NOT CCID. No Android createBond()
+ * call and no guessed S1C/BTPR transport is used for this pairing gate.
+ */
+class GattClient(context: Context) {
+    private val appContext = context.applicationContext
+    private val mainHandler = Handler(Looper.getMainLooper())
+
+    private var gatt: BluetoothGatt? = null
+    private var targetDevice: BluetoothDevice? = null
+    private var retryCount = 0
+    private var receiverRegistered = false
+    private var linkStartedAtMs = 0L
+    private var prePairCaptureStartedForConnection = false
+    private var passivePairCaptureStartedForConnection = false
+    private val secureRandom = SecureRandom()
+
+    private val _state = MutableStateFlow("idle")
+    val state: StateFlow<String> = _state
+
+    private val _bondState = MutableStateFlow("none")
+    val bondState: StateFlow<String> = _bondState
+
+    private val _disconnectReason = MutableStateFlow<String?>(null)
+    val disconnectReason: StateFlow<String?> = _disconnectReason
+
+    private val _snapshot = MutableStateFlow<GattSnapshot?>(null)
+    val snapshot: StateFlow<GattSnapshot?> = _snapshot
+
+    private val _tcsPairingState = MutableStateFlow(TcsPairingState())
+    val tcsPairingState: StateFlow<TcsPairingState> = _tcsPairingState
+
+    private val _tcsRemoteState = MutableStateFlow(TcsRemoteState())
+    val tcsRemoteState: StateFlow<TcsRemoteState> = _tcsRemoteState
+
+    // Legacy mirrors retained for UI/debug compatibility. 18.8 transport truth is
+    // TcsPacketLinkTransport below. Official DidConnect starts first=1/credit=0,
+    // produces the F0 prime turn; official macOS RemoteApi AtomMessage subclasses use m_isLocal=1.
+    private var tcsCommandSequence: Int = 0
+    private var tcsPacketFirstSubpacket: Boolean = true
+    private var tcsPacketRemoteCredit: Boolean = false
+    // TCSBleMonitor.packetLinkTimer in the supplied macOS AtomRemote executable
+    // runs every 0.01 s and calls TCSBleManager_PacketLinkProcessTick. 18.4 was
+    // missing this process loop, so it treated the first flow-control-only E0 as
+    // a completed RemoteApi transaction and never pulled the later payload.
+    private var tcsPacketLocalFlag: Boolean = false
+    private var packetLinkProcessEnabled: Boolean = false
+    private var remoteEmptyPolls: Int = 0
+    private var remoteResponseStartedAtMs: Long = 0L
+    private var remoteResponseTimeout: Runnable? = null
+    private var remoteBootstrapSettle: Runnable? = null
+    private val remoteRxBuffer = ByteArrayOutputStream()
+    private val packetLinkProcessTick = object : Runnable {
+        override fun run() {
+            if (!packetLinkProcessEnabled) return
+            drivePacketLink18_8()
+            mainHandler.postDelayed(this, PACKET_LINK_PROCESS_TICK_MS)
+        }
+    }
+
+    private data class PendingRemotePacket(
+        val body: ByteArray,
+        val purpose: String,
+        val label: String,
+        val commandId: Int,
+        val packetId: Int,
+        val expectedResponseId: Int? = null,
+        val bootstrap: Boolean = false
+    )
+
+    private data class RemoteBootstrapQuery(
+        val commandId: Int,
+        val expectedResponseId: Int,
+        val label: String
+    )
+
+    private var pendingRemotePacket: PendingRemotePacket? = null
+    private var pendingRemoteFrameWritten: Boolean = false
+    private val remoteBootstrapQueue = ArrayDeque<RemoteBootstrapQuery>()
+    private var remoteBootstrapActive = false
+    private var remoteBootstrapCompleted = false
+    private var remoteBootstrapResponses = 0
+
+    // Official TCSBleManager CONNECTED lifecycle. The macOS framework does not jump
+    // directly from ~CCID acceptance to LINKED. It first subscribes cxtic0 frame-count,
+    // waits for a frame update, reads cxtic1 timecode, and only then exposes PacketLink.
+    private var connectedLifecycleArmed = false
+    private var connectedFrameCountCccdReady = false
+    private var connectedLifecycleReady = false
+    // 18.8.2: the official TCS LINKED path opens PacketLink on a fresh BLE
+    // connection after the accepted CONNECTED session. This flag survives
+    // closeGattOnly() so the new services-ready callback can finish that handoff.
+    private var officialLinkedReconnectPending = false
+    private var connectedTimecodeReadPending = false
+    private var connectedDeviceNameCountdown = 3
+    private var connectedLastFrameCount = -1
+    private var connectedLastTimecodeReadAtMs = 0L
+    private var connectedSyncTimeout: Runnable? = null
+
+    // 18.8: direct port of the official macOS TCSPacketLink READY/WRITING/READING
+    // state machine. Pairing remains completely separate from this transport.
+    private val packetLink18 = TcsPacketLinkTransport()
+    private var packetLink18Primed = false
+
+    private val _events = MutableStateFlow<List<String>>(emptyList())
+    val events: StateFlow<List<String>> = _events
+
+    private val values = linkedMapOf<String, ByteArray>()
+    private val asciiLineBuffer = StringBuilder()
+    private var address: String = ""
+
+    private sealed interface PendingOp {
+        data class Read(
+            val characteristic: BluetoothGattCharacteristic,
+            val purpose: String? = null
+        ) : PendingOp
+        data class WriteDescriptor(
+            val descriptor: BluetoothGattDescriptor,
+            val value: ByteArray,
+            val purpose: String? = null
+        ) : PendingOp
+        data class WriteCharacteristic(
+            val characteristic: BluetoothGattCharacteristic,
+            val value: ByteArray,
+            val writeType: Int = BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT,
+            val purpose: String
+        ) : PendingOp
+    }
+
+    private val pendingOps = ArrayDeque<PendingOp>()
+    private var activeOp: PendingOp? = null
+    private var operationInFlight = false
+    private var operationTimeout: Runnable? = null
+    private var connectionTimeout: Runnable? = null
+
+    init {
+        registerBondReceiver()
+    }
+
+    @SuppressLint("MissingPermission")
+    fun connect(device: BluetoothDevice) {
+        targetDevice = device
+        address = device.address
+        retryCount = 0
+        values.clear()
+        asciiLineBuffer.clear()
+        _snapshot.value = null
+        _tcsPairingState.value = TcsPairingState()
+        _tcsRemoteState.value = TcsRemoteState()
+        officialLinkedReconnectPending = false
+        tcsCommandSequence = 0
+        tcsPacketFirstSubpacket = true
+        tcsPacketRemoteCredit = false
+        tcsPacketLocalFlag = false
+        pendingRemotePacket = null
+        pendingRemoteFrameWritten = false
+        remoteBootstrapQueue.clear()
+        remoteBootstrapActive = false
+        remoteBootstrapCompleted = false
+        remoteBootstrapResponses = 0
+        connectedLifecycleArmed = false
+        connectedFrameCountCccdReady = false
+        connectedLifecycleReady = false
+        connectedTimecodeReadPending = false
+        connectedDeviceNameCountdown = 3
+        connectedLastFrameCount = -1
+        connectedLastTimecodeReadAtMs = 0L
+        cancelConnectedSyncTimeout()
+        remoteEmptyPolls = 0
+        remoteResponseStartedAtMs = 0L
+        cancelRemoteResponseTimeout()
+        cancelRemoteBootstrapSettle()
+        remoteRxBuffer.reset()
+        stopPacketLinkProcessLoop()
+        packetLink18.didDisconnect()
+        packetLink18Primed = false
+        _disconnectReason.value = null
+        updateBondState(device.bondState)
+
+        // ATOMOS documents an application-level Pairing ID flow. Do not block the BLE
+        // transport waiting for Android's OS bond state and do not create a bond here.
+        openGatt(device)
+    }
+
+    @SuppressLint("MissingPermission")
+    fun retry() {
+        val device = targetDevice ?: return
+        closeGattOnly()
+        retryCount = 0
+        _disconnectReason.value = null
+        updateBondState(device.bondState)
+        openGatt(device)
+    }
+
+    @SuppressLint("MissingPermission")
+    private fun openGatt(device: BluetoothDevice) {
+        closeGattOnly()
+        pendingOps.clear()
+        activeOp = null
+        operationInFlight = false
+        prePairCaptureStartedForConnection = false
+        passivePairCaptureStartedForConnection = false
+        _state.value = "connecting"
+        appendEvent("GATT connect -> ${device.address}, osBond=${bondLabel(device.bondState)}")
+        gatt = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+            device.connectGatt(appContext, false, callback, BluetoothDevice.TRANSPORT_LE)
+        } else {
+            device.connectGatt(appContext, false, callback)
+        }
+        armConnectionTimeout(device)
+    }
+
+    @SuppressLint("MissingPermission")
+    fun clearAndroidBondAndRetry(): Boolean {
+        val device = targetDevice ?: return false
+        closeGattOnly()
+        if (device.bondState == BluetoothDevice.BOND_NONE) {
+            appendEvent("Android OS bond already clear; reconnecting")
+            mainHandler.postDelayed({ openGatt(device) }, 500L)
+            return true
+        }
+        val removed = runCatching {
+            val method = device.javaClass.getMethod("removeBond")
+            method.invoke(device) as? Boolean ?: false
+        }.getOrDefault(false)
+        appendEvent(if (removed) "Requested removal of stale Android OS bond" else "Could not remove Android OS bond programmatically; forget the device in Android Bluetooth settings")
+        if (removed) {
+            mainHandler.postDelayed({ openGatt(device) }, 1400L)
+        }
+        return removed
+    }
+
+    private fun armConnectionTimeout(device: BluetoothDevice) {
+        cancelConnectionTimeout()
+        val task = Runnable {
+            if (_state.value != "connecting" && _state.value != "retrying") return@Runnable
+            appendEvent("BLE connect timeout after 8 seconds -> ${device.address}")
+            _disconnectReason.value = "BLE connect timeout after 8 seconds"
+            _state.value = "error:connect-timeout"
+            closeGattOnly()
+        }
+        connectionTimeout = task
+        mainHandler.postDelayed(task, 8_000L)
+    }
+
+    private fun cancelConnectionTimeout() {
+        connectionTimeout?.let { mainHandler.removeCallbacks(it) }
+        connectionTimeout = null
+    }
+
+    @SuppressLint("MissingPermission")
+    fun disconnect() {
+        pendingOps.clear()
+        activeOp = null
+        operationInFlight = false
+        closeGattOnly()
+        _disconnectReason.value = null
+        _state.value = "idle"
+    }
+
+    fun close() {
+        disconnect()
+        if (receiverRegistered) {
+            runCatching { appContext.unregisterReceiver(bondReceiver) }
+            receiverRegistered = false
+        }
+    }
+
+    @SuppressLint("MissingPermission")
+    private fun closeGattOnly() {
+        cancelOperationTimeout()
+        cancelConnectionTimeout()
+        cancelRemoteResponseTimeout()
+        cancelRemoteBootstrapSettle()
+        cancelConnectedSyncTimeout()
+        connectedLifecycleArmed = false
+        connectedFrameCountCccdReady = false
+        connectedLifecycleReady = false
+        connectedTimecodeReadPending = false
+        connectedDeviceNameCountdown = 3
+        connectedLastFrameCount = -1
+        connectedLastTimecodeReadAtMs = 0L
+        remoteRxBuffer.reset()
+        stopPacketLinkProcessLoop()
+        pendingRemotePacket = null
+        pendingRemoteFrameWritten = false
+        activeOp = null
+        operationInFlight = false
+        val current = gatt
+        gatt = null
+        if (current != null) {
+            runCatching { current.disconnect() }
+            runCatching { current.close() }
+        }
+    }
+
+    @SuppressLint("MissingPermission")
+    fun write(serviceUuid: String, characteristicUuid: String, value: ByteArray, withResponse: Boolean): Boolean {
+        val current = gatt ?: return false
+        if (_state.value != "services-ready") return false
+        if (operationInFlight || pendingOps.isNotEmpty()) return false
+        if (serviceUuid.equals(AIRGLU_SHOGUN_SERVICE_UUID, ignoreCase = true) &&
+            value.firstOrNull()?.toInt()?.and(0xFF) == '#'.code
+        ) {
+            appendEvent("18.0 SAFETY BLOCK: refused blind ASCII command on proprietary 9383 AirGlu service (${value.size} byte(s)); passive capture stays connected")
+            return false
+        }
+        val service = runCatching { current.getService(UUID.fromString(serviceUuid)) }.getOrNull() ?: return false
+        val characteristic = runCatching { service.getCharacteristic(UUID.fromString(characteristicUuid)) }.getOrNull() ?: return false
+        val writeType = if (withResponse) BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT else BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE
+        characteristic.writeType = writeType
+        appendEvent("Explicit write -> ${characteristic.uuid}, ${value.size} byte(s)")
+        return if (Build.VERSION.SDK_INT >= 33) {
+            current.writeCharacteristic(characteristic, value, writeType) == BluetoothStatusCodes.SUCCESS
+        } else {
+            @Suppress("DEPRECATION")
+            run {
+                characteristic.value = value
+                current.writeCharacteristic(characteristic)
+            }
+        }
+    }
+
+    /**
+     * Passive service enumeration. No reads, no notification subscriptions and no writes.
+     * This is intentionally the default immediately after connection.
+     */
+    private fun inspectServicesPassive(g: BluetoothGatt) {
+        pendingOps.clear()
+        activeOp = null
+        operationInFlight = false
+        val infos = mutableListOf<GattCharacteristicInfo>()
+
+        g.services.forEach { service ->
+            service.characteristics.forEach { c ->
+                val p = c.properties
+                val descriptorUuids = c.descriptors.map { it.uuid.toString() }
+                infos += GattCharacteristicInfo(
+                    serviceUuid = service.uuid.toString(),
+                    characteristicUuid = c.uuid.toString(),
+                    readable = p and BluetoothGattCharacteristic.PROPERTY_READ != 0,
+                    writable = p and BluetoothGattCharacteristic.PROPERTY_WRITE != 0,
+                    writableNoResponse = p and BluetoothGattCharacteristic.PROPERTY_WRITE_NO_RESPONSE != 0,
+                    notifiable = p and BluetoothGattCharacteristic.PROPERTY_NOTIFY != 0,
+                    indicatable = p and BluetoothGattCharacteristic.PROPERTY_INDICATE != 0,
+                    properties = p,
+                    permissions = c.permissions,
+                    descriptorUuids = descriptorUuids
+                )
+                appendEvent(
+                    "GATT MAP service=${service.uuid} char=${c.uuid} props=0x${p.toString(16)} perms=0x${c.permissions.toString(16)} desc=${descriptorUuids.joinToString(",").ifBlank { "none" }}"
+                )
+            }
+        }
+
+        _snapshot.value = GattSnapshot(
+            deviceAddress = address,
+            characteristics = infos,
+            serviceUuids = g.services.map { it.uuid.toString() }
+        )
+        _state.value = "services-ready"
+        val serviceSummary = g.services.joinToString(" | ") { service ->
+            "${service.uuid}[${service.characteristics.size}]"
+        }
+        appendEvent("ACTIVE AG2 GATT ready: ${g.services.size} services / ${infos.size} characteristics mapped; vendor characteristic writes are locked; passive capture may arm CCCD only")
+        appendEvent("GATT SERVICES: ${serviceSummary.ifBlank { "none" }}")
+    }
+
+
+    /**
+     * Official AtomRemote / TCSiOSC pairing flow recovered from the user supplied
+     * macOS AtomRemote 1.2.5 bundle:
+     *
+     *  1. Read ID slots (cxtic 6)
+     *  2. Write 9-digit Connect Name, NUL padded to 12 bytes (cxtic 3)
+     *  3. Generate non-zero/non-0xffffffff CCID and write U32 little-endian (cxtic 5)
+     *  4. Wait for/read BCID U32 little-endian (cxtic 4)
+     *  5. User compares the same visible 9-digit code on app + recorder
+     *  6. Accept by writing bitwise-NOT CCID to cxtic 5, little-endian
+     *
+     * This is application-level AirGlu pairing. Android createBond() is not part of
+     * the official gate and is never forced here.
+     */
+    @SuppressLint("MissingPermission")
+    fun beginOfficialTcsPairing(): Boolean {
+        val current = gatt ?: return false
+        if (_state.value != "services-ready") {
+            appendEvent("TCS18 START blocked: GATT state=${_state.value}, expected services-ready")
+            return false
+        }
+
+        val service = current.getService(UUID.fromString(AIRGLU_SHOGUN_SERVICE_UUID))
+        if (service == null) {
+            failTcsPairing("Official 9383 AirGlu service not found")
+            return false
+        }
+
+        val slots = service.getCharacteristic(UUID.fromString(TCS_ID_SLOTS_UUID))
+        val connectName = service.getCharacteristic(UUID.fromString(TCS_CONNECT_NAME_UUID))
+        val ccid = service.getCharacteristic(UUID.fromString(TCS_CCID_UUID))
+        val bcid = service.getCharacteristic(UUID.fromString(TCS_BCID_UUID))
+        if (slots == null || connectName == null || ccid == null || bcid == null) {
+            failTcsPairing(
+                "Official TCS pairing characteristic missing: " +
+                    "slots=${slots != null} connectName=${connectName != null} ccid=${ccid != null} bcid=${bcid != null}"
+            )
+            return false
+        }
+
+        pendingOps.clear()
+        activeOp = null
+        operationInFlight = false
+        cancelOperationTimeout()
+
+        val rawCode = generateNineDigitConnectName()
+        val displayCode = formatNineDigitCode(rawCode)
+        _tcsPairingState.value = TcsPairingState(
+            phase = "arming-bcid",
+            pairingCode = displayCode
+        )
+        _snapshot.value = _snapshot.value?.copy(
+            pairingId = displayCode,
+            binaryPairingCandidates = emptyList(),
+            pairingDecodeEvidence = listOf(
+                "official-tcs: app-generated 9-digit Connect Name",
+                "official-tcs: ID_SLOTS -> CONNECT_NAME -> CCID -> BCID -> ~CCID"
+            )
+        )
+        PairingRuntimeGate.seedCapturedId(address, displayCode)
+        appendEvent("TCS18 START code=$displayCode (official app-generated Connect Name; 9 independent decimal digits)")
+
+        // Official TCS waits for BCID changes. Arm its CCCD first when available so the
+        // transition cannot be missed while the initial pairing writes are running.
+        val localNotify = runCatching { current.setCharacteristicNotification(bcid, true) }.getOrDefault(false)
+        val cccd = bcid.getDescriptor(CCCD_UUID)
+        if (localNotify && cccd != null) {
+            val enable = if (bcid.properties and BluetoothGattCharacteristic.PROPERTY_INDICATE != 0) {
+                BluetoothGattDescriptor.ENABLE_INDICATION_VALUE
+            } else {
+                BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE
+            }
+            pendingOps.addLast(PendingOp.WriteDescriptor(cccd, enable, TCS_PURPOSE_BCID_CCCD))
+        } else {
+            appendEvent("TCS18 BCID CCCD not available; pairing will poll/read BCID after CCID write")
+        }
+
+        pendingOps.addLast(PendingOp.Read(slots, TCS_PURPOSE_ID_SLOTS))
+        _tcsPairingState.value = _tcsPairingState.value.copy(phase = "reading-id-slots")
+        _state.value = "tcs-pairing"
+        processNext(current)
+        return true
+    }
+
+    @SuppressLint("MissingPermission")
+    fun acceptOfficialTcsPairing(): Boolean {
+        val current = gatt ?: return false
+        val state = _tcsPairingState.value
+        val ccid = state.ccid
+        if (!state.canAccept || ccid == null) {
+            appendEvent("TCS18 ACCEPT blocked: phase=${state.phase} canAccept=${state.canAccept} ccid=${ccid != null}")
+            return false
+        }
+        _tcsPairingState.value = state.copy(
+            phase = if (state.bcid != null && state.bcid != 0L) "writing-accept" else "accepted-waiting-for-bcid",
+            canAccept = false,
+            userAccepted = true,
+            lastError = null
+        )
+        appendEvent("TCS18 USER ACCEPT recorded for code=${state.pairingCode}; BCID=${state.bcid?.let { hexU32(it) } ?: "waiting"}")
+
+        // The official TCS manager records the UI accept flag first. The ~CCID write
+        // occurs only once the BCID side of the handshake has completed.
+        if (state.bcid == null || state.bcid == 0L) {
+            return true
+        }
+        return enqueueOfficialAccept(current)
+    }
+
+    private fun enqueueOfficialAccept(current: BluetoothGatt? = gatt): Boolean {
+        val link = current ?: return false
+        val state = _tcsPairingState.value
+        val ccid = state.ccid ?: return false
+        if (!state.userAccepted || state.acceptWritten) return false
+        if (pendingOps.any { it is PendingOp.WriteCharacteristic && it.purpose == TCS_PURPOSE_ACCEPT }) return true
+
+        val service = link.getService(UUID.fromString(AIRGLU_SHOGUN_SERVICE_UUID)) ?: return false
+        val ccidChar = service.getCharacteristic(UUID.fromString(TCS_CCID_UUID)) ?: return false
+        val accept = ccid xor 0xFFFF_FFFFL
+        val payload = u32Le(accept)
+        _tcsPairingState.value = state.copy(phase = "writing-accept", canAccept = false, lastError = null)
+        _state.value = "tcs-pairing"
+        pendingOps.addLast(
+            PendingOp.WriteCharacteristic(
+                ccidChar,
+                payload,
+                BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT,
+                TCS_PURPOSE_ACCEPT
+            )
+        )
+        appendEvent("TCS18 ACCEPT -> write ~CCID=${hexU32(accept)} LE=${payload.toHex()} to $TCS_CCID_UUID")
+        if (!operationInFlight) processNext(link)
+        return true
+    }
+
+    private fun generateNineDigitConnectName(): String = buildString(9) {
+        repeat(9) { append(('0'.code + secureRandom.nextInt(10)).toChar()) }
+    }
+
+    private fun formatNineDigitCode(raw: String): String =
+        raw.filter(Char::isDigit).take(9).chunked(3).joinToString("-")
+
+    private fun connectNamePayload(displayCode: String): ByteArray {
+        val digits = displayCode.filter(Char::isDigit).take(9)
+        val payload = ByteArray(12)
+        digits.toByteArray(Charsets.US_ASCII).copyInto(payload, endIndex = digits.length)
+        return payload
+    }
+
+    private fun generateOfficialCcid(): Long {
+        while (true) {
+            val candidate = secureRandom.nextInt().toLong() and 0xFFFF_FFFFL
+            if (candidate != 0L && candidate != 0xFFFF_FFFFL) return candidate
+        }
+    }
+
+    private fun u16Le(value: ByteArray): Int {
+        if (value.size < 2) return 0
+        return (value[0].toInt() and 0xFF) or ((value[1].toInt() and 0xFF) shl 8)
+    }
+
+    private fun u32Le(value: ByteArray): Long {
+        if (value.size < 4) return 0L
+        return (value[0].toLong() and 0xFF) or
+            ((value[1].toLong() and 0xFF) shl 8) or
+            ((value[2].toLong() and 0xFF) shl 16) or
+            ((value[3].toLong() and 0xFF) shl 24)
+    }
+
+    private fun u32Le(value: Long): ByteArray = byteArrayOf(
+        (value and 0xFF).toByte(),
+        ((value ushr 8) and 0xFF).toByte(),
+        ((value ushr 16) and 0xFF).toByte(),
+        ((value ushr 24) and 0xFF).toByte()
+    )
+
+    private fun ByteArray.toHex(): String = joinToString("") { "%02X".format(it) }
+    private fun hexU32(value: Long): String = "0x%08X".format(value and 0xFFFF_FFFFL)
+
+    private fun failTcsPairing(message: String) {
+        pendingOps.clear()
+        activeOp = null
+        operationInFlight = false
+        cancelOperationTimeout()
+        _tcsPairingState.value = _tcsPairingState.value.copy(
+            phase = "error",
+            canAccept = false,
+            lastError = message
+        )
+        _state.value = "services-ready"
+        appendEvent("TCS18 ERROR: $message")
+    }
+
+    private fun handleTcsReadPurpose(g: BluetoothGatt, op: PendingOp.Read, value: ByteArray, status: Int): Boolean {
+        val purpose = op.purpose ?: return false
+        if (!purpose.startsWith("tcs-")) return false
+        if (status != BluetoothGatt.GATT_SUCCESS) {
+            failTcsPairing("$purpose read failed status=$status")
+            return true
+        }
+
+        when (purpose) {
+            TCS_PURPOSE_ID_SLOTS -> {
+                val slots = u16Le(value)
+                appendEvent("TCS18 READ ID_SLOTS -> $slots (raw=${value.toHex()})")
+                if (slots <= 0) {
+                    failTcsPairing("Recorder reports no free pairing ID slots")
+                    return true
+                }
+                val state = _tcsPairingState.value.copy(
+                    phase = "writing-connect-name",
+                    slotsAvailable = slots,
+                    lastError = null
+                )
+                _tcsPairingState.value = state
+                val service = g.getService(UUID.fromString(AIRGLU_SHOGUN_SERVICE_UUID))
+                val connectName = service?.getCharacteristic(UUID.fromString(TCS_CONNECT_NAME_UUID))
+                if (connectName == null) {
+                    failTcsPairing("Connect Name characteristic disappeared")
+                    return true
+                }
+                val payload = connectNamePayload(state.pairingCode.orEmpty())
+                appendEvent(
+                    "TCS18 WRITE CONNECT_NAME code=${state.pairingCode} bytes=${payload.toHex()} uuid=$TCS_CONNECT_NAME_UUID"
+                )
+                pendingOps.addFirst(
+                    PendingOp.WriteCharacteristic(
+                        connectName,
+                        payload,
+                        BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT,
+                        TCS_PURPOSE_CONNECT_NAME
+                    )
+                )
+            }
+
+            TCS_PURPOSE_BCID_READ -> {
+                val bcid = u32Le(value)
+                if (bcid != 0L) {
+                    onOfficialBcid(bcid, "read")
+                } else {
+                    appendEvent("TCS18 BCID read returned 0; waiting for notification")
+                }
+            }
+        }
+        return true
+    }
+
+    private fun handleTcsWritePurpose(g: BluetoothGatt, op: PendingOp.WriteCharacteristic, status: Int): Boolean {
+        if (!op.purpose.startsWith("tcs-")) return false
+        if (status != BluetoothGatt.GATT_SUCCESS) {
+            failTcsPairing("${op.purpose} write failed status=$status")
+            return true
+        }
+
+        when (op.purpose) {
+            TCS_PURPOSE_CONNECT_NAME -> {
+                val ccid = generateOfficialCcid()
+                val state = _tcsPairingState.value.copy(
+                    phase = "writing-ccid",
+                    connectNameWritten = true,
+                    ccid = ccid,
+                    lastError = null
+                )
+                _tcsPairingState.value = state
+                val service = g.getService(UUID.fromString(AIRGLU_SHOGUN_SERVICE_UUID))
+                val ccidChar = service?.getCharacteristic(UUID.fromString(TCS_CCID_UUID))
+                if (ccidChar == null) {
+                    failTcsPairing("CCID characteristic disappeared")
+                    return true
+                }
+                val payload = u32Le(ccid)
+                appendEvent("TCS18 WRITE CCID=${hexU32(ccid)} LE=${payload.toHex()} uuid=$TCS_CCID_UUID")
+                pendingOps.addFirst(
+                    PendingOp.WriteCharacteristic(
+                        ccidChar,
+                        payload,
+                        BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT,
+                        TCS_PURPOSE_CCID
+                    )
+                )
+            }
+
+            TCS_PURPOSE_CCID -> {
+                val state = _tcsPairingState.value.copy(
+                    phase = "waiting-for-bcid",
+                    ccidWritten = true,
+                    canAccept = true,
+                    lastError = null
+                )
+                _tcsPairingState.value = state
+                appendEvent("TCS18 CAN_ACCEPT: CCID write complete; waiting for BCID and user code confirmation")
+
+                val service = g.getService(UUID.fromString(AIRGLU_SHOGUN_SERVICE_UUID))
+                val bcid = service?.getCharacteristic(UUID.fromString(TCS_BCID_UUID))
+                if (bcid != null && bcid.properties and BluetoothGattCharacteristic.PROPERTY_READ != 0) {
+                    pendingOps.addFirst(PendingOp.Read(bcid, TCS_PURPOSE_BCID_READ))
+                }
+            }
+
+            TCS_PURPOSE_ACCEPT -> {
+                _tcsPairingState.value = _tcsPairingState.value.copy(
+                    phase = "accepted",
+                    canAccept = false,
+                    acceptWritten = true,
+                    lastError = null
+                )
+                appendEvent("TCS18 ACCEPT WRITE OK: official ~CCID gate sent; entering 18.6 official CONNECTED lifecycle")
+                mainHandler.postDelayed({ beginOfficialConnectedLifecycle() }, 120L)
+            }
+        }
+        return true
+    }
+
+    private fun onOfficialBcid(bcid: Long, source: String) {
+        if (bcid == 0L) return
+        val current = _tcsPairingState.value
+        _tcsPairingState.value = current.copy(
+            phase = when {
+                current.userAccepted -> "writing-accept"
+                current.canAccept -> "can-accept"
+                else -> current.phase
+            },
+            bcid = bcid,
+            lastError = null
+        )
+        appendEvent("TCS18 BCID <- ${hexU32(bcid)} source=$source")
+        if (_tcsPairingState.value.userAccepted && !_tcsPairingState.value.acceptWritten) {
+            enqueueOfficialAccept()
+        }
+    }
+
+
+    /**
+     * Official post-pair CONNECTED lifecycle recovered from TCSiOSC.framework.
+     *
+     * macOS order after successful ~CCID:
+     *   CONNECTED_Enter
+     *   -> subscribe cxtic0 frame-count updates
+     *   -> CONNECTED_WaitingForFrameCount
+     *   -> read cxtic1 timecode
+     *   -> require 16 bytes and byte[0] != 0
+     *   -> then PacketLink becomes eligible for the Remote screen
+     *
+     * 18.5 skipped these states and declared the recorder linked too early.
+     */
+    @SuppressLint("MissingPermission")
+    private fun beginOfficialConnectedLifecycle(): Boolean {
+        val current = gatt ?: return false
+        if (!_tcsPairingState.value.acceptWritten) {
+            appendEvent("TCS18.6 CONNECTED blocked: official ~CCID accept is not complete")
+            return false
+        }
+        if (connectedLifecycleReady) {
+            return openOfficialTcsRemoteLink(autoProbe = true)
+        }
+
+        val service = current.getService(UUID.fromString(AIRGLU_SHOGUN_SERVICE_UUID))
+        val frameCount = service?.getCharacteristic(UUID.fromString(TCS_FRAME_COUNT_UUID))
+        val timecode = service?.getCharacteristic(UUID.fromString(TCS_TIMECODE_UUID))
+        if (frameCount == null || timecode == null) {
+            connectedLifecycleArmed = false
+            connectedFrameCountCccdReady = false
+            _tcsRemoteState.value = _tcsRemoteState.value.copy(
+                phase = "error",
+                available = false,
+                linked = false,
+                lastStatus = "Recorder connected-session endpoints are unavailable",
+                lastError = "Official TCS CONNECTED characteristics missing"
+            )
+            appendEvent("TCS18.6 CONNECTED failed: cxtic0=${frameCount != null} cxtic1=${timecode != null}")
+            return false
+        }
+
+        val canNotify = frameCount.properties and
+            (BluetoothGattCharacteristic.PROPERTY_NOTIFY or BluetoothGattCharacteristic.PROPERTY_INDICATE) != 0
+        val canReadTimecode = timecode.properties and BluetoothGattCharacteristic.PROPERTY_READ != 0
+        if (!canNotify || !canReadTimecode) {
+            _tcsRemoteState.value = _tcsRemoteState.value.copy(
+                phase = "error",
+                available = false,
+                linked = false,
+                lastStatus = "Recorder connected-session properties are unavailable",
+                lastError = "Official TCS CONNECTED properties invalid (frameNotify=$canNotify timecodeRead=$canReadTimecode)"
+            )
+            appendEvent("TCS18.6 CONNECTED failed properties: cxtic0Notify=$canNotify cxtic1Read=$canReadTimecode")
+            return false
+        }
+
+        _tcsRemoteState.value = _tcsRemoteState.value.copy(
+            phase = "connected-sync",
+            available = false,
+            linked = false,
+            lastStatus = "Synchronizing official TCS connected session",
+            lastError = null
+        )
+        stopPacketLinkProcessLoop()
+        cancelRemoteResponseTimeout()
+        cancelRemoteBootstrapSettle()
+        pendingRemotePacket = null
+        pendingRemoteFrameWritten = false
+
+        if (connectedFrameCountCccdReady) {
+            armConnectedSyncTimeout()
+            appendEvent("TCS18.6 CONNECTED waiting for recorder frame clock on cxtic0")
+            return true
+        }
+        if (connectedLifecycleArmed) return true
+
+        val localNotify = runCatching { current.setCharacteristicNotification(frameCount, true) }.getOrDefault(false)
+        val cccd = frameCount.getDescriptor(CCCD_UUID)
+        if (!localNotify || cccd == null) {
+            connectedLifecycleArmed = false
+            _tcsRemoteState.value = _tcsRemoteState.value.copy(
+                phase = "error",
+                available = false,
+                linked = false,
+                lastStatus = "Could not arm recorder frame clock",
+                lastError = "cxtic0 notification subscription unavailable"
+            )
+            appendEvent("TCS18.6 CONNECTED cxtic0 subscription unavailable: local=$localNotify cccd=${cccd != null}")
+            return false
+        }
+
+        // CoreBluetooth's setNotifyValue maps to a notification subscription when
+        // PROPERTY_NOTIFY exists. cxtic0 advertises both notify and indicate; prefer
+        // notify to mirror the continuous frame-count update path.
+        val enable = if (frameCount.properties and BluetoothGattCharacteristic.PROPERTY_NOTIFY != 0) {
+            BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE
+        } else {
+            BluetoothGattDescriptor.ENABLE_INDICATION_VALUE
+        }
+        connectedLifecycleArmed = true
+        connectedFrameCountCccdReady = false
+        pendingOps.addFirst(PendingOp.WriteDescriptor(cccd, enable, TCS_PURPOSE_CONNECTED_FRAMECOUNT_CCCD))
+        appendEvent("TCS18.6 CONNECTED ENTER: subscribing cxtic0=$TCS_FRAME_COUNT_UUID frame-count updates before PacketLink")
+        if (!operationInFlight) processNext(current)
+        return true
+    }
+
+    private fun armConnectedSyncTimeout() {
+        cancelConnectedSyncTimeout()
+        val task = Runnable {
+            connectedSyncTimeout = null
+            if (connectedLifecycleReady || !_tcsPairingState.value.acceptWritten) return@Runnable
+            _tcsRemoteState.value = _tcsRemoteState.value.copy(
+                phase = "waiting-frame-clock",
+                available = false,
+                linked = false,
+                lastStatus = "Waiting for recorder frame clock",
+                lastError = null
+            )
+            appendEvent("TCS18.6 CONNECTED still waiting for cxtic0 frame-count notification; PacketLink remains gated")
+        }
+        connectedSyncTimeout = task
+        mainHandler.postDelayed(task, CONNECTED_SYNC_WAIT_MS)
+    }
+
+    private fun cancelConnectedSyncTimeout() {
+        connectedSyncTimeout?.let { mainHandler.removeCallbacks(it) }
+        connectedSyncTimeout = null
+    }
+
+    @SuppressLint("MissingPermission")
+    private fun onOfficialConnectedFrameCount(g: BluetoothGatt, value: ByteArray) {
+        if (!_tcsPairingState.value.acceptWritten || value.size < 2) return
+        val frameCount = u16Le(value)
+        connectedLastFrameCount = frameCount
+        appendEvent("TCS18.6 CONNECTED FRAMECOUNT <- $frameCount raw=${value.toHex()}")
+
+        if (connectedTimecodeReadPending) return
+        // Once Remote is active, keep the official CONNECTED heartbeat alive without
+        // flooding Android's single ATT queue. Initial synchronization is immediate;
+        // subsequent timecode reads are rate-limited while PacketLink owns the queue.
+        val now = System.currentTimeMillis()
+        if (connectedLifecycleReady && now - connectedLastTimecodeReadAtMs < CONNECTED_TIMECODE_REFRESH_MS) return
+
+        val timecode = g.getService(UUID.fromString(AIRGLU_SHOGUN_SERVICE_UUID))
+            ?.getCharacteristic(UUID.fromString(TCS_TIMECODE_UUID)) ?: return
+        connectedTimecodeReadPending = true
+        _tcsRemoteState.value = _tcsRemoteState.value.copy(
+            phase = if (connectedLifecycleReady) _tcsRemoteState.value.phase else "reading-timecode",
+            available = connectedLifecycleReady && _tcsRemoteState.value.available,
+            linked = connectedLifecycleReady && _tcsRemoteState.value.linked,
+            lastStatus = if (connectedLifecycleReady) {
+                _tcsRemoteState.value.lastStatus
+            } else {
+                "Frame clock received; reading official TCS timecode"
+            },
+            lastError = null
+        )
+        pendingOps.addFirst(PendingOp.Read(timecode, TCS_PURPOSE_CONNECTED_TIMECODE))
+        if (!operationInFlight) processNext(g)
+    }
+
+    @SuppressLint("MissingPermission")
+    private fun handleConnectedReadPurpose(g: BluetoothGatt, op: PendingOp.Read, value: ByteArray, status: Int): Boolean {
+        val purpose = op.purpose ?: return false
+        if (!purpose.startsWith("connected-")) return false
+        when (purpose) {
+            TCS_PURPOSE_CONNECTED_TIMECODE -> {
+                connectedTimecodeReadPending = false
+                if (status != BluetoothGatt.GATT_SUCCESS) {
+                    connectedLifecycleReady = false
+                    _tcsRemoteState.value = _tcsRemoteState.value.copy(
+                        phase = "error",
+                        available = false,
+                        linked = false,
+                        lastStatus = "Recorder timecode synchronization failed",
+                        lastError = "cxtic1 timecode read failed status=$status"
+                    )
+                    appendEvent("TCS18.6 CONNECTED TIMECODE read failed status=$status")
+                    return true
+                }
+                if (value.size != 16 || value[0].toInt() == 0) {
+                    connectedLifecycleReady = false
+                    _tcsRemoteState.value = _tcsRemoteState.value.copy(
+                        phase = "waiting-frame-clock",
+                        available = false,
+                        linked = false,
+                        lastStatus = "Waiting for a valid recorder timecode frame",
+                        lastError = null
+                    )
+                    appendEvent("TCS18.6 CONNECTED TIMECODE not ready len=${value.size} first=${value.firstOrNull()?.toInt()?.and(0xFF) ?: -1} hex=${value.toHex()}")
+                    armConnectedSyncTimeout()
+                    return true
+                }
+
+                connectedLastTimecodeReadAtMs = System.currentTimeMillis()
+                if (!connectedLifecycleReady) {
+                    connectedLifecycleReady = true
+                    cancelConnectedSyncTimeout()
+                    connectedDeviceNameCountdown = 3
+                    _tcsRemoteState.value = _tcsRemoteState.value.copy(
+                        phase = "connected-synced",
+                        available = false,
+                        linked = false,
+                        lastStatus = "Official TCS connected session synchronized",
+                        lastError = null
+                    )
+                    appendEvent("TCS18.6 CONNECTED TIMECODE OK len=16 frameCount=$connectedLastFrameCount hex=${value.toHex()}; PacketLink gate OPEN")
+                    mainHandler.postDelayed({ beginOfficialLinkedReconnect() }, 20L)
+                }
+                return true
+            }
+            TCS_PURPOSE_CONNECTED_DEVICE_NAME -> {
+    
+            if (status == BluetoothGatt.GATT_SUCCESS) {
+                    val name = value.toString(Charsets.UTF_8).trim('\u0000', ' ', '\r', '\n')
+                    appendEvent("TCS18.6 CONNECTED DEVICE NAME <- ${name.ifBlank { value.toHex() }}")
+                }
+                return true
+            }
+        }
+        return false
+    }
+
+    /**
+     * 18.5 official TCS Packet Link + macOS RemoteApi process-loop transport.
+     *
+     * Exact behavior recovered from TCSiOSC TCSPacketLink.c:
+     *   cxtic 12 = 232be115-457c-4e46-a24c-e9267071b567 (read)
+     *   cxtic 13 = 8a8cc04b-7c4b-4c98-999e-b4ea39164c3a (write)
+     *
+     * AtomMessage local wire body:
+     *   packetId U8 + payloadLen LE16 + messageType LE16 + payload
+     *
+     * Important 18.3 correction from the macOS executable/framework:
+     * TCSPacketLink DidConnect starts first=1, peerCredit=0 and local=0. A normal
+     * PacketLink process tick with no buffered command therefore serializes F0,
+     * not F8. F0 is the session prime: first/final/initial + RX-space, non-local.
+     * After cxtic12 returns E0 (peer TX credit bit 0x20), RemoteApi one-shot local
+     * commands serialize as E8 + AtomMessage. This keeps link setup separate from
+     * the Record/Stop/Play command packet, matching the framework state machine.
+     */
+    /**
+     * 18.8.2 official LINKED transition.
+     *
+     * TCSiOSC does not reuse the TRYPAIR/CONNECTED GATT instance for LINKED.
+     * OpenPacketLink drives LINKED_Enter -> CONNECT_Enter, producing a fresh
+     * BLE connection before PacketLink processing begins.
+     *
+     * Pairing is already accepted here and is deliberately not modified.
+     */
+    @SuppressLint("MissingPermission")
+    private fun beginOfficialLinkedReconnect(): Boolean {
+        if (!_tcsPairingState.value.acceptWritten) {
+            appendEvent("TCS18.8.2 LINKED RECONNECT blocked: accepted pairing gate is not complete")
+            return false
+        }
+        if (officialLinkedReconnectPending) return true
+
+        val device = targetDevice ?: run {
+            appendEvent("TCS18.8.2 LINKED RECONNECT failed: target device missing")
+            return false
+        }
+
+        officialLinkedReconnectPending = true
+        appendEvent("TCS18.8.2 LINKED RECONNECT START: closing CONNECTED GATT and reopening fresh LINKED GATT; pairing state preserved")
+
+        stopPacketLinkProcessLoop()
+        pendingRemotePacket = null
+        pendingRemoteFrameWritten = false
+        remoteBootstrapQueue.clear()
+        remoteBootstrapActive = false
+        remoteBootstrapCompleted = false
+        remoteBootstrapResponses = 0
+
+        closeGattOnly()
+
+        mainHandler.postDelayed({
+            if (!_tcsPairingState.value.acceptWritten) {
+                officialLinkedReconnectPending = false
+                appendEvent("TCS18.8.2 LINKED RECONNECT cancelled: pairing gate no longer accepted")
+                return@postDelayed
+            }
+            openGatt(device)
+        }, 500L)
+
+        return true
+    }
+
+    /**
+     * 18.8.3 exact CONNECT preflight recovered from the supplied official
+     * TCSiOSC.framework x86_64 implementation:
+     *
+     * substate_CONNECT_ReadingDeviceName_OnEntry -> TCSBlePlex_Read(cxtic 2)
+     * substate_CONNECT_ReadingBcid_OnEntry       -> TCSBlePlex_Read(cxtic 4)
+     *
+     * Only after those reads does the state machine transition to LINKED.
+     */
+    @SuppressLint("MissingPermission")
+    private fun handleOfficialLinkedConnectReadPurpose(
+        g: BluetoothGatt,
+        op: PendingOp.Read,
+        value: ByteArray,
+        status: Int
+    ): Boolean {
+        val purpose = op.purpose ?: return false
+        if (purpose != TCS_PURPOSE_LINKED_DEVICE_NAME && purpose != TCS_PURPOSE_LINKED_BCID) {
+            return false
+        }
+
+        if (status != BluetoothGatt.GATT_SUCCESS) {
+            officialLinkedReconnectPending = false
+            connectedLifecycleReady = false
+            _tcsRemoteState.value = _tcsRemoteState.value.copy(
+                phase = "error",
+                available = false,
+                linked = false,
+                lastStatus = "Official LINKED CONNECT preflight read failed",
+                lastError = "$purpose failed status=$status"
+            )
+            appendEvent("TCS18.8.3 CONNECT PREFLIGHT READ FAIL purpose=$purpose status=$status")
+            return true
+        }
+
+        when (purpose) {
+            TCS_PURPOSE_LINKED_DEVICE_NAME -> {
+                val name = value.toString(Charsets.UTF_8).trim('\u0000', ' ', '\r', '\n')
+                appendEvent(
+                    "TCS18.8.3 CONNECT DEVICE NAME <- ${name.ifBlank { value.toHex() }} raw=${value.toHex()}"
+                )
+
+                val bcid = g.getService(UUID.fromString(AIRGLU_SHOGUN_SERVICE_UUID))
+                    ?.getCharacteristic(UUID.fromString(TCS_BCID_UUID))
+                if (bcid == null || bcid.properties and BluetoothGattCharacteristic.PROPERTY_READ == 0) {
+                    officialLinkedReconnectPending = false
+                    connectedLifecycleReady = false
+                    _tcsRemoteState.value = _tcsRemoteState.value.copy(
+                        phase = "error",
+                        available = false,
+                        linked = false,
+                        lastStatus = "Official LINKED BCID endpoint unavailable",
+                        lastError = "cxtic4 BCID characteristic missing/not readable"
+                    )
+                    appendEvent("TCS18.8.3 CONNECT PREFLIGHT FAIL: cxtic4 BCID unavailable after device-name read")
+                    return true
+                }
+
+                _tcsRemoteState.value = _tcsRemoteState.value.copy(
+                    phase = "linked-connect-preflight",
+                    available = false,
+                    linked = false,
+                    lastStatus = "Device name read; reading official CONNECT BCID",
+                    lastError = null
+                )
+                pendingOps.addFirst(PendingOp.Read(bcid, TCS_PURPOSE_LINKED_BCID))
+                appendEvent("TCS18.8.3 CONNECT BCID READ -> cxtic4=$TCS_BCID_UUID")
+                return true
+            }
+
+            TCS_PURPOSE_LINKED_BCID -> {
+                if (value.size < 4) {
+                    officialLinkedReconnectPending = false
+                    connectedLifecycleReady = false
+                    _tcsRemoteState.value = _tcsRemoteState.value.copy(
+                        phase = "error",
+                        available = false,
+                        linked = false,
+                        lastStatus = "Official LINKED BCID read was invalid",
+                        lastError = "Expected 4-byte BCID, got ${value.size}"
+                    )
+                    appendEvent("TCS18.8.3 CONNECT BCID INVALID len=${value.size} raw=${value.toHex()}")
+                    return true
+                }
+
+                val linkedBcid = u32Le(value)
+                val pairedBcid = _tcsPairingState.value.bcid ?: 0L
+
+                appendEvent(
+                    "TCS18.8.3 CONNECT BCID <- ${hexU32(linkedBcid)} paired=${hexU32(pairedBcid)} raw=${value.toHex()}"
+                )
+
+                // The official framework maps this freshly-read BCID back to its
+                // stored CCID before entering LINKED. We already retain the accepted
+                // application pairing state, so a mismatching non-zero BCID means
+                // this fresh connection is not the paired recorder identity.
+                if (linkedBcid == 0L || (pairedBcid != 0L && linkedBcid != pairedBcid)) {
+                    officialLinkedReconnectPending = false
+                    connectedLifecycleReady = false
+                    _tcsRemoteState.value = _tcsRemoteState.value.copy(
+                        phase = "error",
+                        available = false,
+                        linked = false,
+                        lastStatus = "Fresh LINKED connection did not resolve the accepted pairing slot",
+                        lastError = "BCID linked=${hexU32(linkedBcid)} paired=${hexU32(pairedBcid)}"
+                    )
+                    appendEvent("TCS18.8.3 CONNECT IDENTITY FAIL: refusing PacketLink on unresolved/mismatched BCID")
+                    return true
+                }
+
+                officialLinkedReconnectPending = false
+                connectedLifecycleReady = true
+                connectedTimecodeReadPending = false
+
+                _tcsRemoteState.value = _tcsRemoteState.value.copy(
+                    phase = "linked-reconnect-ready",
+                    available = false,
+                    linked = false,
+                    lastStatus = "Official CONNECT preflight complete; opening PacketLink",
+                    lastError = null
+                )
+                appendEvent("TCS18.8.3 CONNECT PREFLIGHT PASS: cxtic2 + cxtic4 complete; entering LINKED PacketLink")
+                mainHandler.postDelayed({ openOfficialTcsRemoteLink(autoProbe = true) }, 60L)
+                return true
+            }
+        }
+
+        return false
+    }
+    @SuppressLint("MissingPermission")
+    fun openOfficialTcsRemoteLink(autoProbe: Boolean = true): Boolean {
+        val current = gatt ?: return false
+        if (!_tcsPairingState.value.acceptWritten) {
+            appendEvent("TCS18.8 REMOTE OPEN blocked: pairing accept gate is not complete")
+            return false
+        }
+        if (!connectedLifecycleReady) {
+            appendEvent("TCS18.8 REMOTE OPEN deferred: official CONNECTED frame-count/timecode gate is not ready")
+            return beginOfficialConnectedLifecycle()
+        }
+
+        val service = current.getService(UUID.fromString(AIRGLU_SHOGUN_SERVICE_UUID))
+        val readChar = service?.getCharacteristic(UUID.fromString(TCS_PACKET_READ_UUID))
+        val writeChar = service?.getCharacteristic(UUID.fromString(TCS_PACKET_WRITE_UUID))
+        if (readChar == null || writeChar == null) {
+            _tcsRemoteState.value = TcsRemoteState(phase = "error", lastError = "Official TCS Packet Link characteristic missing")
+            appendEvent("TCS18.8 REMOTE OPEN failed: cxtic12=${readChar != null} cxtic13=${writeChar != null}")
+            return false
+        }
+        val readOk = readChar.properties and BluetoothGattCharacteristic.PROPERTY_READ != 0
+        val writeOk = writeChar.properties and
+            (BluetoothGattCharacteristic.PROPERTY_WRITE or BluetoothGattCharacteristic.PROPERTY_WRITE_NO_RESPONSE) != 0
+        if (!readOk || !writeOk) {
+            _tcsRemoteState.value = TcsRemoteState(
+                phase = "error",
+                lastError = "TCS Packet Link properties are not usable (read=$readOk write=$writeOk)"
+            )
+            return false
+        }
+
+        // TCSPacketLink DidConnect. No pairing state is modified here.
+        packetLink18.didConnect()
+        packetLink18Primed = false
+        tcsPacketFirstSubpacket = true
+        tcsPacketRemoteCredit = false
+        tcsPacketLocalFlag = false
+        pendingRemotePacket = null
+        pendingRemoteFrameWritten = false
+        tcsCommandSequence = 0
+        remoteBootstrapQueue.clear()
+        remoteBootstrapActive = false
+        remoteBootstrapCompleted = false
+        remoteBootstrapResponses = 0
+        cancelRemoteResponseTimeout()
+        cancelRemoteBootstrapSettle()
+        remoteRxBuffer.reset()
+        stopPacketLinkProcessLoop()
+
+        _tcsRemoteState.value = _tcsRemoteState.value.copy(
+            phase = "link-priming",
+            available = true,
+            linked = false,
+            lastStatus = "Opening macOS-parity TCSPacketLink",
+            lastError = null
+        )
+        appendEvent("TCS18.8 PLINK DIDCONNECT state=READY first=1 peerCredit=0; cxtic12=$TCS_PACKET_READ_UUID cxtic13=$TCS_PACKET_WRITE_UUID")
+
+        if (autoProbe) {
+            startPacketLinkProcessLoop()
+            drivePacketLink18_8() // First READY process turn produces official F0.
+        }
+        return true
+    }
+
+    @SuppressLint("MissingPermission")
+    private fun enqueueOfficialLinkPrime(
+        current: BluetoothGatt,
+        writeChar: BluetoothGattCharacteristic
+    ): Boolean {
+        if (operationInFlight || pendingOps.any { op ->
+                (op as? PendingOp.Read)?.purpose.orEmpty().startsWith("remote-") ||
+                    (op as? PendingOp.WriteCharacteristic)?.purpose.orEmpty().startsWith("remote-")
+            }) {
+            appendEvent("TCS18.5 LINK PRIME deferred: GATT queue busy")
+            mainHandler.postDelayed({
+                val live = gatt ?: return@postDelayed
+                val wc = live.getService(UUID.fromString(AIRGLU_SHOGUN_SERVICE_UUID))
+                    ?.getCharacteristic(UUID.fromString(TCS_PACKET_WRITE_UUID))
+                    ?: return@postDelayed
+                enqueueOfficialLinkPrime(live, wc)
+            }, 40L)
+            return true
+        }
+
+        val header = buildOfficialPacketLinkHeader(local = false)
+        val frame = byteArrayOf(header.toByte())
+        pendingOps.addLast(
+            PendingOp.WriteCharacteristic(
+                writeChar,
+                frame,
+                packetLinkWriteType(writeChar),
+                "remote-link-prime"
+            )
+        )
+        _tcsRemoteState.value = _tcsRemoteState.value.copy(
+            phase = "link-priming",
+            available = true,
+            linked = false,
+            lastTxHex = frame.toHex(),
+            lastStatus = "Priming PacketLink session",
+            lastError = null
+        )
+        appendEvent("TCS18.5 LINK PRIME TX frame=${frame.toHex()} expected=F0 source=TCSiOSC-DidConnect/Process local=0")
+        if (!operationInFlight) processNext(current)
+        return true
+    }
+
+    @SuppressLint("MissingPermission")
+    fun sendOfficialRemoteCommand(command: String): Boolean {
+        if (!_tcsPairingState.value.acceptWritten) {
+            appendEvent("TCS18.5 REMOTE command blocked before accepted pairing: $command")
+            return false
+        }
+        if (!_tcsRemoteState.value.available && !openOfficialTcsRemoteLink(autoProbe = true)) return false
+        if (!_tcsRemoteState.value.linked) {
+            appendEvent("TCS18.5 REMOTE command blocked until F0 -> E0 PacketLink prime completes: $command")
+            return false
+        }
+        // The official 10 ms PacketLink process loop means a harmless empty
+        // write/read tick can be in flight at almost any moment. Do NOT reject
+        // a user button because of that background tick. A real RemoteApi
+        // command is blocked only when another command payload is outstanding;
+        // enqueueRemoteDataFrame places the user command ahead of queued ticks.
+        if (pendingRemotePacket != null) {
+            appendEvent("TCS18.5 REMOTE busy: previous RemoteApi command is still active")
+            return false
+        }
+        return when (command) {
+            "record-start" -> enqueueOfficialRemoteCommand(REMOTE_RECORD_START, "remote-record-start", "Record Start")
+            "record-stop" -> enqueueOfficialRemoteCommand(REMOTE_RECORD_STOP, "remote-record-stop", "Record Stop")
+            "play" -> enqueueOfficialRemoteCommand(REMOTE_PLAY_START, "remote-play-start", "Play")
+            "pause" -> enqueueOfficialRemoteCommand(REMOTE_PLAY_PAUSE, "remote-play-pause", "Pause")
+            else -> {
+                appendEvent("TCS18.5 REMOTE unsupported command=$command")
+                false
+            }
+        }
+    }
+
+    /**
+     * Remote screen bootstrap recovered directly from the official macOS
+     * AtomRemote controller. The official view sends these GET/state messages
+     * on connection before transport buttons are used. 18.3 skipped this
+     * RemoteApi startup entirely and jumped straight to Record.Start.
+     *
+     * Message IDs / expected response IDs are copied from the macOS executable:
+     *  0x04B0->0x04B0, ApplicationStateGet 0x0640->0x0640,
+     *  Play.StateGet 0x012E->0x012C, Record.StateGet 0x0190->0x0190,
+     *  then the remaining state probes used by the same Remote screen startup.
+     */
+    @SuppressLint("MissingPermission")
+    private fun startOfficialMacRemoteBootstrap(): Boolean {
+        if (remoteBootstrapActive) return true
+        remoteBootstrapQueue.clear()
+        listOf(
+            RemoteBootstrapQuery(0x04B0, 0x04B0, "Remote state 0x04B0"),
+            RemoteBootstrapQuery(0x0640, 0x0640, "ApplicationStateGet"),
+            RemoteBootstrapQuery(0x012E, 0x012C, "Play.StateGet"),
+            RemoteBootstrapQuery(0x0190, 0x0190, "Record.StateGet"),
+            RemoteBootstrapQuery(0x0648, 0x0648, "InputOutputSummaryGet"),
+            RemoteBootstrapQuery(0x0064, 0x0064, "Remote state 0x0064"),
+            RemoteBootstrapQuery(0x02BD, 0x02BC, "Remote state 0x02BD"),
+            RemoteBootstrapQuery(0x0135, 0x0135, "Remote state 0x0135"),
+            RemoteBootstrapQuery(0x0071, 0x006D, "Remote state 0x0071"),
+            RemoteBootstrapQuery(0x00DD, 0x00DC, "Remote state 0x00DD"),
+            RemoteBootstrapQuery(0x013C, 0x013C, "Remote state 0x013C"),
+            RemoteBootstrapQuery(0x0070, 0x006C, "Remote state 0x0070"),
+            RemoteBootstrapQuery(0x02BF, 0x02BD, "Remote state 0x02BF")
+        ).forEach { remoteBootstrapQueue.addLast(it) }
+        remoteBootstrapActive = true
+        remoteBootstrapCompleted = false
+        remoteBootstrapResponses = 0
+        _tcsRemoteState.value = _tcsRemoteState.value.copy(
+            phase = "bootstrapping",
+            available = true,
+            linked = false,
+            lastStatus = "Syncing official macOS RemoteApi state",
+            lastError = null
+        )
+        appendEvent("TCS18.8 MAC REMOTE BOOTSTRAP START count=${remoteBootstrapQueue.size} sequence=04B0,0640,012E,0190,0648,0064,02BD,0135,0071,00DD,013C,0070,02BF")
+        return enqueueNextMacRemoteBootstrapQuery()
+    }
+
+    @SuppressLint("MissingPermission")
+    private fun enqueueNextMacRemoteBootstrapQuery(): Boolean {
+        if (!remoteBootstrapActive) return false
+        if (pendingRemotePacket != null) return true
+        val query = remoteBootstrapQueue.pollFirst()
+        if (query == null) {
+            // The official macOS CommandManager does not serialize UI startup on
+            // one response per getter. It queues the startup requests while the
+            // 10 ms PacketLink process loop keeps draining incoming state. 18.4
+            // incorrectly treated E0 as the response itself. 18.5 separates the
+            // two concepts: E0 completes the transport turn, while payloads are
+            // collected independently during a short drain window.
+            remoteBootstrapActive = false
+            scheduleRemoteBootstrapSettle()
+            appendEvent("TCS18.8 MAC REMOTE BOOTSTRAP FRAMES SENT count=13; draining RemoteApi payloads for ${REMOTE_BOOTSTRAP_DRAIN_MS}ms")
+            return true
+        }
+        val current = gatt ?: return false
+        val writeChar = current.getService(UUID.fromString(AIRGLU_SHOGUN_SERVICE_UUID))
+            ?.getCharacteristic(UUID.fromString(TCS_PACKET_WRITE_UUID)) ?: return false
+        tcsCommandSequence = if (tcsCommandSequence >= 255) 1 else tcsCommandSequence + 1
+        val packetId = tcsCommandSequence
+        val body = buildOfficialAtomMessageBody(packetId, query.commandId)
+        val purpose = "remote-bootstrap-${query.commandId.toString(16)}"
+        val packet = PendingRemotePacket(
+            body = body,
+            purpose = purpose,
+            label = query.label,
+            commandId = query.commandId,
+            packetId = packetId,
+            expectedResponseId = query.expectedResponseId,
+            bootstrap = true
+        )
+        pendingRemotePacket = packet
+        pendingRemoteFrameWritten = false
+        _tcsRemoteState.value = _tcsRemoteState.value.copy(
+            phase = "bootstrapping",
+            available = true,
+            linked = false,
+            lastCommand = query.label,
+            lastCommandId = query.commandId,
+            lastStatus = "macOS bootstrap ${13 - remoteBootstrapQueue.size}/13: ${query.label}"
+        )
+        appendEvent("TCS18.8 BOOTSTRAP QUERY label=${query.label} cmd=${query.commandId} expected=${query.expectedResponseId} packetId=$packetId credit=$tcsPacketRemoteCredit body=${body.toHex()}")
+        return queueRemotePacket18_8(packet, local = true)
+    }
+
+    private fun buildOfficialAtomMessageBody(packetId: Int, commandId: Int): ByteArray = byteArrayOf(
+        (packetId and 0xFF).toByte(),
+        0x00, 0x00,
+        (commandId and 0xFF).toByte(),
+        ((commandId ushr 8) and 0xFF).toByte()
+    )
+
+    @SuppressLint("MissingPermission")
+    private fun enqueueOfficialRemoteCommand(commandId: Int, purpose: String, label: String): Boolean {
+        val current = gatt ?: return false
+        val service = current.getService(UUID.fromString(AIRGLU_SHOGUN_SERVICE_UUID)) ?: return false
+        val writeChar = service.getCharacteristic(UUID.fromString(TCS_PACKET_WRITE_UUID)) ?: return false
+        // Official macOS AtomRemote constructor evidence: RemoteApi Record/Play
+        // AtomMessage subclasses call AtomMessage(m_isLocal: true). The local
+        // PacketLink bit (0x08) must therefore be present on these packets.
+        // One-shot Record/Stop/Play/Pause still use packetId = 0.
+        val packetId = 0
+        val body = buildOfficialAtomMessageBody(packetId, commandId)
+        val packet = PendingRemotePacket(body, purpose, label, commandId, packetId)
+        pendingRemotePacket = packet
+        pendingRemoteFrameWritten = false
+        _tcsRemoteState.value = _tcsRemoteState.value.copy(
+            phase = if (tcsPacketRemoteCredit) "sending" else "requesting-credit",
+            available = true,
+            lastCommand = label,
+            lastCommandId = commandId,
+            lastTxHex = null,
+            lastStatus = if (tcsPacketRemoteCredit) "Peer credit already available" else "Requesting official PacketLink peer credit",
+            lastError = null
+        )
+
+        return queueRemotePacket18_8(packet, local = true)
+    }
+
+    /** Buffer an AtomMessage exactly like TCSPacketLinkSendPacket. The 10 ms
+     * process tick decides when it may actually enter the BLE write/read turn. */
+    @SuppressLint("MissingPermission")
+    private fun queueRemotePacket18_8(packet: PendingRemotePacket, local: Boolean): Boolean {
+        if (!packetLink18.sendPacket(local, packet.body)) {
+            appendEvent("TCS18.8 PLINK BUFFER BUSY label=${packet.label} state=${packetLink18.state()} buffered=${packetLink18.bufferedPacketSize()}")
+            return false
+        }
+        pendingRemotePacket = packet
+        pendingRemoteFrameWritten = false
+        _tcsRemoteState.value = _tcsRemoteState.value.copy(
+            phase = if (packet.bootstrap) "bootstrapping" else "queued",
+            available = true,
+            lastCommand = packet.label,
+            lastCommandId = packet.commandId,
+            lastTxHex = packet.body.toHex(),
+            lastStatus = "${packet.label} buffered in official PacketLink",
+            lastError = null
+        )
+        val packetIdRule = if (packet.bootstrap) "official-query-sequence" else "official-one-shot-zero"
+        appendEvent("TCS18.8.1 PLINK BUFFER label=${packet.label} cmd=${packet.commandId} packetId=${packet.packetId} m_isLocal=${if (local) 1 else 0} atom=${packet.body.toHex()} packetIdRule=$packetIdRule")
+        // Match macOS: SendPacket only fills the PacketLink TX buffer. The 10 ms
+        // TCSPacketLinkProcess timer owns the READY -> WRITING transition.
+        return true
+    }
+
+    /**
+     * Mirrors TCSPacketLinkProcess. Crucially, a timer tick does NOTHING while
+     * state is WRITING or READING. The old Android implementation kept creating
+     * manual E0 turns around in-flight commands, which was not framework parity.
+     */
+    @SuppressLint("MissingPermission")
+    private fun drivePacketLink18_8() {
+        if (!packetLinkProcessEnabled || !_tcsRemoteState.value.available) return
+        if (operationInFlight || pendingOps.any { op ->
+                (op as? PendingOp.Read)?.purpose == PLINK18_READ_PURPOSE ||
+                    (op as? PendingOp.WriteCharacteristic)?.purpose == PLINK18_WRITE_PURPOSE
+            }) return
+        val current = gatt ?: return
+        val writeChar = current.getService(UUID.fromString(AIRGLU_SHOGUN_SERVICE_UUID))
+            ?.getCharacteristic(UUID.fromString(TCS_PACKET_WRITE_UUID)) ?: return
+
+        val subpacket = packetLink18.process() ?: return
+        queuePacketLink18_8Write(current, writeChar, subpacket)
+    }
+
+    @SuppressLint("MissingPermission")
+    private fun queuePacketLink18_8Write(
+        current: BluetoothGatt,
+        writeChar: BluetoothGattCharacteristic,
+        subpacket: TcsPacketLinkTransport.OutboundSubpacket
+    ) {
+        pendingOps.addFirst(
+            PendingOp.WriteCharacteristic(
+                writeChar,
+                subpacket.bytes,
+                packetLinkWriteType(writeChar),
+                PLINK18_WRITE_PURPOSE
+            )
+        )
+        _tcsRemoteState.value = _tcsRemoteState.value.copy(
+            lastTxHex = subpacket.bytes.toHex(),
+            lastStatus = when {
+                subpacket.includesPacketPayload -> "Writing official PacketLink data subpacket"
+                !packetLink18Primed -> "Priming official PacketLink"
+                else -> _tcsRemoteState.value.lastStatus
+            }
+        )
+        appendEvent(
+            "TCS18.8 PLINK TX state=WRITING frame=${subpacket.bytes.toHex()} final=${subpacket.final} payloadBytes=${subpacket.payloadBytes} peerCredit=${packetLink18.peerCredit()}"
+        )
+        if (!operationInFlight) processNext(current)
+    }
+
+    @SuppressLint("MissingPermission")
+    private fun queuePacketLink18_8Read(g: BluetoothGatt) {
+        val readChar = g.getService(UUID.fromString(AIRGLU_SHOGUN_SERVICE_UUID))
+            ?.getCharacteristic(UUID.fromString(TCS_PACKET_READ_UUID)) ?: return
+        if (pendingOps.none { (it as? PendingOp.Read)?.purpose == PLINK18_READ_PURPOSE }) {
+            pendingOps.addFirst(PendingOp.Read(readChar, PLINK18_READ_PURPOSE))
+        }
+        if (!operationInFlight) processNext(g)
+    }
+
+    @SuppressLint("MissingPermission")
+    private fun handlePacketLink18_8WritePurpose(
+        g: BluetoothGatt,
+        op: PendingOp.WriteCharacteristic,
+        status: Int
+    ): Boolean {
+        if (op.purpose != PLINK18_WRITE_PURPOSE) return false
+        if (status != BluetoothGatt.GATT_SUCCESS) {
+            packetLink18.onWriteFailed()
+            _tcsRemoteState.value = _tcsRemoteState.value.copy(
+                phase = "packet-ready",
+                lastStatus = "PacketLink write failed; transport retained",
+                lastError = "cxtic13 write failed status=$status"
+            )
+            appendEvent("TCS18.8 PLINK WRITE FAIL status=$status; returning transport to READY")
+            return true
+        }
+
+        when (packetLink18.onWriteComplete()) {
+            TcsPacketLinkTransport.WriteCompleteAction.Read -> {
+                appendEvent("TCS18.8 PLINK WRITE COMPLETE final=1 -> state=READING")
+                queuePacketLink18_8Read(g)
+            }
+            TcsPacketLinkTransport.WriteCompleteAction.WriteNext -> {
+                val writeChar = g.getService(UUID.fromString(AIRGLU_SHOGUN_SERVICE_UUID))
+                    ?.getCharacteristic(UUID.fromString(TCS_PACKET_WRITE_UUID)) ?: return true
+                val next = packetLink18.continueWrite()
+                if (next != null) queuePacketLink18_8Write(g, writeChar, next)
+            }
+            TcsPacketLinkTransport.WriteCompleteAction.Ignore -> Unit
+        }
+        return true
+    }
+
+    @SuppressLint("MissingPermission")
+    private fun handlePacketLink18_8ReadPurpose(
+        g: BluetoothGatt,
+        op: PendingOp.Read,
+        value: ByteArray,
+        status: Int
+    ): Boolean {
+        if (op.purpose != PLINK18_READ_PURPOSE) return false
+        if (status != BluetoothGatt.GATT_SUCCESS) {
+            packetLink18.onReadFailed()
+            appendEvent("TCS18.8 PLINK READ FAIL status=$status; returning state=READY")
+            return true
+        }
+
+        val result = packetLink18.onReadSubpacket(value)
+        tcsPacketRemoteCredit = result.peerCredit
+        appendEvent(
+            "TCS18.8 PLINK RX state=${packetLink18.state()} frame=${value.toHex()} final=${!result.needAnotherRead} peerCredit=${result.peerCredit} local=${result.packetLocal} payloadBytes=${result.packet?.size ?: 0}"
+        )
+
+        if (result.needAnotherRead) {
+            queuePacketLink18_8Read(g)
+            return true
+        }
+
+        if (!packetLink18Primed) {
+            packetLink18Primed = true
+            _tcsRemoteState.value = _tcsRemoteState.value.copy(
+                phase = "bootstrapping",
+                available = true,
+                linked = false,
+                lastStatus = "PacketLink primed; syncing macOS RemoteApi state",
+                lastError = null
+            )
+            appendEvent("TCS18.8 PLINK PRIME COMPLETE first F0/read turn -> READY peerCredit=${result.peerCredit}")
+            startOfficialMacRemoteBootstrap()
+        }
+
+        result.packet?.let { handlePacketLink18_8Payload(it, result.packetLocal) }
+
+        if (result.txPacketCompletedThisTurn) {
+            val sent = pendingRemotePacket
+            pendingRemotePacket = null
+            pendingRemoteFrameWritten = false
+            if (sent != null) {
+                appendEvent("TCS18.8.1 CONTROL SENT label=${sent.label} cmd=${sent.commandId}; PacketLink delivery complete")
+                if (sent.bootstrap) {
+                    enqueueNextMacRemoteBootstrapQuery()
+                } else {
+                    _tcsRemoteState.value = _tcsRemoteState.value.copy(
+                        phase = "linked",
+                        available = true,
+                        linked = remoteBootstrapCompleted,
+                        lastStatus = "${sent.label} command sent",
+                        lastError = null
+                    )
+                }
+            }
+        }
+
+        // Exact TCSPacketLinkProcess is timer-driven from READY. Do not immediately
+        // force an extra E0 turn here; the 10 ms tick owns that transition.
+        return true
+    }
+
+    private fun handlePacketLink18_8Payload(payload: ByteArray, local: Boolean) {
+        val hex = payload.toHex()
+        if (payload.size < 5) {
+            appendEvent("TCS18.8 PLINK PAYLOAD short local=$local bytes=$hex")
+            return
+        }
+        val packetId = payload[0].toInt() and 0xFF
+        val payloadLen = (payload[1].toInt() and 0xFF) or ((payload[2].toInt() and 0xFF) shl 8)
+        val messageType = (payload[3].toInt() and 0xFF) or ((payload[4].toInt() and 0xFF) shl 8)
+        val available = (payload.size - 5).coerceAtLeast(0)
+        val bodyLen = minOf(payloadLen, available)
+        val body = if (bodyLen > 0) payload.copyOfRange(5, 5 + bodyLen) else byteArrayOf()
+        if (!remoteBootstrapCompleted) remoteBootstrapResponses++
+        _tcsRemoteState.value = _tcsRemoteState.value.copy(
+            lastRxHex = hex,
+            lastStatus = if (remoteBootstrapCompleted) "Recorder RemoteApi state received" else "Recorder state received during startup",
+            lastError = null
+        )
+        appendEvent("TCS18.8 REMOTE PAYLOAD local=$local packetId=$packetId payloadLen=$payloadLen messageType=$messageType data=${body.toHex()}")
+    }
+
+    @SuppressLint("MissingPermission")
+    private fun enqueueRemoteCreditRequest(
+        current: BluetoothGatt,
+        writeChar: BluetoothGattCharacteristic,
+        packet: PendingRemotePacket
+    ): Boolean {
+        // Exact _writeSubPacket fallback when peer credit is lost after the session
+        // has already been primed. RemoteApi packets are NON-LOCAL in the official
+        // macOS CommandManager (m_isLocal = 0). The local bit is reserved for the
+        // app's TCSCommand family, not ATOMOS recorder RemoteApi messages.
+        // Therefore the credit/request turn must keep local=false as well.
+        val header = buildOfficialPacketLinkHeader(local = false)
+        val frame = byteArrayOf(header.toByte())
+        val writeType = packetLinkWriteType(writeChar)
+        pendingOps.addLast(
+            PendingOp.WriteCharacteristic(
+                writeChar,
+                frame,
+                writeType,
+                "remote-credit-request:${packet.purpose}"
+            )
+        )
+        _tcsRemoteState.value = _tcsRemoteState.value.copy(lastTxHex = frame.toHex())
+        appendEvent("TCS18.7 FLOW TX CREDIT m_isLocal=0 label=${packet.label} packetId=${packet.packetId} header=${frame.toHex()} payload=none firstNow=$tcsPacketFirstSubpacket")
+        if (!operationInFlight) processNext(current)
+        return true
+    }
+
+    @SuppressLint("MissingPermission")
+    private fun enqueueRemoteDataFrame(
+        current: BluetoothGatt,
+        writeChar: BluetoothGattCharacteristic,
+        packet: PendingRemotePacket
+    ): Boolean {
+        // macOS CommandManager passes AtomMessage.m_isLocal into
+        // TCSBleManager_SendPacketToDevice. Normal ATOMOS RemoteApi commands
+        // (Record/Stop/Play/Pause and state queries) are m_isLocal = 0. Only the
+        // separate TCSCommand class uses m_isLocal = 1. 18.1-18.6 incorrectly
+        // routed recorder commands as local packets, producing E8 frames that the
+        // Shogun acknowledged at PacketLink level but did not dispatch to RemoteApi.
+        tcsPacketLocalFlag = false
+        remoteEmptyPolls = 0
+        remoteResponseStartedAtMs = System.currentTimeMillis()
+        armRemoteResponseTimeout(packet)
+        startPacketLinkProcessLoop()
+        val header = buildOfficialPacketLinkHeader(local = false)
+        val frame = ByteArray(packet.body.size + 1)
+        frame[0] = header.toByte()
+        packet.body.copyInto(frame, destinationOffset = 1)
+        val writeType = packetLinkWriteType(writeChar)
+        pendingOps.addFirst(
+            PendingOp.WriteCharacteristic(
+                writeChar,
+                frame,
+                writeType,
+                "remote-data:${packet.purpose}"
+            )
+        )
+        _tcsRemoteState.value = _tcsRemoteState.value.copy(
+            phase = "sending",
+            lastTxHex = frame.toHex(),
+            lastStatus = "Official AtomMessage data frame queued"
+        )
+        val packetIdRule = if (packet.bootstrap) "official-query-sequence" else "official-one-shot-zero"
+        appendEvent("TCS18.7 REMOTE DATA TX m_isLocal=0 label=${packet.label} cmd=${packet.commandId} packetId=${packet.packetId} frame=${frame.toHex()} credit=$tcsPacketRemoteCredit packetIdRule=$packetIdRule")
+        if (!operationInFlight) processNext(current)
+        return true
+    }
+
+
+    private fun startPacketLinkProcessLoop() {
+        if (packetLinkProcessEnabled) return
+        packetLinkProcessEnabled = true
+        mainHandler.removeCallbacks(packetLinkProcessTick)
+        mainHandler.postDelayed(packetLinkProcessTick, PACKET_LINK_PROCESS_TICK_MS)
+        appendEvent("TCS18.8 PACKET PROCESS LOOP START interval=${PACKET_LINK_PROCESS_TICK_MS}ms stateMachine=READY/WRITING/READING")
+    }
+
+    private fun stopPacketLinkProcessLoop() {
+        packetLinkProcessEnabled = false
+        mainHandler.removeCallbacks(packetLinkProcessTick)
+    }
+
+    private fun cancelRemoteResponseTimeout() {
+        remoteResponseTimeout?.let { mainHandler.removeCallbacks(it) }
+        remoteResponseTimeout = null
+    }
+
+    private fun cancelRemoteBootstrapSettle() {
+        remoteBootstrapSettle?.let { mainHandler.removeCallbacks(it) }
+        remoteBootstrapSettle = null
+    }
+
+    private fun scheduleRemoteBootstrapSettle() {
+        cancelRemoteBootstrapSettle()
+        _tcsRemoteState.value = _tcsRemoteState.value.copy(
+            phase = "bootstrapping",
+            available = true,
+            linked = false,
+            lastStatus = "RemoteApi startup sent; draining PacketLink state",
+            lastError = null
+        )
+        val task = Runnable {
+            remoteBootstrapSettle = null
+            remoteBootstrapCompleted = true
+            _tcsRemoteState.value = _tcsRemoteState.value.copy(
+                phase = "linked",
+                available = true,
+                linked = true,
+                lastStatus = if (remoteBootstrapResponses > 0) {
+                    "Remote ready • $remoteBootstrapResponses state response${if (remoteBootstrapResponses == 1) "" else "s"}"
+                } else {
+                    "Remote ready • macOS-parity PacketLink active"
+                },
+                lastError = null
+            )
+            appendEvent("TCS18.8 MAC REMOTE BOOTSTRAP COMPLETE sent=13 payloadResponses=$remoteBootstrapResponses; controls enabled on TCSPacketLink READY state")
+        }
+        remoteBootstrapSettle = task
+        mainHandler.postDelayed(task, REMOTE_BOOTSTRAP_DRAIN_MS)
+    }
+
+    private fun armRemoteResponseTimeout(packet: PendingRemotePacket) {
+        cancelRemoteResponseTimeout()
+        val task = Runnable {
+            if (pendingRemotePacket !== packet) return@Runnable
+            pendingRemotePacket = null
+            pendingRemoteFrameWritten = false
+            remoteEmptyPolls = 0
+            if (packet.bootstrap) {
+                // A getter may not yield a payload on every firmware revision.
+                // Keep the official startup queue moving instead of deadlocking
+                // the entire Remote screen on one optional state response.
+                appendEvent("TCS18.5 REMOTE PAYLOAD TIMEOUT bootstrap=${packet.label}; continuing official startup queue")
+                enqueueNextMacRemoteBootstrapQuery()
+            } else {
+                _tcsRemoteState.value = _tcsRemoteState.value.copy(
+                    phase = "linked",
+                    available = true,
+                    linked = remoteBootstrapCompleted,
+                    lastStatus = "${packet.label} sent; no RemoteApi payload returned",
+                    lastError = if (remoteBootstrapCompleted) null else "RemoteApi session is not synchronized"
+                )
+                appendEvent("TCS18.5 REMOTE PAYLOAD TIMEOUT command=${packet.label}; PacketLink stays open")
+            }
+        }
+        remoteResponseTimeout = task
+        mainHandler.postDelayed(task, REMOTE_RESPONSE_TIMEOUT_MS)
+    }
+
+    /**
+     * Mirrors TCSBleMonitor.packetTick -> TCSBleManager_PacketLinkProcessTick.
+     * The official macOS app schedules packetTick every 0.01 seconds. A tick in
+     * PacketLink idle state writes an empty final subpacket and then starts a
+     * cxtic12 read cycle. Android BLE serializes those ATT operations, so ticks
+     * that occur while GATT is busy are intentionally coalesced.
+     */
+    @SuppressLint("MissingPermission")
+    private fun runOfficialPacketLinkProcessTick() {
+        if (!_tcsPairingState.value.acceptWritten || !_tcsRemoteState.value.available) return
+        if (operationInFlight || pendingOps.isNotEmpty()) return
+        val current = gatt ?: return
+        val service = current.getService(UUID.fromString(AIRGLU_SHOGUN_SERVICE_UUID)) ?: return
+        val writeChar = service.getCharacteristic(UUID.fromString(TCS_PACKET_WRITE_UUID)) ?: return
+        val header = buildOfficialPacketLinkHeader(local = tcsPacketLocalFlag)
+        val frame = byteArrayOf(header.toByte())
+        pendingOps.addLast(
+            PendingOp.WriteCharacteristic(
+                writeChar,
+                frame,
+                packetLinkWriteType(writeChar),
+                "remote-process-tick"
+            )
+        )
+        if (pendingRemotePacket != null) {
+            appendEvent("TCS18.5 PACKET PROCESS TICK tx=${frame.toHex()} local=$tcsPacketLocalFlag pending=${pendingRemotePacket?.label}")
+        }
+        processNext(current)
+    }
+
+    private fun packetLinkWriteType(writeChar: BluetoothGattCharacteristic): Int =
+        if (writeChar.properties and BluetoothGattCharacteristic.PROPERTY_WRITE != 0) {
+            BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT
+        } else {
+            BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE
+        }
+
+    /**
+     * Mirrors TCSiOSC _writeSubPacket first/final header generation.
+     * Our Android receiver drains each cxtic12 response immediately, so the local
+     * receive buffer is empty and the framework's 0x20 flag is asserted.
+     */
+    private fun buildOfficialPacketLinkHeader(local: Boolean): Int {
+        var header = if (tcsPacketFirstSubpacket) 0x90 else 0x80
+        tcsPacketFirstSubpacket = false
+        if (local) header = header or 0x08
+        header = header or 0x40 // current frame is the final subpacket
+        header = header or 0x20 // local receive buffer is empty / advertise RX space
+        return header and 0xFF
+    }
+
+
+    private fun parsePacketLinkHeader(value: ByteArray): String {
+        if (value.isEmpty()) return "empty"
+        val h = value[0].toInt() and 0xFF
+        return "0x${h.toString(16).uppercase().padStart(2, '0')} first=${h and 0x80 != 0} final=${h and 0x40 != 0} credit=${h and 0x20 != 0} initial=${h and 0x10 != 0} local=${h and 0x08 != 0}"
+    }
+
+    @SuppressLint("MissingPermission")
+    private fun handleRemoteReadPurpose(op: PendingOp.Read, value: ByteArray, status: Int): Boolean {
+        val purpose = op.purpose.orEmpty()
+        if (!purpose.startsWith("remote-")) return false
+        if (status != BluetoothGatt.GATT_SUCCESS) {
+            pendingRemotePacket = null
+            pendingRemoteFrameWritten = false
+            cancelRemoteResponseTimeout()
+            remoteRxBuffer.reset()
+            _tcsRemoteState.value = _tcsRemoteState.value.copy(
+                phase = "packet-ready",
+                lastStatus = "RX read failed status=$status",
+                lastError = "Packet Link read failed status=$status"
+            )
+            appendEvent("TCS18.5 REMOTE RX failed purpose=$purpose status=$status")
+            return true
+        }
+
+        val hex = value.toHex()
+        val header = value.firstOrNull()?.toInt()?.and(0xFF)
+        val final = header != null && header and 0x40 != 0
+        val peerCredit = header != null && header and 0x20 != 0
+        tcsPacketRemoteCredit = peerCredit
+        val payload = if (value.isNotEmpty() && header != null) value.copyOfRange(1, value.size) else byteArrayOf()
+        val first = header != null && header and 0x80 != 0
+        if (first) remoteRxBuffer.reset()
+        if (payload.isNotEmpty()) remoteRxBuffer.write(payload)
+        appendEvent("TCS18.5 FLOW RX purpose=$purpose frame=$hex header=${parsePacketLinkHeader(value)} payload=${payload.toHex()}")
+
+        if (purpose == "remote-link-prime-read") {
+            if (!final || !peerCredit) {
+                _tcsRemoteState.value = _tcsRemoteState.value.copy(
+                    phase = "packet-ready",
+                    linked = false,
+                    lastRxHex = hex,
+                    lastStatus = "PacketLink prime did not receive final peer credit",
+                    lastError = "Expected E0-compatible final/credit response after F0 link prime"
+                )
+                appendEvent("TCS18.5 LINK PRIME FAILED rx=$hex expectedFinal=true expectedCredit=true")
+                return true
+            }
+            _tcsRemoteState.value = _tcsRemoteState.value.copy(
+                phase = "bootstrapping",
+                available = true,
+                linked = false,
+                lastRxHex = hex,
+                lastStatus = "PacketLink ready; starting macOS RemoteApi bootstrap",
+                lastError = null
+            )
+            appendEvent("TCS18.5 LINK PRIME COMPLETE F0 -> $hex; peerCredit=$peerCredit; starting official 10 ms PacketLink process loop")
+            startPacketLinkProcessLoop()
+            startOfficialMacRemoteBootstrap()
+            return true
+        }
+
+        if (purpose.startsWith("remote-credit-read:")) {
+            val packet = pendingRemotePacket
+            if (!peerCredit || packet == null) {
+                pendingRemotePacket = null
+                pendingRemoteFrameWritten = false
+                cancelRemoteResponseTimeout()
+                remoteRxBuffer.reset()
+                _tcsRemoteState.value = _tcsRemoteState.value.copy(
+                    phase = "packet-ready",
+                    linked = false,
+                    lastRxHex = hex,
+                    lastStatus = "Peer did not grant PacketLink TX credit",
+                    lastError = "Expected cxtic12 credit bit 0x20 after flow-control request"
+                )
+                appendEvent("TCS18.5 FLOW CREDIT FAILED expected bit0x20; value=$hex")
+                return true
+            }
+            val current = gatt ?: return true
+            val writeChar = current.getService(UUID.fromString(AIRGLU_SHOGUN_SERVICE_UUID))
+                ?.getCharacteristic(UUID.fromString(TCS_PACKET_WRITE_UUID))
+            if (writeChar == null) {
+                pendingRemotePacket = null
+                pendingRemoteFrameWritten = false
+                cancelRemoteResponseTimeout()
+                remoteRxBuffer.reset()
+                _tcsRemoteState.value = _tcsRemoteState.value.copy(phase = "error", lastError = "PacketLink write characteristic missing after credit")
+                return true
+            }
+            _tcsRemoteState.value = _tcsRemoteState.value.copy(
+                phase = "credit-granted",
+                linked = !packet.bootstrap,
+                lastRxHex = hex,
+                lastStatus = "Peer credit granted; sending AtomMessage payload",
+                lastError = null
+            )
+            appendEvent("TCS18.5 FLOW CREDIT GRANTED: ${parsePacketLinkHeader(value)}; sending buffered ${packet.label}")
+            enqueueRemoteDataFrame(current, writeChar, packet)
+            return true
+        }
+
+        if (purpose.startsWith("remote-response:") || purpose == "remote-process-read") {
+            val packet = pendingRemotePacket
+            if (!final) {
+                // Official _plexDidReadValue immediately reads the next subpacket
+                // until bit 0x40 marks the final subpacket.
+                val current = gatt
+                val readChar = current?.getService(UUID.fromString(AIRGLU_SHOGUN_SERVICE_UUID))
+                    ?.getCharacteristic(UUID.fromString(TCS_PACKET_READ_UUID))
+                if (readChar != null) {
+                    pendingOps.addFirst(PendingOp.Read(readChar, purpose))
+                    appendEvent("TCS18.5 FLOW RX continuation required; reading next cxtic12 subpacket")
+                }
+                return true
+            }
+
+            val completePayload = remoteRxBuffer.toByteArray()
+
+            // A user command can be queued while an official 10 ms background
+            // process tick is already in flight. Do not mistake that older tick's
+            // E0/state payload for the newly queued command before its data frame
+            // has actually reached cxtic13.
+            if (purpose == "remote-process-read" && packet != null && !pendingRemoteFrameWritten) {
+                if (completePayload.isNotEmpty()) {
+                    appendEvent("TCS18.5 PRE-COMMAND ASYNC RX payload=${completePayload.toHex()} while=${packet.label}; preserving queued command")
+                }
+                remoteRxBuffer.reset()
+                return true
+            }
+
+            if (completePayload.isEmpty()) {
+                // Critical 18.5 fix: E0 is a final PacketLink subpacket with TX
+                // credit, not a RemoteApi response. TCSBleMonitor keeps calling
+                // PacketLinkProcessTick every 10 ms, causing another empty write
+                // + read cycle until the remote payload is available.
+                if (packet != null) {
+                    remoteEmptyPolls++
+                    if (packet.bootstrap) {
+                        // E0 is not the query response, but it does finish this
+                        // PacketLink transport turn and grants credit. Queue the
+                        // next official startup request while the 10 ms process
+                        // loop independently drains later state payloads.
+                        cancelRemoteResponseTimeout()
+                        pendingRemotePacket = null
+                        pendingRemoteFrameWritten = false
+                        remoteRxBuffer.reset()
+                        _tcsRemoteState.value = _tcsRemoteState.value.copy(
+                            phase = "bootstrapping",
+                            available = true,
+                            linked = false,
+                            lastRxHex = hex,
+                            lastStatus = "${packet.label} sent; continuing recorder state sync",
+                            lastError = null
+                        )
+                        appendEvent("TCS18.5 FLOW-ONLY RX E0 is NOT RemoteApi payload; bootstrap transport turn complete for ${packet.label}; continuing queue + 10ms process loop")
+                        enqueueNextMacRemoteBootstrapQuery()
+                    } else {
+                        _tcsRemoteState.value = _tcsRemoteState.value.copy(
+                            phase = "awaiting-response",
+                            available = true,
+                            linked = remoteBootstrapCompleted,
+                            lastRxHex = hex,
+                            lastStatus = "Command sent; waiting for recorder state (${remoteEmptyPolls} flow ticks)",
+                            lastError = null
+                        )
+                        appendEvent("TCS18.5 FLOW-ONLY RX E0 is NOT command completion; pending=${packet.label} emptyPolls=$remoteEmptyPolls next=10ms-process-tick")
+                    }
+                }
+                return true
+            }
+
+            if (completePayload.size < 5) {
+                appendEvent("TCS18.5 REMOTE RX short assembled payload=${completePayload.toHex()}; waiting for a complete AtomMessage")
+                return true
+            }
+
+            val packetId = completePayload[0].toInt() and 0xFF
+            val payloadLen = (completePayload[1].toInt() and 0xFF) or ((completePayload[2].toInt() and 0xFF) shl 8)
+            val messageType = (completePayload[3].toInt() and 0xFF) or ((completePayload[4].toInt() and 0xFF) shl 8)
+            val declaredEnd = (5 + payloadLen).coerceAtMost(completePayload.size)
+            val messagePayload = if (declaredEnd > 5) completePayload.copyOfRange(5, declaredEnd) else byteArrayOf()
+            val decoded = "AtomMessage packetId=$packetId payloadLen=$payloadLen messageType=$messageType data=${messagePayload.toHex()}"
+
+            if (packet?.bootstrap == true && packetId != packet.packetId) {
+                // Query replies are correlated primarily by AtomMessage packetId.
+                // State/event message types can differ across recorder firmware,
+                // so do not hard-block on our recovered message-type labels.
+                remoteBootstrapResponses++
+                appendEvent("TCS18.5 BOOTSTRAP ASYNC PAYLOAD while=${packet.label} response=$decoded expectedPacketId=${packet.packetId}; keeping current transport turn pending")
+                _tcsRemoteState.value = _tcsRemoteState.value.copy(
+                    phase = "bootstrapping",
+                    available = true,
+                    linked = false,
+                    lastRxHex = hex,
+                    lastStatus = "Recorder state received while startup continues",
+                    lastError = null
+                )
+                return true
+            }
+
+            if (packet == null && !remoteBootstrapCompleted) {
+                remoteBootstrapResponses++
+                remoteRxBuffer.reset()
+                appendEvent("TCS18.5 BOOTSTRAP DRAIN PAYLOAD response=$decoded")
+                _tcsRemoteState.value = _tcsRemoteState.value.copy(
+                    phase = "bootstrapping",
+                    available = true,
+                    linked = false,
+                    lastRxHex = hex,
+                    lastStatus = "Recorder state received during startup drain",
+                    lastError = null
+                )
+                return true
+            }
+
+            cancelRemoteResponseTimeout()
+            pendingRemotePacket = null
+            pendingRemoteFrameWritten = false
+            remoteEmptyPolls = 0
+            remoteRxBuffer.reset()
+            if (packet?.bootstrap == true) {
+                remoteBootstrapResponses++
+                _tcsRemoteState.value = _tcsRemoteState.value.copy(
+                    phase = "bootstrapping",
+                    available = true,
+                    linked = false,
+                    lastRxHex = hex,
+                    lastStatus = "Recorder state received; startup continues",
+                    lastError = null
+                )
+                appendEvent("TCS18.5 BOOTSTRAP PAYLOAD label=${packet.label} expectedType=${packet.expectedResponseId} response=$decoded nextCredit=$tcsPacketRemoteCredit")
+                enqueueNextMacRemoteBootstrapQuery()
+                return true
+            }
+
+            _tcsRemoteState.value = _tcsRemoteState.value.copy(
+                phase = "linked",
+                available = true,
+                linked = remoteBootstrapCompleted,
+                lastRxHex = hex,
+                lastStatus = "${packet?.label ?: "Remote command"} response received",
+                lastError = null
+            )
+            appendEvent("TCS18.5 REMOTE PAYLOAD RX label=${packet?.label ?: "unsolicited"} response=$decoded nextCredit=$tcsPacketRemoteCredit")
+            return true
+        }
+
+        _tcsRemoteState.value = _tcsRemoteState.value.copy(
+            phase = "linked",
+            available = true,
+            linked = true,
+            lastRxHex = hex,
+            lastStatus = "PacketLink response received",
+            lastError = null
+        )
+        return true
+    }
+
+    @SuppressLint("MissingPermission")
+    private fun handleRemoteWritePurpose(g: BluetoothGatt, op: PendingOp.WriteCharacteristic, status: Int): Boolean {
+        val purpose = op.purpose
+        if (!purpose.startsWith("remote-")) return false
+        if (status != BluetoothGatt.GATT_SUCCESS) {
+            if (purpose == "remote-process-tick") {
+                appendEvent("TCS18.5 PACKET PROCESS TICK write failed status=$status; timer will retry")
+                return true
+            }
+            pendingRemotePacket = null
+            pendingRemoteFrameWritten = false
+            cancelRemoteResponseTimeout()
+            _tcsRemoteState.value = _tcsRemoteState.value.copy(
+                phase = "packet-ready",
+                lastStatus = "TX failed status=$status",
+                lastError = "Remote PacketLink write failed status=$status"
+            )
+            appendEvent("TCS18.5 REMOTE TX failed purpose=$purpose status=$status")
+            return true
+        }
+
+        val readChar = g.getService(UUID.fromString(AIRGLU_SHOGUN_SERVICE_UUID))
+            ?.getCharacteristic(UUID.fromString(TCS_PACKET_READ_UUID))
+        if (readChar == null) {
+            pendingRemotePacket = null
+            pendingRemoteFrameWritten = false
+            _tcsRemoteState.value = _tcsRemoteState.value.copy(phase = "error", lastError = "Packet Link read characteristic disappeared")
+            return true
+        }
+
+        when {
+            purpose == "remote-link-prime" -> {
+                _tcsRemoteState.value = _tcsRemoteState.value.copy(
+                    phase = "link-priming",
+                    available = true,
+                    linked = false,
+                    lastStatus = "F0 written; reading PacketLink peer credit"
+                )
+                pendingOps.addFirst(PendingOp.Read(readChar, "remote-link-prime-read"))
+                appendEvent("TCS18.5 LINK PRIME TX OK; reading cxtic12 for E0/bit0x20 grant")
+            }
+            purpose.startsWith("remote-credit-request:") -> {
+                _tcsRemoteState.value = _tcsRemoteState.value.copy(
+                    phase = "awaiting-credit",
+                    available = true,
+                    lastStatus = "PacketLink flow-control header written; reading peer credit"
+                )
+                val basePurpose = purpose.removePrefix("remote-credit-request:")
+                pendingOps.addFirst(PendingOp.Read(readChar, "remote-credit-read:$basePurpose"))
+                appendEvent("TCS18.5 FLOW CREDIT TX OK; reading cxtic12 for bit0x20 grant")
+            }
+            purpose.startsWith("remote-data:") -> {
+                pendingRemoteFrameWritten = true
+                _tcsRemoteState.value = _tcsRemoteState.value.copy(
+                    phase = "awaiting-response",
+                    available = true,
+                    lastStatus = "AtomMessage frame written; entering PacketLink read cycle"
+                )
+                val basePurpose = purpose.removePrefix("remote-data:")
+                pendingOps.addFirst(PendingOp.Read(readChar, "remote-response:$basePurpose"))
+                appendEvent("TCS18.5 REMOTE DATA TX OK purpose=$basePurpose; reading cxtic12 then continuing 10ms process ticks")
+            }
+            purpose == "remote-process-tick" -> {
+                pendingOps.addFirst(PendingOp.Read(readChar, "remote-process-read"))
+            }
+            else -> return false
+        }
+        return true
+    }
+
+    /**
+     * Pre-code Pairing-ID capture.
+     *
+     * This deliberately avoids every characteristic write and every CCCD descriptor write.
+     * Reads are limited to non-standard vendor characteristics whose metadata does not declare
+     * encrypted/MITM read permissions. Notify/indicate capable characteristics are mapped but
+     * are not subscribed until the user explicitly accepts the visible Pairing ID.
+     */
+    @SuppressLint("MissingPermission")
+    fun beginPrePairCapture(): Boolean {
+        val current = gatt ?: return false
+        if (_state.value != "services-ready") return false
+        if (prePairCaptureStartedForConnection) return false
+        prePairCaptureStartedForConnection = true
+
+        pendingOps.clear()
+        operationInFlight = false
+        values.clear()
+        asciiLineBuffer.clear()
+
+        val vendor = current.services
+            .filterNot { isStandardGattService(it.uuid) }
+            .sortedByDescending { isTimecodeSystemsService(it.uuid) }
+            .flatMap { service -> service.characteristics.map { service to it } }
+
+        vendor.forEach { (service, c) ->
+            if (c.properties and (BluetoothGattCharacteristic.PROPERTY_NOTIFY or BluetoothGattCharacteristic.PROPERTY_INDICATE) != 0) {
+                appendEvent("PRE-PAIR notify mapped service=${service.uuid} char=${c.uuid}; CCCD intentionally NOT written before code acceptance")
+            }
+            if (c.properties and BluetoothGattCharacteristic.PROPERTY_READ != 0) {
+                if (isPrePairReadSafe(c)) {
+                    pendingOps.addLast(PendingOp.Read(c))
+                } else {
+                    appendEvent("PRE-PAIR protected read skipped char=${c.uuid} perms=0x${c.permissions.toString(16)}")
+                }
+            }
+        }
+
+        _state.value = "pre-pair-capture"
+        appendEvent("PRE-PAIR active AG2 capture started: ${pendingOps.size} safe vendor read(s); zero characteristic writes; zero CCCD writes")
+        if (pendingOps.isEmpty()) {
+            _state.value = "services-ready"
+            appendEvent("PRE-PAIR active AG2 capture complete: map only, no safe readable vendor characteristics")
+            return true
+        }
+        processNext(current)
+        return true
+    }
+
+    private fun isPrePairReadSafe(c: BluetoothGattCharacteristic): Boolean {
+        val encrypted = BluetoothGattCharacteristic.PERMISSION_READ_ENCRYPTED or
+            BluetoothGattCharacteristic.PERMISSION_READ_ENCRYPTED_MITM
+        return c.permissions and encrypted == 0
+    }
+
+    /**
+     * User-initiated pairing-data discovery.
+     *
+     * Reads and notification subscriptions are serialized. If Android reports that a
+     * characteristic requires authentication/encryption, the operation is skipped rather
+     * than forcing createBond(). This keeps ATOMOS' application-level pairing flow separate
+     * from Android OS bonding.
+     */
+    /**
+     * Fast pairing discovery for short-lived AG/AG2/AirGlu BT Pair windows.
+     *
+     * ATOMOS documents the same Sync Config Bluetooth Pair entry for AtomRemote pairing,
+     * while AirGlu BT also supports third-party sync clients. Prior builds spent most of
+     * the roughly ten-second Pair window reading too many characteristics before trying
+     * the pairing API. This path subscribes to at most two high-priority vendor notify
+     * characteristics and reads at most one characteristic, then returns control so the
+     * ViewModel can immediately issue the non-mutating BTPR? query.
+     */
+    /**
+     * 17.9 dual-role outbound Pairing-ID capture for the Shogun 9383 profile.
+     *
+     * The 17.6 trace proved that sending public AirGlu S1C ASCII frames to arbitrary
+     * writable characteristics in this proprietary service is wrong: the recorder
+     * accepts the ATT write and then closes the BLE link. This capture mode therefore
+     * performs ZERO characteristic writes. It only enables genuine notify/indicate
+     * characteristics through their CCCD and samples readable vendor values so the
+     * phone-side mirrored GATT server can answer with real cached recorder values.
+     */
+    @SuppressLint("MissingPermission")
+    fun beginPassivePairingCapture(): Boolean {
+        val current = gatt ?: return false
+        if (_state.value != "services-ready") return false
+        if (passivePairCaptureStartedForConnection) {
+            appendEvent("17.9 dual-role outbound Pairing-ID capture already armed for this connection")
+            return true
+        }
+        passivePairCaptureStartedForConnection = true
+
+        pendingOps.clear()
+        operationInFlight = false
+        values.clear()
+        asciiLineBuffer.clear()
+
+        val vendor = current.services
+            .filterNot { isStandardGattService(it.uuid) }
+            .sortedByDescending { isTimecodeSystemsService(it.uuid) }
+            .flatMap { service -> service.characteristics.map { service to it } }
+
+        // Subscribe first so an application pairing packet cannot be missed while reads run.
+        vendor
+            .filter { (_, c) -> c.properties and (BluetoothGattCharacteristic.PROPERTY_NOTIFY or BluetoothGattCharacteristic.PROPERTY_INDICATE) != 0 }
+            .forEach { (_, c) ->
+                val enabled = runCatching { current.setCharacteristicNotification(c, true) }.getOrDefault(false)
+                if (enabled) {
+                    val cccd = c.getDescriptor(CCCD_UUID)
+                    if (cccd != null) {
+                        val enable = if (c.properties and BluetoothGattCharacteristic.PROPERTY_INDICATE != 0)
+                            BluetoothGattDescriptor.ENABLE_INDICATION_VALUE
+                        else
+                            BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE
+                        pendingOps.addLast(PendingOp.WriteDescriptor(cccd, enable))
+                    }
+                }
+            }
+
+        vendor
+            .filter { (_, c) -> c.properties and BluetoothGattCharacteristic.PROPERTY_READ != 0 }
+            .filter { (_, c) -> isPrePairReadSafe(c) }
+            .forEach { (_, c) -> pendingOps.addLast(PendingOp.Read(c)) }
+
+        _state.value = "passive-pair-capture"
+        appendEvent("17.9 OUTBOUND PASSIVE CAPTURE armed: ${pendingOps.size} CCCD/read operation(s), ZERO characteristic writes, proprietary 9383 ASCII probing disabled")
+        if (pendingOps.isEmpty()) {
+            _state.value = "services-ready"
+            appendEvent("17.9 OUTBOUND PASSIVE CAPTURE ready: no subscribable/readable vendor characteristic found")
+            return true
+        }
+        processNext(current)
+        return true
+    }
+
+    @SuppressLint("MissingPermission")
+    fun beginFastPairingDiscovery(): Boolean {
+        val current = gatt ?: return false
+        if (_state.value != "services-ready") return false
+
+        pendingOps.clear()
+        operationInFlight = false
+        values.clear()
+        asciiLineBuffer.clear()
+
+        val vendorServices = current.services
+            .filterNot { isStandardGattService(it.uuid) }
+            .sortedByDescending { isTimecodeSystemsService(it.uuid) }
+        val custom = vendorServices.flatMap { service -> service.characteristics.map { service to it } }
+
+        if (vendorServices.any { isTimecodeSystemsService(it.uuid) }) {
+            appendEvent("FAST pairing: AirGlu priority service detected (FCC1 or 9383b854); treating AG2 as Shogun/AirGlu control candidate")
+        } else {
+            appendEvent("FAST pairing: no known AirGlu priority service; using first vendor service(s)")
+        }
+
+        custom
+            .filter { (_, c) -> c.properties and (BluetoothGattCharacteristic.PROPERTY_NOTIFY or BluetoothGattCharacteristic.PROPERTY_INDICATE) != 0 }
+            .take(2)
+            .forEach { (_, c) ->
+                val p = c.properties
+                val localEnabled = runCatching { current.setCharacteristicNotification(c, true) }.getOrDefault(false)
+                if (localEnabled) {
+                    val cccd = c.getDescriptor(CCCD_UUID)
+                    if (cccd != null) {
+                        val enable = if (p and BluetoothGattCharacteristic.PROPERTY_INDICATE != 0) {
+                            BluetoothGattDescriptor.ENABLE_INDICATION_VALUE
+                        } else {
+                            BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE
+                        }
+                        pendingOps.addLast(PendingOp.WriteDescriptor(cccd, enable))
+                    }
+                }
+            }
+
+        custom
+            .filter { (_, c) -> c.properties and BluetoothGattCharacteristic.PROPERTY_READ != 0 }
+            .take(1)
+            .forEach { (_, c) -> pendingOps.addLast(PendingOp.Read(c)) }
+
+        _state.value = "pair-discovery"
+        appendEvent("FAST pairing discovery started: ${pendingOps.size} operation(s)")
+        processNext(current)
+        return true
+    }
+
+    @SuppressLint("MissingPermission")
+    fun beginPairingDiscovery(): Boolean {
+        val current = gatt ?: return false
+        if (_state.value != "services-ready") return false
+
+        pendingOps.clear()
+        operationInFlight = false
+        values.clear()
+        asciiLineBuffer.clear()
+
+        val vendorServices = current.services
+            .filterNot { isStandardGattService(it.uuid) }
+            .sortedByDescending { isTimecodeSystemsService(it.uuid) }
+        val custom = vendorServices
+            .flatMap { service -> service.characteristics.map { service to it } }
+        if (vendorServices.any { isTimecodeSystemsService(it.uuid) }) {
+            appendEvent("Known AirGlu service detected (FCC1 or 9383b854); prioritizing it for pairing discovery")
+        } else {
+            appendEvent("Known AirGlu service not discovered; using generic vendor-service pairing discovery")
+        }
+        val standard = current.services
+            .filter { isStandardGattService(it.uuid) }
+            .flatMap { service -> service.characteristics.map { service to it } }
+
+        // Subscribe to vendor notifications FIRST so any short-lived pairing response is
+        // captured before we start reading characteristics. Then perform a small,
+        // serialized read set. Every ATT operation has its own timeout, so a peripheral
+        // that never calls us back cannot freeze pairing discovery forever.
+        custom
+            .filter { (_, c) -> c.properties and (BluetoothGattCharacteristic.PROPERTY_NOTIFY or BluetoothGattCharacteristic.PROPERTY_INDICATE) != 0 }
+            .take(4)
+            .forEach { (_, c) ->
+                val p = c.properties
+                val localEnabled = runCatching { current.setCharacteristicNotification(c, true) }.getOrDefault(false)
+                if (localEnabled) {
+                    val cccd = c.getDescriptor(CCCD_UUID)
+                    if (cccd != null) {
+                        val enable = if (p and BluetoothGattCharacteristic.PROPERTY_INDICATE != 0) {
+                            BluetoothGattDescriptor.ENABLE_INDICATION_VALUE
+                        } else {
+                            BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE
+                        }
+                        pendingOps.addLast(PendingOp.WriteDescriptor(cccd, enable))
+                    }
+                }
+            }
+
+        custom
+            .filter { (_, c) -> c.properties and BluetoothGattCharacteristic.PROPERTY_READ != 0 }
+            .take(4)
+            .forEach { (_, c) -> pendingOps.addLast(PendingOp.Read(c)) }
+
+        // Only a tiny standard-service tail is inspected. Device Information can be
+        // useful, but generic battery/GAP reads should never dominate the Pair window.
+        standard
+            .filter { (_, c) -> c.properties and BluetoothGattCharacteristic.PROPERTY_READ != 0 }
+            .take(1)
+            .forEach { (_, c) -> pendingOps.addLast(PendingOp.Read(c)) }
+
+        _state.value = "pair-discovery"
+        appendEvent("Pairing discovery started: ${pendingOps.size} serialized operation(s), vendor notifications first")
+        processNext(current)
+        return true
+    }
+
+    @SuppressLint("MissingPermission")
+    private fun processNext(g: BluetoothGatt) {
+        if (operationInFlight) return
+        while (pendingOps.isNotEmpty()) {
+            val op = pendingOps.removeFirst()
+            val label = when (op) {
+                is PendingOp.Read -> "${op.purpose ?: "read"} ${op.characteristic.uuid}"
+                is PendingOp.WriteDescriptor -> "${op.purpose ?: "CCCD"} ${op.descriptor.characteristic.uuid}"
+                is PendingOp.WriteCharacteristic -> "${op.purpose} ${op.characteristic.uuid}"
+            }
+            val started = when (op) {
+                is PendingOp.Read -> g.readCharacteristic(op.characteristic)
+                is PendingOp.WriteDescriptor -> {
+                    if (Build.VERSION.SDK_INT >= 33) {
+                        g.writeDescriptor(op.descriptor, op.value) == BluetoothStatusCodes.SUCCESS
+                    } else {
+                        @Suppress("DEPRECATION")
+                        run {
+                            op.descriptor.value = op.value
+                            g.writeDescriptor(op.descriptor)
+                        }
+                    }
+                }
+                is PendingOp.WriteCharacteristic -> {
+                    op.characteristic.writeType = op.writeType
+                    if (Build.VERSION.SDK_INT >= 33) {
+                        g.writeCharacteristic(op.characteristic, op.value, op.writeType) == BluetoothStatusCodes.SUCCESS
+                    } else {
+                        @Suppress("DEPRECATION")
+                        run {
+                            op.characteristic.value = op.value
+                            g.writeCharacteristic(op.characteristic)
+                        }
+                    }
+                }
+            }
+            if (started) {
+                activeOp = op
+                operationInFlight = true
+                armOperationTimeout(g, label)
+                return
+            }
+            // Android's BluetoothGatt can briefly report BUSY immediately after a
+            // completed ATT callback even though our serialized queue is logically
+            // idle. The macOS 10 ms PacketLink timer simply tries again on the next
+            // tick. A missed empty process tick is therefore NOT a link failure and
+            // must never clear a pending RemoteApi command or poison UI state.
+            if (op is PendingOp.WriteCharacteristic && op.purpose == PLINK18_WRITE_PURPOSE) {
+                // Do not mutate PacketLink state when Android merely reports BUSY.
+                // macOS is still logically WRITING; retry the exact same subpacket.
+                pendingOps.addFirst(op)
+                appendEvent("TCS18.8 PLINK write start coalesced: Android GATT busy; retrying identical subpacket")
+                activeOp = null
+                mainHandler.postDelayed({
+                    val live = gatt ?: return@postDelayed
+                    processNext(live)
+                }, 12L)
+                return
+            }
+            if (op is PendingOp.Read && op.purpose == PLINK18_READ_PURPOSE) {
+                // Same rule for READ: remain in READING and retry the same cxtic12 read.
+                pendingOps.addFirst(op)
+                appendEvent("TCS18.8 PLINK read start coalesced: Android GATT busy; retrying identical read")
+                activeOp = null
+                mainHandler.postDelayed({
+                    val live = gatt ?: return@postDelayed
+                    processNext(live)
+                }, 12L)
+                return
+            }
+            if (op is PendingOp.WriteCharacteristic && op.purpose == "remote-process-tick") {
+                appendEvent("TCS18.5.1 PACKET PROCESS TICK coalesced: Android GATT busy; next 10ms tick will retry")
+                activeOp = null
+                continue
+            }
+
+            appendEvent("ATT operation could not start $label; continuing")
+            val connectedPurpose = when (op) {
+                is PendingOp.Read -> op.purpose
+                is PendingOp.WriteDescriptor -> op.purpose
+                is PendingOp.WriteCharacteristic -> op.purpose
+            }
+            if (connectedPurpose?.startsWith("connected-") == true) {
+                if (connectedPurpose == TCS_PURPOSE_CONNECTED_FRAMECOUNT_CCCD) {
+                    connectedLifecycleArmed = false
+                    connectedFrameCountCccdReady = false
+                }
+                if (connectedPurpose == TCS_PURPOSE_CONNECTED_TIMECODE) {
+                    connectedTimecodeReadPending = false
+                }
+                _tcsRemoteState.value = _tcsRemoteState.value.copy(
+                    phase = "connected-sync",
+                    available = false,
+                    linked = false,
+                    lastStatus = "Synchronizing recorder connected session",
+                    lastError = null
+                )
+                appendEvent("TCS18.6 CONNECTED operation busy/coalesced: $connectedPurpose; retrying")
+                mainHandler.postDelayed({ beginOfficialConnectedLifecycle() }, 80L)
+                activeOp = null
+                continue
+            }
+            if (op is PendingOp.WriteCharacteristic && op.purpose.startsWith("tcs-")) {
+                failTcsPairing("${op.purpose} could not start")
+                activeOp = null
+                return
+            }
+            if (op is PendingOp.WriteCharacteristic && op.purpose.startsWith("remote-")) {
+                pendingRemotePacket = null
+                pendingRemoteFrameWritten = false
+                cancelRemoteResponseTimeout()
+                remoteRxBuffer.reset()
+                _tcsRemoteState.value = _tcsRemoteState.value.copy(
+                    phase = "packet-ready",
+                    lastError = "${op.purpose} could not start"
+                )
+                appendEvent("TCS18.5.1 REMOTE operation could not start: ${op.purpose}")
+            }
+        }
+        activeOp = null
+        cancelOperationTimeout()
+        val completedMode = _state.value
+        if (completedMode != "tcs-pairing" || _tcsPairingState.value.phase in setOf("accepted", "can-accept", "waiting-for-bcid", "error")) {
+            _state.value = "services-ready"
+        }
+        appendEvent(
+            when (completedMode) {
+                "pre-pair-capture" -> "PRE-PAIR active AG2 capture complete; Pairing-ID gate remains closed for characteristic writes"
+                "passive-pair-capture" -> "Legacy passive capture ready"
+                "tcs-pairing" -> "TCS18 ATT queue idle: phase=${_tcsPairingState.value.phase}"
+                else -> if (_tcsRemoteState.value.available) "TCS18.5.1 PacketLink ATT queue idle: phase=${_tcsRemoteState.value.phase}" else "Pairing discovery complete"
+            }
+        )
+    }
+
+    private fun armOperationTimeout(g: BluetoothGatt, label: String) {
+        cancelOperationTimeout()
+        val task = Runnable {
+            if (!operationInFlight) return@Runnable
+            operationInFlight = false
+            val timedOut = activeOp
+            activeOp = null
+            appendEvent("ATT operation timeout: $label; continuing")
+            val timedPurpose = when (timedOut) {
+                is PendingOp.Read -> timedOut.purpose
+                is PendingOp.WriteDescriptor -> timedOut.purpose
+                is PendingOp.WriteCharacteristic -> timedOut.purpose
+                null -> null
+            }
+            if (timedPurpose == PLINK18_WRITE_PURPOSE) {
+                packetLink18.onWriteFailed()
+                appendEvent("TCS18.8 PLINK write timeout; returning transport READY")
+                processNext(g)
+                return@Runnable
+            }
+            if (timedPurpose == PLINK18_READ_PURPOSE) {
+                packetLink18.onReadFailed()
+                appendEvent("TCS18.8 PLINK read timeout; returning transport READY")
+                processNext(g)
+                return@Runnable
+            }
+            if (timedPurpose == TCS_PURPOSE_BCID_CCCD) {
+                appendEvent("TCS18 BCID CCCD timeout; continuing with ID slots/read fallback")
+                processNext(g)
+                return@Runnable
+            }
+            if (timedPurpose?.startsWith("connected-") == true) {
+                if (timedPurpose == TCS_PURPOSE_CONNECTED_FRAMECOUNT_CCCD) {
+                    connectedLifecycleArmed = false
+                    connectedFrameCountCccdReady = false
+                }
+                if (timedPurpose == TCS_PURPOSE_CONNECTED_TIMECODE) {
+                    connectedTimecodeReadPending = false
+                }
+                _tcsRemoteState.value = _tcsRemoteState.value.copy(
+                    phase = "connected-sync",
+                    available = false,
+                    linked = false,
+                    lastStatus = "Recorder connected-session operation timed out; retrying",
+                    lastError = null
+                )
+                appendEvent("TCS18.6 CONNECTED timeout coalesced: $timedPurpose")
+                mainHandler.postDelayed({ beginOfficialConnectedLifecycle() }, 100L)
+                processNext(g)
+                return@Runnable
+            }
+            if (timedPurpose?.startsWith("tcs-") == true) {
+                failTcsPairing("$timedPurpose timeout")
+                return@Runnable
+            }
+            if (timedPurpose == "remote-process-tick") {
+                // Process ticks are best-effort timer work. Losing one ATT callback
+                // must not tear down or invalidate the RemoteApi session.
+                appendEvent("TCS18.5.1 PACKET PROCESS TICK timeout coalesced; timer will retry")
+                processNext(g)
+                return@Runnable
+            }
+            if (timedPurpose?.startsWith("remote-") == true) {
+                pendingRemotePacket = null
+                pendingRemoteFrameWritten = false
+                cancelRemoteResponseTimeout()
+                remoteRxBuffer.reset()
+                _tcsRemoteState.value = _tcsRemoteState.value.copy(
+                    phase = "packet-ready",
+                    lastStatus = "Operation timeout",
+                    lastError = "$timedPurpose timeout"
+                )
+                appendEvent("TCS18.5.1 REMOTE timeout: $timedPurpose")
+            }
+            processNext(g)
+        }
+        operationTimeout = task
+        mainHandler.postDelayed(task, 900L)
+    }
+
+    private fun cancelOperationTimeout() {
+        operationTimeout?.let { mainHandler.removeCallbacks(it) }
+        operationTimeout = null
+    }
+
+    private fun updateValue(c: BluetoothGattCharacteristic, value: ByteArray, source: String) {
+        val key = "${c.service.uuid}/${c.uuid}"
+        values[key] = value
+        val rawAscii = value.toString(Charset.forName("UTF-8"))
+        val ascii = rawAscii.filter { it.code in 0x20..0x7E }
+        val hex = value.joinToString("") { "%02X".format(it) }
+        val numeric = numericSummary(value)
+        appendEvent("RX[$source] svc=${c.service.uuid} char=${c.uuid} len=${value.size} hex=$hex ${if (ascii.isNotBlank()) "ascii=[$ascii] " else ""}$numeric")
+        appendAsciiLines(rawAscii)
+        val officialCode = _tcsPairingState.value.pairingCode
+        _snapshot.value = _snapshot.value?.let { snap ->
+            snap.copy(
+                pairingId = officialCode ?: snap.pairingId,
+                binaryPairingCandidates = emptyList(),
+                pairingDecodeEvidence = if (officialCode != null) {
+                    listOf(
+                        "official-tcs: app-generated Connect Name",
+                        "official-tcs: ID_SLOTS -> CONNECT_NAME -> CCID -> BCID -> ~CCID"
+                    )
+                } else {
+                    snap.pairingDecodeEvidence
+                },
+                characteristics = snap.characteristics.map {
+                    if (it.characteristicUuid.equals(c.uuid.toString(), true)) it.copy(lastValueHex = hex, lastValueAscii = ascii) else it
+                }
+            )
+        }
+    }
+
+    private fun appendAsciiLines(raw: String) {
+        raw.forEach { ch ->
+            when (ch) {
+                '\n' -> {
+                    val line = asciiLineBuffer.toString().trim().trimEnd('\r')
+                    asciiLineBuffer.clear()
+                    if (line.isNotBlank() && (line.startsWith("#") || line.matches(Regex("[A-Z0-9]{4}=.*")))) {
+                        appendEvent("S1C<$line")
+                    }
+                }
+                '\r' -> Unit
+                else -> if (ch.code in 0x20..0x7E) {
+                    asciiLineBuffer.append(ch)
+                    if (asciiLineBuffer.length > 512) asciiLineBuffer.clear()
+                }
+            }
+        }
+    }
+
+    private fun numericSummary(value: ByteArray): String {
+        if (value.size != 4) return ""
+        val le = (value[0].toLong() and 0xFF) or
+            ((value[1].toLong() and 0xFF) shl 8) or
+            ((value[2].toLong() and 0xFF) shl 16) or
+            ((value[3].toLong() and 0xFF) shl 24)
+        val be = (value[3].toLong() and 0xFF) or
+            ((value[2].toLong() and 0xFF) shl 8) or
+            ((value[1].toLong() and 0xFF) shl 16) or
+            ((value[0].toLong() and 0xFF) shl 24)
+        return "u32le=$le u32be=$be mod1e9(le=${le % 1_000_000_000L},be=${be % 1_000_000_000L})"
+    }
+
+    private fun appendEvent(message: String) {
+        Log.d("AtomRemoteGatt", message)
+        _events.value = (_events.value + message).takeLast(500)
+    }
+
+    private fun isTimecodeSystemsService(uuid: UUID): Boolean {
+        val value = uuid.toString().lowercase()
+        // FCC1 is the historical Timecode Systems assigned service hint. Real Shogun Ultra
+        // captures also advertise the vendor service 9383b854-8bee-11e7-bb31-be2e44b06b34.
+        // Treat both as priority hints while still discovering all vendor services at runtime.
+        return value.startsWith("0000fcc1-") || value == AIRGLU_SHOGUN_SERVICE_UUID
+    }
+
+    private fun isStandardGattService(uuid: UUID): Boolean {
+        val value = uuid.toString().lowercase()
+        return value.startsWith("00001800-") ||
+            value.startsWith("00001801-") ||
+            value.startsWith("0000180a-") ||
+            value.startsWith("0000180f-")
+    }
+
+    private fun handleSecurityRequired(g: BluetoothGatt, device: BluetoothDevice, status: Int) {
+        operationInFlight = false
+        updateBondState(device.bondState)
+        appendEvent("Protected GATT operation skipped (status=$status, osBond=${bondLabel(device.bondState)}). Android bonding was NOT forced.")
+        processNext(g)
+    }
+
+    private fun updateBondState(value: Int) {
+        _bondState.value = bondLabel(value)
+    }
+
+    private fun bondLabel(value: Int): String = when (value) {
+        BluetoothDevice.BOND_BONDED -> "bonded"
+        BluetoothDevice.BOND_BONDING -> "pairing"
+        else -> "not-paired"
+    }
+
+    private fun registerBondReceiver() {
+        if (receiverRegistered) return
+        val filter = IntentFilter(BluetoothDevice.ACTION_BOND_STATE_CHANGED)
+        if (Build.VERSION.SDK_INT >= 33) {
+            appContext.registerReceiver(bondReceiver, filter, Context.RECEIVER_NOT_EXPORTED)
+        } else {
+            @Suppress("DEPRECATION")
+            appContext.registerReceiver(bondReceiver, filter)
+        }
+        receiverRegistered = true
+    }
+
+    private val bondReceiver = object : BroadcastReceiver() {
+        @SuppressLint("MissingPermission")
+        override fun onReceive(context: Context?, intent: Intent?) {
+            if (intent?.action != BluetoothDevice.ACTION_BOND_STATE_CHANGED) return
+            val device = if (Build.VERSION.SDK_INT >= 33) {
+                intent.getParcelableExtra(BluetoothDevice.EXTRA_DEVICE, BluetoothDevice::class.java)
+            } else {
+                @Suppress("DEPRECATION")
+                intent.getParcelableExtra(BluetoothDevice.EXTRA_DEVICE)
+            } ?: return
+            if (device.address != targetDevice?.address) return
+
+            val current = intent.getIntExtra(BluetoothDevice.EXTRA_BOND_STATE, BluetoothDevice.BOND_NONE)
+            val previous = intent.getIntExtra(BluetoothDevice.EXTRA_PREVIOUS_BOND_STATE, BluetoothDevice.BOND_NONE)
+            updateBondState(current)
+            appendEvent("Android OS bond changed: ${bondLabel(previous)} -> ${bondLabel(current)} (informational only)")
+        }
+    }
+
+    private val callback = object : BluetoothGattCallback() {
+        @SuppressLint("MissingPermission")
+        override fun onConnectionStateChange(g: BluetoothGatt, status: Int, newState: Int) {
+            if (g !== this@GattClient.gatt) {
+                appendEvent("TCS18.8.2 stale GATT state callback ignored status=$status state=$newState")
+                runCatching { g.close() }
+                return
+            }
+            updateBondState(g.device.bondState)
+            if (status != BluetoothGatt.GATT_SUCCESS) {
+                cancelConnectionTimeout()
+                appendEvent("GATT connection error: status=$status state=$newState osBond=${bondLabel(g.device.bondState)}")
+                if (status == 133 && retryCount < 1) {
+                    retryCount++
+                    _state.value = "retrying"
+                    runCatching { g.close() }
+                    if (this@GattClient.gatt === g) this@GattClient.gatt = null
+                    mainHandler.postDelayed({ targetDevice?.let { openGatt(it) } }, 900)
+                    return
+                }
+                _disconnectReason.value = "GATT error $status"
+                _state.value = "error:$status"
+                return
+            }
+
+            if (newState == BluetoothProfile.STATE_CONNECTED) {
+                cancelConnectionTimeout()
+                retryCount = 0
+                linkStartedAtMs = System.currentTimeMillis()
+                _disconnectReason.value = null
+                _state.value = "connected"
+                appendEvent("GATT connected; starting passive service discovery")
+                g.discoverServices()
+            } else if (newState == BluetoothProfile.STATE_DISCONNECTED) {
+                cancelConnectionTimeout()
+                cancelOperationTimeout()
+                cancelRemoteResponseTimeout()
+                cancelRemoteBootstrapSettle()
+                remoteRxBuffer.reset()
+                stopPacketLinkProcessLoop()
+                packetLink18.didDisconnect()
+                packetLink18Primed = false
+                pendingOps.clear()
+                operationInFlight = false
+                val aliveMs = if (linkStartedAtMs > 0L) System.currentTimeMillis() - linkStartedAtMs else 0L
+                val reason = if (aliveMs > 0L) {
+                    "Remote/peripheral closed BLE link after ${aliveMs}ms (GATT status 0)"
+                } else {
+                    "BLE link closed (GATT status 0)"
+                }
+                _disconnectReason.value = reason
+                _state.value = "disconnected"
+                appendEvent(reason)
+            }
+        }
+
+        @SuppressLint("MissingPermission")
+        override fun onServicesDiscovered(g: BluetoothGatt, status: Int) {
+
+            if (status == BluetoothGatt.GATT_SUCCESS) {
+                inspectServicesPassive(g)
+                if (officialLinkedReconnectPending && _tcsPairingState.value.acceptWritten) {
+                    // Exact TCSiOSC CONNECT sequence on the fresh BLE connection:
+                    // CONNECT_Enter_DidConnect
+                    // -> CONNECT_ReadingDeviceName (cxtic 2)
+                    // -> CONNECT_ReadingBcid (cxtic 4)
+                    // -> LINKED
+                    //
+                    // Do not open PacketLink until these reads complete.
+                    val service = g.getService(UUID.fromString(AIRGLU_SHOGUN_SERVICE_UUID))
+                    val deviceName = service?.getCharacteristic(UUID.fromString(TCS_DEVICE_NAME_UUID))
+                    val bcid = service?.getCharacteristic(UUID.fromString(TCS_BCID_UUID))
+
+                    val deviceNameReadable = deviceName != null &&
+                        deviceName.properties and BluetoothGattCharacteristic.PROPERTY_READ != 0
+                    val bcidReadable = bcid != null &&
+                        bcid.properties and BluetoothGattCharacteristic.PROPERTY_READ != 0
+
+                    if (!deviceNameReadable || !bcidReadable) {
+                        officialLinkedReconnectPending = false
+                        _tcsRemoteState.value = _tcsRemoteState.value.copy(
+                            phase = "error",
+                            available = false,
+                            linked = false,
+                            lastStatus = "Official LINKED CONNECT preflight unavailable",
+                            lastError = "cxtic2 readable=$deviceNameReadable cxtic4 readable=$bcidReadable"
+                        )
+                        appendEvent("TCS18.8.3 CONNECT PREFLIGHT FAIL cxtic2=$deviceNameReadable cxtic4=$bcidReadable")
+                    } else {
+                        connectedLifecycleArmed = false
+                        connectedFrameCountCccdReady = false
+                        connectedLifecycleReady = false
+                        connectedTimecodeReadPending = false
+
+                        _tcsRemoteState.value = _tcsRemoteState.value.copy(
+                            phase = "linked-connect-preflight",
+                            available = false,
+                            linked = false,
+                            lastStatus = "Fresh BLE connected; reading official CONNECT device name",
+                            lastError = null
+                        )
+
+                        pendingOps.addFirst(
+                            PendingOp.Read(
+                                deviceName!!,
+                                TCS_PURPOSE_LINKED_DEVICE_NAME
+                            )
+                        )
+                        appendEvent("TCS18.8.3 CONNECT PREFLIGHT START: fresh BLE ready; reading cxtic2 device name before BCID/PacketLink")
+                        if (!operationInFlight) processNext(g)
+                    }
+                }
+                // 17.7: the 9383 profile is proprietary and is not assumed to transport
+                // public S1C ASCII. ViewModel will arm passive reads/notifications only.
+                appendEvent("18.3 services ready: proprietary 9383 profile mapped; proven official TCS pairing can start")
+            } else {
+                _state.value = "service-error:$status"
+                _disconnectReason.value = "Service discovery failed: $status"
+                appendEvent("Service discovery failed: $status")
+            }
+        }
+
+        override fun onMtuChanged(g: BluetoothGatt, mtu: Int, status: Int) {
+            appendEvent("MTU changed mtu=$mtu status=$status")
+        }
+
+        override fun onPhyUpdate(g: BluetoothGatt, txPhy: Int, rxPhy: Int, status: Int) {
+            appendEvent("PHY update tx=$txPhy rx=$rxPhy status=$status")
+        }
+
+        override fun onCharacteristicRead(g: BluetoothGatt, c: BluetoothGattCharacteristic, value: ByteArray, status: Int) {
+            cancelOperationTimeout()
+            operationInFlight = false
+            val op = activeOp as? PendingOp.Read
+            activeOp = null
+            if (status == BluetoothGatt.GATT_SUCCESS) {
+                updateValue(c, value, "read")
+                if (op != null && handleOfficialLinkedConnectReadPurpose(g, op, value, status)) {
+                    processNext(g)
+                } else if (op != null && handlePacketLink18_8ReadPurpose(g, op, value, status)) {
+                    processNext(g)
+                } else if (op != null && handleConnectedReadPurpose(g, op, value, status)) {
+                    processNext(g)
+                } else if (op != null && handleRemoteReadPurpose(op, value, status)) {
+                    processNext(g)
+                } else if (op != null && handleTcsReadPurpose(g, op, value, status)) {
+                    processNext(g)
+                } else {
+                    processNext(g)
+                }
+            } else if (status == GATT_AUTH || status == GATT_ENCRYPTION) {
+                if (op?.purpose?.startsWith("tcs-") == true) {
+                    failTcsPairing("${op.purpose} requires GATT security status=$status")
+                } else {
+                    handleSecurityRequired(g, g.device, status)
+                }
+            } else {
+                if (op != null && handleOfficialLinkedConnectReadPurpose(g, op, value, status)) {
+                    processNext(g)
+                } else if (op != null && handlePacketLink18_8ReadPurpose(g, op, value, status)) {
+                    processNext(g)
+                } else if (op != null && handleConnectedReadPurpose(g, op, value, status)) {
+                    processNext(g)
+                } else if (op != null && handleRemoteReadPurpose(op, value, status)) {
+                    processNext(g)
+                } else if (op != null && handleTcsReadPurpose(g, op, value, status)) {
+                    // TCS handler recorded the failure.
+                } else {
+                    appendEvent("Read ${c.uuid} failed: $status")
+                    processNext(g)
+                }
+            }
+        }
+
+        @Deprecated("Deprecated in Java")
+        override fun onCharacteristicRead(g: BluetoothGatt, c: BluetoothGattCharacteristic, status: Int) {
+            if (Build.VERSION.SDK_INT >= 33) return
+            cancelOperationTimeout()
+            operationInFlight = false
+            val op = activeOp as? PendingOp.Read
+            activeOp = null
+            val value = c.value ?: byteArrayOf()
+            if (status == BluetoothGatt.GATT_SUCCESS) {
+                updateValue(c, value, "read")
+                if (op != null && !handleOfficialLinkedConnectReadPurpose(g, op, value, status) &&
+                    !handlePacketLink18_8ReadPurpose(g, op, value, status) &&
+                    !handleConnectedReadPurpose(g, op, value, status) &&
+                    !handleRemoteReadPurpose(op, value, status)
+                ) {
+                    handleTcsReadPurpose(g, op, value, status)
+                }
+                processNext(g)
+            } else if (status == GATT_AUTH || status == GATT_ENCRYPTION) {
+                if (op?.purpose?.startsWith("tcs-") == true) {
+                    failTcsPairing("${op.purpose} requires GATT security status=$status")
+                } else {
+                    handleSecurityRequired(g, g.device, status)
+                }
+            } else {
+                if (op != null && handleOfficialLinkedConnectReadPurpose(g, op, value, status)) {
+                    processNext(g)
+                } else if (op != null && handlePacketLink18_8ReadPurpose(g, op, value, status)) {
+                    processNext(g)
+                } else if (op != null && handleConnectedReadPurpose(g, op, value, status)) {
+                    processNext(g)
+                } else if (op != null && handleRemoteReadPurpose(op, value, status)) {
+                    processNext(g)
+                } else if (op != null && handleTcsReadPurpose(g, op, value, status)) {
+                    // TCS handler recorded the failure.
+                } else {
+                    appendEvent("Read ${c.uuid} failed: $status")
+                    processNext(g)
+                }
+            }
+        }
+
+        override fun onDescriptorWrite(g: BluetoothGatt, descriptor: BluetoothGattDescriptor, status: Int) {
+            cancelOperationTimeout()
+            operationInFlight = false
+            val op = activeOp as? PendingOp.WriteDescriptor
+            activeOp = null
+            if (op?.purpose == TCS_PURPOSE_CONNECTED_FRAMECOUNT_CCCD) {
+                if (status == BluetoothGatt.GATT_SUCCESS) {
+                    connectedFrameCountCccdReady = true
+                    connectedLifecycleArmed = true
+                    _tcsRemoteState.value = _tcsRemoteState.value.copy(
+                        phase = "connected-sync",
+                        available = false,
+                        linked = false,
+                        lastStatus = "Waiting for recorder frame clock",
+                        lastError = null
+                    )
+                    appendEvent("TCS18.6 CONNECTED cxtic0 CCCD READY; waiting for frame-count notification")
+                    armConnectedSyncTimeout()
+                } else {
+                    connectedLifecycleArmed = false
+                    connectedFrameCountCccdReady = false
+                    _tcsRemoteState.value = _tcsRemoteState.value.copy(
+                        phase = "error",
+                        available = false,
+                        linked = false,
+                        lastStatus = "Recorder frame-clock subscription failed",
+                        lastError = "cxtic0 CCCD write failed status=$status"
+                    )
+                    appendEvent("TCS18.6 CONNECTED cxtic0 CCCD failed status=$status; Android bond is not forced")
+                }
+                processNext(g)
+                return
+            }
+            if (status == GATT_AUTH || status == GATT_ENCRYPTION) {
+                if (op?.purpose == TCS_PURPOSE_BCID_CCCD) {
+                    appendEvent("TCS18 BCID CCCD requires security status=$status; continuing with direct BCID read fallback")
+                    processNext(g)
+                } else if (op?.purpose?.startsWith("tcs-") == true) {
+                    failTcsPairing("${op.purpose} requires GATT security status=$status")
+                } else {
+                    handleSecurityRequired(g, g.device, status)
+                }
+            } else {
+                if (status == BluetoothGatt.GATT_SUCCESS) {
+                    appendEvent("CCCD write OK char=${descriptor.characteristic.uuid} descriptor=${descriptor.uuid} purpose=${op?.purpose ?: "generic"}")
+                } else {
+                    appendEvent("Descriptor ${descriptor.uuid} write failed: $status")
+                    if (op?.purpose == TCS_PURPOSE_BCID_CCCD) {
+                        appendEvent("TCS18 BCID CCCD failed; continuing with direct BCID read/poll")
+                    }
+                }
+                processNext(g)
+            }
+        }
+
+        override fun onCharacteristicWrite(g: BluetoothGatt, c: BluetoothGattCharacteristic, status: Int) {
+            cancelOperationTimeout()
+            operationInFlight = false
+            val op = activeOp as? PendingOp.WriteCharacteristic
+            activeOp = null
+            if (op != null && handlePacketLink18_8WritePurpose(g, op, status)) {
+                processNext(g)
+                return
+            }
+            if (op != null && handleRemoteWritePurpose(g, op, status)) {
+                processNext(g)
+                return
+            }
+            if (op != null && handleTcsWritePurpose(g, op, status)) {
+                processNext(g)
+                return
+            }
+            if (status == GATT_AUTH || status == GATT_ENCRYPTION) {
+                appendEvent("Write ${c.uuid} requires security: $status; OS bond not forced")
+            } else if (status == BluetoothGatt.GATT_SUCCESS) {
+                appendEvent("Write ${c.uuid} accepted by Android GATT")
+            } else {
+                appendEvent("Write ${c.uuid} failed: $status")
+            }
+            processNext(g)
+        }
+
+        override fun onCharacteristicChanged(g: BluetoothGatt, c: BluetoothGattCharacteristic, value: ByteArray) {
+            updateValue(c, value, "notify")
+            if (c.uuid.toString().equals(TCS_BCID_UUID, true) && value.size >= 4) {
+                onOfficialBcid(u32Le(value), "notify")
+            }
+            if (c.uuid.toString().equals(TCS_FRAME_COUNT_UUID, true) && value.size >= 2) {
+                onOfficialConnectedFrameCount(g, value)
+            }
+        }
+
+        @Deprecated("Deprecated in Java")
+        override fun onCharacteristicChanged(g: BluetoothGatt, c: BluetoothGattCharacteristic) {
+            if (Build.VERSION.SDK_INT < 33) {
+                val value = c.value ?: byteArrayOf()
+                updateValue(c, value, "notify")
+                if (c.uuid.toString().equals(TCS_BCID_UUID, true) && value.size >= 4) {
+                    onOfficialBcid(u32Le(value), "notify")
+                }
+                if (c.uuid.toString().equals(TCS_FRAME_COUNT_UUID, true) && value.size >= 2) {
+                    onOfficialConnectedFrameCount(g, value)
+                }
+            }
+        }
+    }
+
+    companion object {
+        const val AIRGLU_SHOGUN_SERVICE_UUID: String = "9383b854-8bee-11e7-bb31-be2e44b06b34"
+
+        // Exact TCSiOSC characteristic map recovered from the official macOS AtomRemote bundle.
+        const val TCS_CONNECT_NAME_UUID: String = "b41d8bd4-a042-4fb4-9509-9bd3036d1ea2"
+        const val TCS_BCID_UUID: String = "ce8dadf8-b7e0-4d9e-94cd-43f84803b361"
+        const val TCS_CCID_UUID: String = "385a8147-e59c-4657-ab1a-c20b4ebb7b95"
+        const val TCS_ID_SLOTS_UUID: String = "e751da25-85b1-46d4-aec4-5a0ee396670d"
+
+        // Official TCS CONNECTED lifecycle characteristic mapping recovered from
+        // TCSBleManager_StringForCxticId / CONNECTED_* states in TCSiOSC.framework.
+        const val TCS_FRAME_COUNT_UUID: String = "9383b110-8bee-11e7-bb31-be2e44b06b34" // cxtic 0
+        const val TCS_TIMECODE_UUID: String = "e3366e3f-9115-417f-9081-6daeee0788f2"    // cxtic 1
+        const val TCS_DEVICE_NAME_UUID: String = "9383b110-8bee-11e7-bb79-be2e44b06b34" // cxtic 2
+        // 18.8.3: exact client CONNECT preflight recovered from TCSiOSC:
+        // CONNECT_ReadingDeviceName reads cxtic 2, then CONNECT_ReadingBcid reads cxtic 4.
+        private const val TCS_PURPOSE_LINKED_DEVICE_NAME = "linked-connect-device-name"
+        private const val TCS_PURPOSE_LINKED_BCID = "linked-connect-bcid"
+
+        // Official TCSPacketLink characteristic mapping recovered from TCSiOSC.
+        const val TCS_PACKET_READ_UUID: String = "232be115-457c-4e46-a24c-e9267071b567"   // cxtic 12
+        const val TCS_PACKET_WRITE_UUID: String = "8a8cc04b-7c4b-4c98-999e-b4ea39164c3a" // cxtic 13
+
+        // Official RemoteApi command IDs recovered from the macOS AtomRemote binary.
+        private const val REMOTE_RECORD_START = 401     // 0x0191
+        private const val REMOTE_RECORD_STOP = 402      // 0x0192
+        private const val REMOTE_PLAY_START = 301       // 0x012D
+        private const val REMOTE_PLAY_PAUSE = 300       // 0x012C, official Play.Pause path
+
+        private const val TCS_PURPOSE_BCID_CCCD = "tcs-bcid-cccd"
+        private const val TCS_PURPOSE_ID_SLOTS = "tcs-id-slots"
+        private const val TCS_PURPOSE_CONNECT_NAME = "tcs-connect-name"
+        private const val TCS_PURPOSE_CCID = "tcs-ccid"
+        private const val TCS_PURPOSE_BCID_READ = "tcs-bcid-read"
+        private const val TCS_PURPOSE_ACCEPT = "tcs-accept"
+        private const val TCS_PURPOSE_CONNECTED_FRAMECOUNT_CCCD = "connected-framecount-cccd"
+        private const val TCS_PURPOSE_CONNECTED_TIMECODE = "connected-timecode"
+        private const val TCS_PURPOSE_CONNECTED_DEVICE_NAME = "connected-device-name"
+        private const val PLINK18_WRITE_PURPOSE = "plink18-write"
+        private const val PLINK18_READ_PURPOSE = "plink18-read"
+
+        private val CCCD_UUID: UUID = UUID.fromString("00002902-0000-1000-8000-00805f9b34fb")
+        private const val GATT_AUTH = 5
+        private const val GATT_ENCRYPTION = 15
+        private const val PACKET_LINK_PROCESS_TICK_MS = 10L
+        private const val REMOTE_BOOTSTRAP_DRAIN_MS = 750L
+        private const val REMOTE_RESPONSE_TIMEOUT_MS = 2500L
+        private const val CONNECTED_SYNC_WAIT_MS = 8_000L
+        private const val CONNECTED_TIMECODE_REFRESH_MS = 750L
+    }
+}

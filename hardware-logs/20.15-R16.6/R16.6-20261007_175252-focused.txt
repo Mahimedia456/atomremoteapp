@@ -1,0 +1,197 @@
+10-07 17:51:49.345  1628  1655 W WindowManager: Keyguard drawn timeout. Setting mKeyguardDrawComplete
+10-07 17:51:51.056   879   962 I mtkpower@impl: [powerd_req] TIMER_MSG_PERF_LOCK_TIMEOUT hdl:16061
+10-07 17:51:51.071   879   962 I mtkpower@impl: [powerd_req] TIMER_MSG_PERF_LOCK_TIMEOUT hdl:16062
+10-07 17:51:51.576   879   962 I mtkpower@impl: [powerd_req] TIMER_MSG_PERF_LOCK_TIMEOUT hdl:16068
+10-07 17:51:51.577   879   962 I mtkpower@impl: [powerd_req] TIMER_MSG_PERF_LOCK_TIMEOUT hdl:16069
+10-07 17:51:51.860 12654 13380 W Kolun.TPMSConfigProxy:  getRemoteConfig timeout
+10-07 17:51:51.984   879   962 I mtkpower@impl: [powerd_req] TIMER_MSG_PERF_LOCK_TIMEOUT hdl:16070
+10-07 17:51:52.056   879   962 I mtkpower@impl: [powerd_req] TIMER_MSG_PERF_LOCK_TIMEOUT hdl:16071
+10-07 17:51:52.168 12654 13380 W Kolun.TPMSConfigProxy:  getRemoteConfig timeout
+10-07 17:51:52.174 12654 13380 W Kolun.TPMSConfigProxy:  getRemoteConfig timeout
+10-07 17:51:52.302   879   962 I mtkpower@impl: [powerd_req] TIMER_MSG_PERF_LOCK_TIMEOUT hdl:16072
+10-07 17:51:52.689   897   897 I Vibrator: Vibrator on for timeoutMs: 300
+10-07 17:51:53.199   897   897 I Vibrator: Vibrator on for timeoutMs: 300
+10-07 17:51:53.307 12654 13380 W Kolun.TPMSConfigProxy:  getRemoteConfig timeout
+10-07 17:51:53.377 12654 13380 W Kolun.TPMSConfigProxy:  getRemoteConfig timeout
+10-07 17:51:53.389 12654 13380 W Kolun.TPMSConfigProxy:  getRemoteConfig timeout
+10-07 17:51:53.530   879   962 I mtkpower@impl: [powerd_req] TIMER_MSG_PERF_LOCK_TIMEOUT hdl:16080
+10-07 17:51:54.427 12654 13380 W Kolun.TPMSConfigProxy:  getRemoteConfig timeout
+10-07 17:51:54.475 12654 13380 W Kolun.TPMSConfigProxy:  getRemoteConfig timeout
+10-07 17:51:54.489 12654 13380 W Kolun.TPMSConfigProxy:  getRemoteConfig timeout
+10-07 17:51:55.640   879   962 I mtkpower@impl: [powerd_req] TIMER_MSG_PERF_LOCK_TIMEOUT hdl:16081
+10-07 17:51:55.656   879   962 I mtkpower@impl: [powerd_req] TIMER_MSG_PERF_LOCK_TIMEOUT hdl:16085
+10-07 17:51:56.642   879   962 I mtkpower@impl: [powerd_req] TIMER_MSG_PERF_LOCK_TIMEOUT hdl:16082
+10-07 17:52:01.142   879   962 I mtkpower@impl: [powerd_req] TIMER_MSG_PERF_LOCK_TIMEOUT hdl:16083
+10-07 17:52:01.467  2209  2653 I bluetooth: GATT_SetIdleTimeout: idle_timeout=65535, status=1, (1-OK 0-not performed)
+10-07 17:52:04.481 12654 13380 W Kolun.TPMSConfigProxy:  getRemoteConfig timeout
+10-07 17:52:04.512 12654 13380 W Kolun.TPMSConfigProxy:  getRemoteConfig timeout
+10-07 17:52:04.515 12654 13380 W Kolun.TPMSConfigProxy:  getRemoteConfig timeout
+10-07 17:52:07.592   879   962 I mtkpower@impl: [powerd_req] TIMER_MSG_PERF_LOCK_TIMEOUT hdl:16089
+10-07 17:52:09.082   879   962 I mtkpower@impl: [powerd_req] TIMER_MSG_PERF_LOCK_TIMEOUT hdl:16090
+10-07 17:52:11.172   879   962 I mtkpower@impl: [powerd_req] TIMER_MSG_PERF_LOCK_TIMEOUT hdl:16092
+10-07 17:52:16.370   879   962 I mtkpower@impl: [powerd_req] TIMER_MSG_PERF_LOCK_TIMEOUT hdl:16093
+10-07 17:52:17.271   879   962 I mtkpower@impl: [powerd_req] TIMER_MSG_PERF_LOCK_TIMEOUT hdl:16094
+10-07 17:52:18.349   897   897 I Vibrator: Vibrator on for timeoutMs: 100
+10-07 17:52:18.599   897   897 I Vibrator: Vibrator on for timeoutMs: 100
+10-07 17:52:20.978   879   962 I mtkpower@impl: [powerd_req] TIMER_MSG_PERF_LOCK_TIMEOUT hdl:16095
+10-07 17:52:24.182   879   962 I mtkpower@impl: [powerd_req] TIMER_MSG_PERF_LOCK_TIMEOUT hdl:16096
+10-07 17:52:25.143   879   962 I mtkpower@impl: [powerd_req] TIMER_MSG_PERF_LOCK_TIMEOUT hdl:16084
+10-07 17:52:25.952   879   962 I mtkpower@impl: [powerd_req] TIMER_MSG_PERF_LOCK_TIMEOUT hdl:16097
+10-07 17:52:26.900   879   962 I mtkpower@impl: [powerd_req] TIMER_MSG_PERF_LOCK_TIMEOUT hdl:16098
+10-07 17:52:29.227   879   962 I mtkpower@impl: [powerd_req] TIMER_MSG_PERF_LOCK_TIMEOUT hdl:16099
+10-07 17:52:31.924   879   962 I mtkpower@impl: [powerd_req] TIMER_MSG_PERF_LOCK_TIMEOUT hdl:16100
+10-07 17:52:32.588   879   962 I mtkpower@impl: [powerd_req] TIMER_MSG_PERF_LOCK_TIMEOUT hdl:16111
+10-07 17:52:35.313   879   962 I mtkpower@impl: [powerd_req] TIMER_MSG_PERF_LOCK_TIMEOUT hdl:16112
+10-07 17:52:35.856   879   962 I mtkpower@impl: [powerd_req] TIMER_MSG_PERF_LOCK_TIMEOUT hdl:16113
+10-07 17:52:38.159   879   962 I mtkpower@impl: [powerd_req] TIMER_MSG_PERF_LOCK_TIMEOUT hdl:16114
+10-07 17:52:38.813   879   962 I mtkpower@impl: [powerd_req] TIMER_MSG_PERF_LOCK_TIMEOUT hdl:16115
+10-07 17:52:40.332   879   962 I mtkpower@impl: [powerd_req] TIMER_MSG_PERF_LOCK_TIMEOUT hdl:16116
+10-07 17:52:40.767   879   962 I mtkpower@impl: [powerd_req] TIMER_MSG_PERF_LOCK_TIMEOUT hdl:16117
+10-07 17:52:40.767   879   962 I mtkpower@impl: [powerd_req] TIMER_MSG_PERF_LOCK_TIMEOUT hdl:16118
+10-07 17:52:41.081   879   962 I mtkpower@impl: [powerd_req] TIMER_MSG_PERF_LOCK_TIMEOUT hdl:16119
+10-07 17:52:41.377   879   962 I mtkpower@impl: [powerd_req] TIMER_MSG_PERF_LOCK_TIMEOUT hdl:16120
+10-07 17:52:41.412   879   962 I mtkpower@impl: [powerd_req] TIMER_MSG_PERF_LOCK_TIMEOUT hdl:16121
+10-07 17:52:42.186   879   962 I mtkpower@impl: [powerd_req] TIMER_MSG_PERF_LOCK_TIMEOUT hdl:16122
+10-07 17:52:43.050   879   962 I mtkpower@impl: [powerd_req] TIMER_MSG_PERF_LOCK_TIMEOUT hdl:16123
+10-07 17:52:44.308 17244 20788 E ogle.android.gm: hiddenapi: Accessing hidden method Lcom/android/org/conscrypt/ConscryptEngineSocket;->setHandshakeTimeout(I)V (runtime_flags=CorePlatformApi, domain=core-platform, api=blocked,core-platform-api) from Lmej; (domain=app, TargetSdkVersion=37) using reflection: denied
+10-07 17:52:44.309 17244 20788 E ogle.android.gm: hiddenapi: Accessing hidden method Lcom/android/org/conscrypt/OpenSSLSocketImpl;->setHandshakeTimeout(I)V (runtime_flags=CorePlatformApi, domain=core-platform, api=max-target-r,core-platform-api) from Lmej; (domain=app, TargetSdkVersion=37) using reflection: denied
+10-07 17:52:44.309 17244 20788 E ogle.android.gm: hiddenapi: Accessing hidden method Lcom/android/org/conscrypt/AbstractConscryptSocket;->setHandshakeTimeout(I)V (runtime_flags=0, domain=core-platform, api=max-target-r) from Lmej; (domain=app, TargetSdkVersion=37) using reflection: denied
+10-07 17:52:44.309 17244 20788 W pwx     : [Gmail] SSLSocketFactoryWrapper: unable to set handshake timeout
+10-07 17:52:44.309 17244 20788 W pwx     : java.lang.NoSuchMethodException: com.android.org.conscrypt.Java8EngineSocket.setHandshakeTimeout [int]
+10-07 17:52:45.153   879   962 I mtkpower@impl: [powerd_req] TIMER_MSG_PERF_LOCK_TIMEOUT hdl:16124
+10-07 17:52:45.622   879   962 I mtkpower@impl: [powerd_req] TIMER_MSG_PERF_LOCK_TIMEOUT hdl:16125
+10-07 17:52:45.788 17244 20787 E ogle.android.gm: hiddenapi: Accessing hidden method Lcom/android/org/conscrypt/ConscryptEngineSocket;->setHandshakeTimeout(I)V (runtime_flags=CorePlatformApi, domain=core-platform, api=blocked,core-platform-api) from Lmej; (domain=app, TargetSdkVersion=37) using reflection: denied
+10-07 17:52:45.788 17244 20787 E ogle.android.gm: hiddenapi: Accessing hidden method Lcom/android/org/conscrypt/OpenSSLSocketImpl;->setHandshakeTimeout(I)V (runtime_flags=CorePlatformApi, domain=core-platform, api=max-target-r,core-platform-api) from Lmej; (domain=app, TargetSdkVersion=37) using reflection: denied
+10-07 17:52:45.788 17244 20787 E ogle.android.gm: hiddenapi: Accessing hidden method Lcom/android/org/conscrypt/AbstractConscryptSocket;->setHandshakeTimeout(I)V (runtime_flags=0, domain=core-platform, api=max-target-r) from Lmej; (domain=app, TargetSdkVersion=37) using reflection: denied
+10-07 17:52:45.789 17244 20787 W pwx     : [Gmail] SSLSocketFactoryWrapper: unable to set handshake timeout
+10-07 17:52:45.789 17244 20787 W pwx     : java.lang.NoSuchMethodException: com.android.org.conscrypt.Java8EngineSocket.setHandshakeTimeout [int]
+10-07 17:52:46.582   879   962 I mtkpower@impl: [powerd_req] TIMER_MSG_PERF_LOCK_TIMEOUT hdl:16126
+10-07 17:52:48.428   879   962 I mtkpower@impl: [powerd_req] TIMER_MSG_PERF_LOCK_TIMEOUT hdl:16128
+10-07 17:52:55.139 20167 20195 D AtomRemoteGatt: RX[read] svc=9383b854-8bee-11e7-bb31-be2e44b06b34 char=232be115-457c-4e46-a24c-e9267071b567 len=1 hex=E0 
+10-07 17:52:55.140 20167 20195 D AtomRemoteGatt: TCS18.8 PLINK RX state=READY frame=E0 final=true peerCredit=true local=false payloadBytes=0
+10-07 17:52:55.140 20167 20195 D AtomRemoteGatt: TCS18.5.1 PacketLink ATT queue idle: phase=transport-ready
+10-07 17:52:55.146 20167 20167 D AtomRemoteGatt: TCS18.8 PLINK TX state=WRITING frame=E0 final=true payloadBytes=0 peerCredit=true
+10-07 17:52:55.236 20167 20195 D AtomRemoteGatt: TCS18.8 PLINK WRITE COMPLETE final=1 -> state=READING
+10-07 17:52:55.335 20167 20195 D AtomRemoteGatt: RX[read] svc=9383b854-8bee-11e7-bb31-be2e44b06b34 char=232be115-457c-4e46-a24c-e9267071b567 len=1 hex=E0 
+10-07 17:52:55.337 20167 20195 D AtomRemoteGatt: TCS18.8 PLINK RX state=READY frame=E0 final=true peerCredit=true local=false payloadBytes=0
+10-07 17:52:55.338 20167 20167 D AtomRemoteGatt: TCS18.8 PLINK TX state=WRITING frame=E0 final=true payloadBytes=0 peerCredit=true
+10-07 17:52:55.338 20167 20167 D AtomRemoteGatt: TCS18.5.1 PacketLink ATT queue idle: phase=transport-ready
+10-07 17:52:55.431 20167 20195 D AtomRemoteGatt: TCS18.8 PLINK WRITE COMPLETE final=1 -> state=READING
+10-07 17:52:55.532 20167 20195 D AtomRemoteGatt: RX[read] svc=9383b854-8bee-11e7-bb31-be2e44b06b34 char=232be115-457c-4e46-a24c-e9267071b567 len=1 hex=E0 
+10-07 17:52:55.534 20167 20195 D AtomRemoteGatt: TCS18.8 PLINK RX state=READY frame=E0 final=true peerCredit=true local=false payloadBytes=0
+10-07 17:52:55.534 20167 20195 D AtomRemoteGatt: TCS18.5.1 PacketLink ATT queue idle: phase=transport-ready
+10-07 17:52:55.537 20167 20167 D AtomRemoteGatt: TCS18.8 PLINK TX state=WRITING frame=E0 final=true payloadBytes=0 peerCredit=true
+10-07 17:52:55.627 20167 20195 D AtomRemoteGatt: TCS18.8 PLINK WRITE COMPLETE final=1 -> state=READING
+10-07 17:52:55.725 20167 20195 D AtomRemoteGatt: RX[read] svc=9383b854-8bee-11e7-bb31-be2e44b06b34 char=232be115-457c-4e46-a24c-e9267071b567 len=1 hex=E0 
+10-07 17:52:55.728 20167 20195 D AtomRemoteGatt: TCS18.8 PLINK RX state=READY frame=E0 final=true peerCredit=true local=false payloadBytes=0
+10-07 17:52:55.729 20167 20195 D AtomRemoteGatt: TCS18.5.1 PacketLink ATT queue idle: phase=transport-ready
+10-07 17:52:55.737 20167 20167 D AtomRemoteGatt: TCS18.8 PLINK TX state=WRITING frame=E0 final=true payloadBytes=0 peerCredit=true
+10-07 17:52:55.822 20167 20195 D AtomRemoteGatt: TCS18.8 PLINK WRITE COMPLETE final=1 -> state=READING
+10-07 17:52:55.920 20167 20195 D AtomRemoteGatt: RX[read] svc=9383b854-8bee-11e7-bb31-be2e44b06b34 char=232be115-457c-4e46-a24c-e9267071b567 len=1 hex=E0 
+10-07 17:52:55.922 20167 20195 D AtomRemoteGatt: TCS18.8 PLINK RX state=READY frame=E0 final=true peerCredit=true local=false payloadBytes=0
+10-07 17:52:55.923 20167 20195 D AtomRemoteGatt: TCS18.5.1 PacketLink ATT queue idle: phase=transport-ready
+10-07 17:52:55.930 20167 20167 D AtomRemoteGatt: TCS18.8 PLINK TX state=WRITING frame=E0 final=true payloadBytes=0 peerCredit=true
+10-07 17:52:56.041   918  1119 D SurfaceFlinger: calculateTimeoutTime, triggerInterval = 1 sec + 194511077 nsec
+10-07 17:52:56.065 20167 20195 D AtomRemoteGatt: TCS18.8 PLINK WRITE COMPLETE final=1 -> state=READING
+10-07 17:52:56.163 20167 20195 D AtomRemoteGatt: RX[read] svc=9383b854-8bee-11e7-bb31-be2e44b06b34 char=232be115-457c-4e46-a24c-e9267071b567 len=1 hex=E0 
+10-07 17:52:56.165 20167 20195 D AtomRemoteGatt: TCS18.8 PLINK RX state=READY frame=E0 final=true peerCredit=true local=false payloadBytes=0
+10-07 17:52:56.166 20167 20195 D AtomRemoteGatt: TCS18.5.1 PacketLink ATT queue idle: phase=transport-ready
+10-07 17:52:56.173 20167 20167 D AtomRemoteGatt: TCS18.8 PLINK TX state=WRITING frame=E0 final=true payloadBytes=0 peerCredit=true
+10-07 17:52:56.260 20167 20195 D AtomRemoteGatt: TCS18.8 PLINK WRITE COMPLETE final=1 -> state=READING
+10-07 17:52:56.359 20167 20195 D AtomRemoteGatt: RX[read] svc=9383b854-8bee-11e7-bb31-be2e44b06b34 char=232be115-457c-4e46-a24c-e9267071b567 len=1 hex=E0 
+10-07 17:52:56.361 20167 20195 D AtomRemoteGatt: TCS18.8 PLINK RX state=READY frame=E0 final=true peerCredit=true local=false payloadBytes=0
+10-07 17:52:56.362 20167 20195 D AtomRemoteGatt: TCS18.5.1 PacketLink ATT queue idle: phase=transport-ready
+10-07 17:52:56.364 20167 20167 D AtomRemoteGatt: TCS18.8 PLINK TX state=WRITING frame=E0 final=true payloadBytes=0 peerCredit=true
+10-07 17:52:56.456 20167 20195 D AtomRemoteGatt: TCS18.8 PLINK WRITE COMPLETE final=1 -> state=READING
+10-07 17:52:56.554 20167 20195 D AtomRemoteGatt: RX[read] svc=9383b854-8bee-11e7-bb31-be2e44b06b34 char=232be115-457c-4e46-a24c-e9267071b567 len=1 hex=E0 
+10-07 17:52:56.557 20167 20195 D AtomRemoteGatt: TCS18.8 PLINK RX state=READY frame=E0 final=true peerCredit=true local=false payloadBytes=0
+10-07 17:52:56.557 20167 20195 D AtomRemoteGatt: TCS18.5.1 PacketLink ATT queue idle: phase=transport-ready
+10-07 17:52:56.567 20167 20167 D AtomRemoteGatt: TCS18.8 PLINK TX state=WRITING frame=E0 final=true payloadBytes=0 peerCredit=true
+10-07 17:52:56.650 20167 20195 D AtomRemoteGatt: TCS18.8 PLINK WRITE COMPLETE final=1 -> state=READING
+10-07 17:52:56.797 20167 20195 D AtomRemoteGatt: RX[read] svc=9383b854-8bee-11e7-bb31-be2e44b06b34 char=232be115-457c-4e46-a24c-e9267071b567 len=1 hex=E0 
+10-07 17:52:56.799 20167 20195 D AtomRemoteGatt: TCS18.8 PLINK RX state=READY frame=E0 final=true peerCredit=true local=false payloadBytes=0
+10-07 17:52:56.800 20167 20195 D AtomRemoteGatt: TCS18.5.1 PacketLink ATT queue idle: phase=transport-ready
+10-07 17:52:56.801 20167 20167 D AtomRemoteGatt: TCS18.8 PLINK TX state=WRITING frame=E0 final=true payloadBytes=0 peerCredit=true
+10-07 17:52:56.894 20167 20195 D AtomRemoteGatt: TCS18.8 PLINK WRITE COMPLETE final=1 -> state=READING
+10-07 17:52:56.992 20167 20195 D AtomRemoteGatt: RX[read] svc=9383b854-8bee-11e7-bb31-be2e44b06b34 char=232be115-457c-4e46-a24c-e9267071b567 len=1 hex=E0 
+10-07 17:52:56.994 20167 20195 D AtomRemoteGatt: TCS18.8 PLINK RX state=READY frame=E0 final=true peerCredit=true local=false payloadBytes=0
+10-07 17:52:56.995 20167 20195 D AtomRemoteGatt: TCS18.5.1 PacketLink ATT queue idle: phase=transport-ready
+10-07 17:52:57.003 20167 20167 D AtomRemoteGatt: TCS18.8 PLINK TX state=WRITING frame=E0 final=true payloadBytes=0 peerCredit=true
+10-07 17:52:57.138 20167 20195 D AtomRemoteGatt: TCS18.8 PLINK WRITE COMPLETE final=1 -> state=READING
+10-07 17:52:57.235 20167 20195 D AtomRemoteGatt: RX[read] svc=9383b854-8bee-11e7-bb31-be2e44b06b34 char=232be115-457c-4e46-a24c-e9267071b567 len=1 hex=E0 
+10-07 17:52:57.236   918  1119 D SurfaceFlinger: calculateTimeoutTime, triggerInterval = 1 sec + 193370538 nsec
+10-07 17:52:57.236 20167 20195 D AtomRemoteGatt: TCS18.8 PLINK RX state=READY frame=E0 final=true peerCredit=true local=false payloadBytes=0
+10-07 17:52:57.237 20167 20195 D AtomRemoteGatt: TCS18.5.1 PacketLink ATT queue idle: phase=transport-ready
+10-07 17:52:57.238 20167 20167 D AtomRemoteGatt: TCS18.8 PLINK TX state=WRITING frame=E0 final=true payloadBytes=0 peerCredit=true
+10-07 17:52:57.332 20167 20195 D AtomRemoteGatt: TCS18.8 PLINK WRITE COMPLETE final=1 -> state=READING
+10-07 17:52:57.430 20167 20195 D AtomRemoteGatt: RX[read] svc=9383b854-8bee-11e7-bb31-be2e44b06b34 char=232be115-457c-4e46-a24c-e9267071b567 len=1 hex=E0 
+10-07 17:52:57.432 20167 20195 D AtomRemoteGatt: TCS18.8 PLINK RX state=READY frame=E0 final=true peerCredit=true local=false payloadBytes=0
+10-07 17:52:57.432 20167 20195 D AtomRemoteGatt: TCS18.5.1 PacketLink ATT queue idle: phase=transport-ready
+10-07 17:52:57.441 20167 20167 D AtomRemoteGatt: TCS18.8 PLINK TX state=WRITING frame=E0 final=true payloadBytes=0 peerCredit=true
+10-07 17:52:57.527 20167 20195 D AtomRemoteGatt: TCS18.8 PLINK WRITE COMPLETE final=1 -> state=READING
+10-07 17:52:57.625 20167 20195 D AtomRemoteGatt: RX[read] svc=9383b854-8bee-11e7-bb31-be2e44b06b34 char=232be115-457c-4e46-a24c-e9267071b567 len=1 hex=E0 
+10-07 17:52:57.626 20167 20195 D AtomRemoteGatt: TCS18.8 PLINK RX state=READY frame=E0 final=true peerCredit=true local=false payloadBytes=0
+10-07 17:52:57.627 20167 20195 D AtomRemoteGatt: TCS18.5.1 PacketLink ATT queue idle: phase=transport-ready
+10-07 17:52:57.629 20167 20167 D AtomRemoteGatt: TCS18.8 PLINK TX state=WRITING frame=E0 final=true payloadBytes=0 peerCredit=true
+10-07 17:52:57.722 20167 20195 D AtomRemoteGatt: TCS18.8 PLINK WRITE COMPLETE final=1 -> state=READING
+10-07 17:52:57.870 20167 20195 D AtomRemoteGatt: RX[read] svc=9383b854-8bee-11e7-bb31-be2e44b06b34 char=232be115-457c-4e46-a24c-e9267071b567 len=1 hex=E0 
+10-07 17:52:57.872 20167 20195 D AtomRemoteGatt: TCS18.8 PLINK RX state=READY frame=E0 final=true peerCredit=true local=false payloadBytes=0
+10-07 17:52:57.872 20167 20195 D AtomRemoteGatt: TCS18.5.1 PacketLink ATT queue idle: phase=transport-ready
+10-07 17:52:57.877 20167 20167 D AtomRemoteGatt: TCS18.8 PLINK TX state=WRITING frame=E0 final=true payloadBytes=0 peerCredit=true
+10-07 17:52:57.967 20167 20195 D AtomRemoteGatt: TCS18.8 PLINK WRITE COMPLETE final=1 -> state=READING
+10-07 17:52:58.063 20167 20195 D AtomRemoteGatt: RX[read] svc=9383b854-8bee-11e7-bb31-be2e44b06b34 char=232be115-457c-4e46-a24c-e9267071b567 len=1 hex=E0 
+10-07 17:52:58.065 20167 20195 D AtomRemoteGatt: TCS18.8 PLINK RX state=READY frame=E0 final=true peerCredit=true local=false payloadBytes=0
+10-07 17:52:58.066 20167 20167 D AtomRemoteGatt: TCS18.8 PLINK TX state=WRITING frame=E0 final=true payloadBytes=0 peerCredit=true
+10-07 17:52:58.066 20167 20167 D AtomRemoteGatt: TCS18.5.1 PacketLink ATT queue idle: phase=transport-ready
+10-07 17:52:58.160 20167 20195 D AtomRemoteGatt: TCS18.8 PLINK WRITE COMPLETE final=1 -> state=READING
+10-07 17:52:58.258 20167 20195 D AtomRemoteGatt: RX[read] svc=9383b854-8bee-11e7-bb31-be2e44b06b34 char=232be115-457c-4e46-a24c-e9267071b567 len=1 hex=E0 
+10-07 17:52:58.260 20167 20195 D AtomRemoteGatt: TCS18.8 PLINK RX state=READY frame=E0 final=true peerCredit=true local=false payloadBytes=0
+10-07 17:52:58.261 20167 20195 D AtomRemoteGatt: TCS18.5.1 PacketLink ATT queue idle: phase=transport-ready
+10-07 17:52:58.263 20167 20167 D AtomRemoteGatt: TCS18.8 PLINK TX state=WRITING frame=E0 final=true payloadBytes=0 peerCredit=true
+10-07 17:52:58.355 20167 20195 D AtomRemoteGatt: TCS18.8 PLINK WRITE COMPLETE final=1 -> state=READING
+10-07 17:52:58.429   918  1119 D SurfaceFlinger: calculateTimeoutTime, triggerInterval = 1 sec + 194338231 nsec
+10-07 17:52:58.455 20167 20195 D AtomRemoteGatt: RX[read] svc=9383b854-8bee-11e7-bb31-be2e44b06b34 char=232be115-457c-4e46-a24c-e9267071b567 len=1 hex=E0 
+10-07 17:52:58.457 20167 20195 D AtomRemoteGatt: TCS18.8 PLINK RX state=READY frame=E0 final=true peerCredit=true local=false payloadBytes=0
+10-07 17:52:58.458 20167 20195 D AtomRemoteGatt: TCS18.5.1 PacketLink ATT queue idle: phase=transport-ready
+10-07 17:52:58.462 20167 20167 D AtomRemoteGatt: TCS18.8 PLINK TX state=WRITING frame=E0 final=true payloadBytes=0 peerCredit=true
+10-07 17:52:58.551 20167 20195 D AtomRemoteGatt: TCS18.8 PLINK WRITE COMPLETE final=1 -> state=READING
+10-07 17:52:58.648 20167 20195 D AtomRemoteGatt: RX[read] svc=9383b854-8bee-11e7-bb31-be2e44b06b34 char=232be115-457c-4e46-a24c-e9267071b567 len=1 hex=E0 
+10-07 17:52:58.649 20167 20195 D AtomRemoteGatt: TCS18.8 PLINK RX state=READY frame=E0 final=true peerCredit=true local=false payloadBytes=0
+10-07 17:52:58.650 20167 20195 D AtomRemoteGatt: TCS18.5.1 PacketLink ATT queue idle: phase=transport-ready
+10-07 17:52:58.651 20167 20167 D AtomRemoteGatt: TCS18.8 PLINK TX state=WRITING frame=E0 final=true payloadBytes=0 peerCredit=true
+10-07 17:52:58.746 20167 20195 D AtomRemoteGatt: TCS18.8 PLINK WRITE COMPLETE final=1 -> state=READING
+10-07 17:52:58.941 20167 20195 D AtomRemoteGatt: RX[read] svc=9383b854-8bee-11e7-bb31-be2e44b06b34 char=232be115-457c-4e46-a24c-e9267071b567 len=1 hex=E0 
+10-07 17:52:58.942 20167 20195 D AtomRemoteGatt: TCS18.8 PLINK RX state=READY frame=E0 final=true peerCredit=true local=false payloadBytes=0
+10-07 17:52:58.943 20167 20195 D AtomRemoteGatt: TCS18.5.1 PacketLink ATT queue idle: phase=transport-ready
+10-07 17:52:58.951 20167 20167 D AtomRemoteGatt: TCS18.8 PLINK TX state=WRITING frame=E0 final=true payloadBytes=0 peerCredit=true
+10-07 17:52:59.039 20167 20195 D AtomRemoteGatt: TCS18.8 PLINK WRITE COMPLETE final=1 -> state=READING
+10-07 17:52:59.138 20167 20195 D AtomRemoteGatt: RX[read] svc=9383b854-8bee-11e7-bb31-be2e44b06b34 char=232be115-457c-4e46-a24c-e9267071b567 len=1 hex=E0 
+10-07 17:52:59.140 20167 20195 D AtomRemoteGatt: TCS18.8 PLINK RX state=READY frame=E0 final=true peerCredit=true local=false payloadBytes=0
+10-07 17:52:59.140 20167 20195 D AtomRemoteGatt: TCS18.5.1 PacketLink ATT queue idle: phase=transport-ready
+10-07 17:52:59.150 20167 20167 D AtomRemoteGatt: TCS18.8 PLINK TX state=WRITING frame=E0 final=true payloadBytes=0 peerCredit=true
+10-07 17:52:59.233 20167 20195 D AtomRemoteGatt: TCS18.8 PLINK WRITE COMPLETE final=1 -> state=READING
+10-07 17:52:59.330 20167 20195 D AtomRemoteGatt: RX[read] svc=9383b854-8bee-11e7-bb31-be2e44b06b34 char=232be115-457c-4e46-a24c-e9267071b567 len=1 hex=E0 
+10-07 17:52:59.331 20167 20195 D AtomRemoteGatt: TCS18.8 PLINK RX state=READY frame=E0 final=true peerCredit=true local=false payloadBytes=0
+10-07 17:52:59.331 20167 20195 D AtomRemoteGatt: TCS18.5.1 PacketLink ATT queue idle: phase=transport-ready
+10-07 17:52:59.340 20167 20167 D AtomRemoteGatt: TCS18.8 PLINK TX state=WRITING frame=E0 final=true payloadBytes=0 peerCredit=true
+10-07 17:52:59.429 20167 20195 D AtomRemoteGatt: TCS18.8 PLINK WRITE COMPLETE final=1 -> state=READING
+10-07 17:52:59.526 20167 20195 D AtomRemoteGatt: RX[read] svc=9383b854-8bee-11e7-bb31-be2e44b06b34 char=232be115-457c-4e46-a24c-e9267071b567 len=1 hex=E0 
+10-07 17:52:59.528 20167 20195 D AtomRemoteGatt: TCS18.8 PLINK RX state=READY frame=E0 final=true peerCredit=true local=false payloadBytes=0
+10-07 17:52:59.528 20167 20195 D AtomRemoteGatt: TCS18.5.1 PacketLink ATT queue idle: phase=transport-ready
+10-07 17:52:59.538 20167 20167 D AtomRemoteGatt: TCS18.8 PLINK TX state=WRITING frame=E0 final=true payloadBytes=0 peerCredit=true
+10-07 17:52:59.624   918  1119 D SurfaceFlinger: calculateTimeoutTime, triggerInterval = 1 sec + 194151384 nsec
+10-07 17:52:59.671 20167 20195 D AtomRemoteGatt: TCS18.8 PLINK WRITE COMPLETE final=1 -> state=READING
+10-07 17:52:59.770 20167 20195 D AtomRemoteGatt: RX[read] svc=9383b854-8bee-11e7-bb31-be2e44b06b34 char=232be115-457c-4e46-a24c-e9267071b567 len=1 hex=E0 
+10-07 17:52:59.771 20167 20195 D AtomRemoteGatt: TCS18.8 PLINK RX state=READY frame=E0 final=true peerCredit=true local=false payloadBytes=0
+10-07 17:52:59.772 20167 20195 D AtomRemoteGatt: TCS18.5.1 PacketLink ATT queue idle: phase=transport-ready
+10-07 17:52:59.779 20167 20167 D AtomRemoteGatt: TCS18.8 PLINK TX state=WRITING frame=E0 final=true payloadBytes=0 peerCredit=true
+10-07 17:52:59.867 20167 20195 D AtomRemoteGatt: TCS18.8 PLINK WRITE COMPLETE final=1 -> state=READING
+10-07 17:52:59.965 20167 20195 D AtomRemoteGatt: RX[read] svc=9383b854-8bee-11e7-bb31-be2e44b06b34 char=232be115-457c-4e46-a24c-e9267071b567 len=1 hex=E0 
+10-07 17:52:59.967 20167 20195 D AtomRemoteGatt: TCS18.8 PLINK RX state=READY frame=E0 final=true peerCredit=true local=false payloadBytes=0
+10-07 17:52:59.967 20167 20195 D AtomRemoteGatt: TCS18.5.1 PacketLink ATT queue idle: phase=transport-ready
+10-07 17:52:59.970 20167 20167 D AtomRemoteGatt: TCS18.8 PLINK TX state=WRITING frame=E0 final=true payloadBytes=0 peerCredit=true
+10-07 17:53:00.061 20167 20195 D AtomRemoteGatt: TCS18.8 PLINK WRITE COMPLETE final=1 -> state=READING
+10-07 17:53:00.159 20167 20195 D AtomRemoteGatt: RX[read] svc=9383b854-8bee-11e7-bb31-be2e44b06b34 char=232be115-457c-4e46-a24c-e9267071b567 len=1 hex=E0 
+10-07 17:53:00.160 20167 20195 D AtomRemoteGatt: TCS18.8 PLINK RX state=READY frame=E0 final=true peerCredit=true local=false payloadBytes=0
+10-07 17:53:00.161 20167 20195 D AtomRemoteGatt: TCS18.5.1 PacketLink ATT queue idle: phase=transport-ready
+10-07 17:53:00.168 20167 20167 D AtomRemoteGatt: TCS18.8 PLINK TX state=WRITING frame=E0 final=true payloadBytes=0 peerCredit=true

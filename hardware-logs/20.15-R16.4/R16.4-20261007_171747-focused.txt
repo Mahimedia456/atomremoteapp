@@ -1,0 +1,394 @@
+﻿10-07 17:16:28.533   879   962 I mtkpower@impl: [powerd_req] TIMER_MSG_PERF_LOCK_TIMEOUT hdl:15549
+10-07 17:16:30.508  5144  5314 W soft_error.cpp: [DGWClientConfig] : sgConnectTimeout: value 0 outside valid range [1, 120] <force_oncall:mi_client_infra:force_oncall>
+10-07 17:16:30.508  5144  5314 W soft_error.cpp: [DGWClientConfig] : sgPingTimeout: value 0 outside valid range [1, 60] <force_oncall:mi_client_infra:force_oncall>
+10-07 17:16:30.508  5144  5314 W soft_error.cpp: [DGWClientConfig] : tunnelConnectTimeout: value 0 outside valid range [1, 120] <force_oncall:mi_client_infra:force_oncall>
+10-07 17:16:30.508  5144  5314 W soft_error.cpp: [DGWClientConfig] : tunnelConnectAckTimeout: value 0 outside valid range [1, 120] <force_oncall:mi_client_infra:force_oncall>
+10-07 17:16:30.822   879   962 I mtkpower@impl: [powerd_req] TIMER_MSG_PERF_LOCK_TIMEOUT hdl:15550
+10-07 17:16:31.195   905 31539 D APM_AudioPolicyManager: listAudioPorts mAvailableInputDevices 0x80000004, 0x80000008, 0x80000040, 0x80000080, 0x80000100, 0x80002000, 0x90000000
+10-07 17:16:31.199   905 31539 D APM_AudioPolicyManager: listAudioPorts mAvailableInputDevices 0x80000004, 0x80000008, 0x80000040, 0x80000080, 0x80000100, 0x80002000, 0x90000000
+10-07 17:16:31.945  3733  3733 W AtomRemoteSession: TCS20.12.5 MONITOR SECTION TIMEOUT label=MonitorMode
+10-07 17:16:38.959   879   962 I mtkpower@impl: [powerd_req] TIMER_MSG_PERF_LOCK_TIMEOUT hdl:15551
+10-07 17:16:39.572  3733  3733 W AtomRemoteSession: TCS20.12.5 MONITOR SECTION TIMEOUT label=MonitorPage
+10-07 17:16:41.221   879   962 I mtkpower@impl: [powerd_req] TIMER_MSG_PERF_LOCK_TIMEOUT hdl:15553
+10-07 17:16:44.386   879   962 I mtkpower@impl: [powerd_req] TIMER_MSG_PERF_LOCK_TIMEOUT hdl:15555
+10-07 17:16:45.736   879   962 I mtkpower@impl: [powerd_req] TIMER_MSG_PERF_LOCK_TIMEOUT hdl:15556
+10-07 17:16:46.984   879   962 I mtkpower@impl: [powerd_req] TIMER_MSG_PERF_LOCK_TIMEOUT hdl:15557
+10-07 17:16:47.451  3733  3733 W AtomRemoteSession: TCS20.12.5 MONITOR SECTION TIMEOUT label=Zoom
+10-07 17:16:47.994   879   962 I mtkpower@impl: [powerd_req] TIMER_MSG_PERF_LOCK_TIMEOUT hdl:15558
+10-07 17:16:48.891   879   962 I mtkpower@impl: [powerd_req] TIMER_MSG_PERF_LOCK_TIMEOUT hdl:15559
+10-07 17:16:49.913   879   962 I mtkpower@impl: [powerd_req] TIMER_MSG_PERF_LOCK_TIMEOUT hdl:15560
+10-07 17:16:51.634   879   962 I mtkpower@impl: [powerd_req] TIMER_MSG_PERF_LOCK_TIMEOUT hdl:15561
+10-07 17:16:52.525   879   962 I mtkpower@impl: [powerd_req] TIMER_MSG_PERF_LOCK_TIMEOUT hdl:15562
+10-07 17:16:53.688   879   962 I mtkpower@impl: [powerd_req] TIMER_MSG_PERF_LOCK_TIMEOUT hdl:15563
+10-07 17:16:55.241   879   962 I mtkpower@impl: [powerd_req] TIMER_MSG_PERF_LOCK_TIMEOUT hdl:15564
+10-07 17:16:55.291  3733  3733 W AtomRemoteSession: TCS20.12.5 MONITOR SECTION TIMEOUT label=Focus
+10-07 17:16:56.263   879   962 I mtkpower@impl: [powerd_req] TIMER_MSG_PERF_LOCK_TIMEOUT hdl:15565
+10-07 17:16:57.240   879   962 I mtkpower@impl: [powerd_req] TIMER_MSG_PERF_LOCK_TIMEOUT hdl:15566
+10-07 17:16:58.533   879   962 I mtkpower@impl: [powerd_req] TIMER_MSG_PERF_LOCK_TIMEOUT hdl:15567
+10-07 17:17:00.106   879   962 I mtkpower@impl: [powerd_req] TIMER_MSG_PERF_LOCK_TIMEOUT hdl:15568
+10-07 17:17:03.048  3733  3733 W AtomRemoteSession: TCS20.12.5 MONITOR SECTION TIMEOUT label=MonitorAssist
+10-07 17:17:03.549   879   962 I mtkpower@impl: [powerd_req] TIMER_MSG_PERF_LOCK_TIMEOUT hdl:15569
+10-07 17:17:04.702   879   962 I mtkpower@impl: [powerd_req] TIMER_MSG_PERF_LOCK_TIMEOUT hdl:15570
+10-07 17:17:05.690   879   962 I mtkpower@impl: [powerd_req] TIMER_MSG_PERF_LOCK_TIMEOUT hdl:15571
+10-07 17:17:05.820 12654 13380 W Kolun.TPMSConfigProxy:  getRemoteConfig timeout
+10-07 17:17:05.971 12654 13380 W Kolun.TPMSConfigProxy:  getRemoteConfig timeout
+10-07 17:17:05.977 12654 13380 W Kolun.TPMSConfigProxy:  getRemoteConfig timeout
+10-07 17:17:07.990   879   962 I mtkpower@impl: [powerd_req] TIMER_MSG_PERF_LOCK_TIMEOUT hdl:15572
+10-07 17:17:09.850  1416  1416 I VoLTE IMCB-1: {{{{uatimer expiry acct_id: 2, uatimer_id: 1, uatimeout: 2998, user_data: 0x1000302F, timer_id: 72 imcb_uatimer_tmo_hdlr()@1#222
+10-07 17:17:10.062   879   962 I mtkpower@impl: [powerd_req] TIMER_MSG_PERF_LOCK_TIMEOUT hdl:15573
+10-07 17:17:10.710  3733  3733 W AtomRemoteSession: TCS20.12.5 MONITOR SECTION TIMEOUT label=Scopes
+10-07 17:17:11.361   879   962 I mtkpower@impl: [powerd_req] TIMER_MSG_PERF_LOCK_TIMEOUT hdl:15574
+10-07 17:17:11.844  1416  1416 I VoLTE IMCB-1: {{{{uatimer expiry acct_id: 2, uatimer_id: 1, uatimeout: 3000, user_data: 0x10002F2E, timer_id: 71 imcb_uatimer_tmo_hdlr()@1#222
+10-07 17:17:11.847  1416  1416 I VoLTE IMCB: uatimer fail cancel acct_id: 0, uatimer_id: 1, uatimeout: 0, user_data: 0x10002F2E imcb_uatimer_cancel()@0#299
+10-07 17:17:11.847  1416  1416 I VoLTE IMCB: uatimer fail cancel acct_id: 0, uatimer_id: 1, uatimeout: 0, user_data: 0x1000302F imcb_uatimer_cancel()@0#299
+10-07 17:17:12.051   879   962 I mtkpower@impl: [powerd_req] TIMER_MSG_PERF_LOCK_TIMEOUT hdl:15575
+10-07 17:17:12.289  1416  1416 I VoLTE IMCB: uatimer start acct_id: 2, uatimer_id: 1, uatimeout: 3000, user_data: 0x10003433, timer_id: 76 imcb_uatimer_start()@1#273
+10-07 17:17:12.289  1416  1416 I VoLTE IMCB: uatimer start acct_id: 2, uatimer_id: 1, uatimeout: 2998, user_data: 0x10003534, timer_id: 77 imcb_uatimer_start()@1#273
+10-07 17:17:12.289  1416  1416 I VoLTE IMCB: uatimer cancel acct_id: 2, uatimer_id: 1, uatimeout: 3600, user_data: 0x10003130, timer_id: 73 imcb_uatimer_cancel()@0#294
+10-07 17:17:12.290  1416  1416 I VoLTE IMCB: uatimer cancel acct_id: 2, uatimer_id: 1, uatimeout: 3598, user_data: 0x10003231, timer_id: 74 imcb_uatimer_cancel()@0#294
+10-07 17:17:12.290  1416  1416 I VoLTE IMCB: uatimer start acct_id: 2, uatimer_id: 1, uatimeout: 3600, user_data: 0x10003635, timer_id: 78 imcb_uatimer_start()@1#273
+10-07 17:17:12.290  1416  1416 I VoLTE IMCB: uatimer start acct_id: 2, uatimer_id: 1, uatimeout: 3598, user_data: 0x10003736, timer_id: 79 imcb_uatimer_start()@1#273
+10-07 17:17:12.292  1416  1416 I VoLTE IMCB: uatimer start acct_id: 2, uatimer_id: 1, uatimeout: 600, user_data: 0x10003837, timer_id: 80 imcb_uatimer_start()@1#273
+10-07 17:17:13.955   879   962 I mtkpower@impl: [powerd_req] TIMER_MSG_PERF_LOCK_TIMEOUT hdl:15577
+10-07 17:17:16.354   897   897 I Vibrator: Vibrator on for timeoutMs: 300
+10-07 17:17:16.854   897   897 I Vibrator: Vibrator on for timeoutMs: 300
+10-07 17:17:17.707   879   962 I mtkpower@impl: [powerd_req] TIMER_MSG_PERF_LOCK_TIMEOUT hdl:15579
+10-07 17:17:18.325  3733  3733 W AtomRemoteSession: TCS20.12.5 MONITOR SECTION TIMEOUT label=Guides
+10-07 17:17:23.092   879   962 I mtkpower@impl: [powerd_req] TIMER_MSG_PERF_LOCK_TIMEOUT hdl:15581
+10-07 17:17:25.916  3733  3733 W AtomRemoteSession: TCS20.12.5 MONITOR SECTION TIMEOUT label=SafeArea
+10-07 17:17:26.798   879   962 I mtkpower@impl: [powerd_req] TIMER_MSG_PERF_LOCK_TIMEOUT hdl:15583
+10-07 17:17:28.267   879   962 I mtkpower@impl: [powerd_req] TIMER_MSG_PERF_LOCK_TIMEOUT hdl:15584
+10-07 17:17:29.043   879   962 I mtkpower@impl: [powerd_req] TIMER_MSG_PERF_LOCK_TIMEOUT hdl:15585
+10-07 17:17:31.263   879   962 I mtkpower@impl: [powerd_req] TIMER_MSG_PERF_LOCK_TIMEOUT hdl:15586
+10-07 17:17:31.761   879   962 I mtkpower@impl: [powerd_req] TIMER_MSG_PERF_LOCK_TIMEOUT hdl:15587
+10-07 17:17:31.763   879   962 I mtkpower@impl: [powerd_req] TIMER_MSG_PERF_LOCK_TIMEOUT hdl:15588
+10-07 17:17:32.162   879   962 I mtkpower@impl: [powerd_req] TIMER_MSG_PERF_LOCK_TIMEOUT hdl:15589
+10-07 17:17:32.385   879   962 I mtkpower@impl: [powerd_req] TIMER_MSG_PERF_LOCK_TIMEOUT hdl:15590
+10-07 17:17:32.388   879   962 I mtkpower@impl: [powerd_req] TIMER_MSG_PERF_LOCK_TIMEOUT hdl:15591
+10-07 17:17:32.753   897   897 I Vibrator: Vibrator on for timeoutMs: 300
+10-07 17:17:33.253   897   897 I Vibrator: Vibrator on for timeoutMs: 300
+10-07 17:17:33.843  3733  3733 W AtomRemoteSession: TCS20.12.5 MONITOR SECTION TIMEOUT label=Anamorphic
+10-07 17:17:36.063   879   962 I mtkpower@impl: [powerd_req] TIMER_MSG_PERF_LOCK_TIMEOUT hdl:15593
+10-07 17:17:36.442  5144  5561 E LongSuspend: Couldn't hook UnsafeLogFatalForThreadSuspendAllTimeout function: Attempted to hook a killswitched function
+10-07 17:17:37.601   879   962 I mtkpower@impl: [powerd_req] TIMER_MSG_PERF_LOCK_TIMEOUT hdl:15594
+10-07 17:17:40.280   879   962 I mtkpower@impl: [powerd_req] TIMER_MSG_PERF_LOCK_TIMEOUT hdl:15595
+10-07 17:17:41.422  3733  3733 W AtomRemoteSession: TCS20.12.5 MONITOR SECTION TIMEOUT label=LUT
+10-07 17:17:42.599  5144  5569 I facebook.katana: Rejecting re-init on previously-failed class java.lang.Class<com.bloks.network.gpuquery.BloksGpuHeapQuery>: java.lang.ExceptionInInitializerError: 
+10-07 17:17:43.315   879   962 I mtkpower@impl: [powerd_req] TIMER_MSG_PERF_LOCK_TIMEOUT hdl:15596
+10-07 17:17:43.601  5144  5569 I facebook.katana: Rejecting re-init on previously-failed class java.lang.Class<com.bloks.network.gpuquery.BloksGpuHeapQuery>: java.lang.ExceptionInInitializerError: 
+10-07 17:17:44.260   879   962 I mtkpower@impl: [powerd_req] TIMER_MSG_PERF_LOCK_TIMEOUT hdl:15597
+10-07 17:17:44.602  5144  5569 I facebook.katana: Rejecting re-init on previously-failed class java.lang.Class<com.bloks.network.gpuquery.BloksGpuHeapQuery>: java.lang.ExceptionInInitializerError: 
+10-07 17:17:45.513   879   962 I mtkpower@impl: [powerd_req] TIMER_MSG_PERF_LOCK_TIMEOUT hdl:15598
+10-07 17:17:49.010  3733  3733 W AtomRemoteSession: TCS20.12.5 MONITOR SECTION TIMEOUT label=Display
+10-07 17:17:50.446  3733  3778 D AtomRemoteGatt: TCS18.5.1 PacketLink ATT queue idle: phase=transport-ready
+10-07 17:17:50.528   918  1119 D SurfaceFlinger: calculateTimeoutTime, triggerInterval = 1 sec + 194783615 nsec
+10-07 17:17:50.639  3733  3778 D AtomRemoteGatt: TCS18.5.1 PacketLink ATT queue idle: phase=transport-ready
+10-07 17:17:50.885  3733  3733 D AtomRemoteGatt: TCS18.5.1 PacketLink ATT queue idle: phase=transport-ready
+10-07 17:17:51.128  3733  3778 D AtomRemoteGatt: TCS18.5.1 PacketLink ATT queue idle: phase=transport-ready
+10-07 17:17:51.322  3733  3778 D AtomRemoteGatt: TCS18.5.1 PacketLink ATT queue idle: phase=transport-ready
+10-07 17:17:51.518  3733  3778 D AtomRemoteGatt: TCS18.5.1 PacketLink ATT queue idle: phase=transport-ready
+10-07 17:17:51.713  3733  3733 D AtomRemoteGatt: TCS18.5.1 PacketLink ATT queue idle: phase=transport-ready
+10-07 17:17:51.723   918  1119 D SurfaceFlinger: calculateTimeoutTime, triggerInterval = 1 sec + 193350769 nsec
+10-07 17:17:51.907  3733  3778 D AtomRemoteGatt: TCS18.5.1 PacketLink ATT queue idle: phase=transport-ready
+10-07 17:17:52.103  3733  3778 D AtomRemoteGatt: TCS18.5.1 PacketLink ATT queue idle: phase=transport-ready
+10-07 17:17:52.298  3733  3778 D AtomRemoteGatt: TCS18.5.1 PacketLink ATT queue idle: phase=transport-ready
+10-07 17:17:52.494  3733  3778 D AtomRemoteGatt: TCS18.5.1 PacketLink ATT queue idle: phase=transport-ready
+10-07 17:17:52.687  3733  3778 D AtomRemoteGatt: TCS18.5.1 PacketLink ATT queue idle: phase=transport-ready
+10-07 17:17:52.883  3733  3778 D AtomRemoteGatt: TCS18.5.1 PacketLink ATT queue idle: phase=transport-ready
+10-07 17:17:52.917   918  1119 D SurfaceFlinger: calculateTimeoutTime, triggerInterval = 1 sec + 193886769 nsec
+10-07 17:17:53.076  3733  3778 D AtomRemoteGatt: TCS18.5.1 PacketLink ATT queue idle: phase=transport-ready
+10-07 17:17:53.273  3733  3778 D AtomRemoteGatt: TCS18.5.1 PacketLink ATT queue idle: phase=transport-ready
+10-07 17:17:53.469  3733  3778 D AtomRemoteGatt: TCS18.5.1 PacketLink ATT queue idle: phase=transport-ready
+10-07 17:17:53.710  3733  3778 D AtomRemoteGatt: TCS18.5.1 PacketLink ATT queue idle: phase=transport-ready
+10-07 17:17:53.904  3733  3778 D AtomRemoteGatt: TCS18.5.1 PacketLink ATT queue idle: phase=transport-ready
+10-07 17:17:54.103  3733  3778 D AtomRemoteGatt: TCS18.5.1 PacketLink ATT queue idle: phase=transport-ready
+10-07 17:17:54.111   918  1119 D SurfaceFlinger: calculateTimeoutTime, triggerInterval = 1 sec + 194501461 nsec
+10-07 17:17:54.298  3733  3778 D AtomRemoteGatt: TCS18.5.1 PacketLink ATT queue idle: phase=transport-ready
+10-07 17:17:54.491  3733  3778 D AtomRemoteGatt: TCS18.5.1 PacketLink ATT queue idle: phase=transport-ready
+10-07 17:17:54.735  3733  3778 D AtomRemoteGatt: TCS18.5.1 PacketLink ATT queue idle: phase=transport-ready
+10-07 17:17:54.931  3733  3778 D AtomRemoteGatt: TCS18.5.1 PacketLink ATT queue idle: phase=transport-ready
+10-07 17:17:55.126  3733  3778 D AtomRemoteGatt: TCS18.5.1 PacketLink ATT queue idle: phase=transport-ready
+10-07 17:17:55.306   918  1119 D SurfaceFlinger: calculateTimeoutTime, triggerInterval = 1 sec + 193739693 nsec
+10-07 17:17:55.322  3733  3778 D AtomRemoteGatt: TCS18.5.1 PacketLink ATT queue idle: phase=transport-ready
+10-07 17:17:55.514  3733  3778 D AtomRemoteGatt: TCS18.5.1 PacketLink ATT queue idle: phase=transport-ready
+10-07 17:17:55.708  3733  3778 D AtomRemoteGatt: TCS18.5.1 PacketLink ATT queue idle: phase=transport-ready
+10-07 17:17:55.905  3733  3778 D AtomRemoteGatt: TCS18.5.1 PacketLink ATT queue idle: phase=transport-ready
+10-07 17:17:56.098  3733  3778 D AtomRemoteGatt: TCS18.5.1 PacketLink ATT queue idle: phase=transport-ready
+10-07 17:17:56.343  3733  5530 D AtomRemoteGatt: TCS18.5.1 PacketLink ATT queue idle: phase=transport-ready
+10-07 17:17:56.499   918  1119 D SurfaceFlinger: calculateTimeoutTime, triggerInterval = 1 sec + 193922692 nsec
+10-07 17:17:56.586  3733  5530 D AtomRemoteGatt: TCS18.5.1 PacketLink ATT queue idle: phase=transport-ready
+10-07 17:17:56.781  3733  5530 D AtomRemoteGatt: TCS18.5.1 PacketLink ATT queue idle: phase=transport-ready
+10-07 17:17:56.976  3733  5530 D AtomRemoteGatt: TCS18.5.1 PacketLink ATT queue idle: phase=transport-ready
+10-07 17:17:57.170  3733  5530 D AtomRemoteGatt: TCS18.5.1 PacketLink ATT queue idle: phase=transport-ready
+10-07 17:17:57.365  3733  5530 D AtomRemoteGatt: TCS18.5.1 PacketLink ATT queue idle: phase=transport-ready
+10-07 17:17:57.561  3733  5530 D AtomRemoteGatt: TCS18.5.1 PacketLink ATT queue idle: phase=transport-ready
+10-07 17:17:57.694   918  1119 D SurfaceFlinger: calculateTimeoutTime, triggerInterval = 1 sec + 194136923 nsec
+10-07 17:17:57.805  3733  5530 D AtomRemoteGatt: TCS18.5.1 PacketLink ATT queue idle: phase=transport-ready
+10-07 17:17:58.001  3733  5530 D AtomRemoteGatt: TCS18.5.1 PacketLink ATT queue idle: phase=transport-ready
+10-07 17:17:58.195  3733  5530 D AtomRemoteGatt: TCS18.5.1 PacketLink ATT queue idle: phase=transport-ready
+10-07 17:17:58.439  3733  5530 D AtomRemoteGatt: TCS18.5.1 PacketLink ATT queue idle: phase=transport-ready
+10-07 17:17:58.633  3733  5530 D AtomRemoteGatt: TCS18.5.1 PacketLink ATT queue idle: phase=transport-ready
+10-07 17:17:58.828  3733  5530 D AtomRemoteGatt: TCS18.5.1 PacketLink ATT queue idle: phase=transport-ready
+10-07 17:17:58.888   918  1119 D SurfaceFlinger: calculateTimeoutTime, triggerInterval = 1 sec + 199307307 nsec
+10-07 17:17:59.072  3733  5530 D AtomRemoteGatt: TCS18.5.1 PacketLink ATT queue idle: phase=transport-ready
+10-07 17:17:59.267  3733  5530 D AtomRemoteGatt: TCS18.5.1 PacketLink ATT queue idle: phase=transport-ready
+10-07 17:17:59.511  3733  5530 D AtomRemoteGatt: TCS18.5.1 PacketLink ATT queue idle: phase=transport-ready
+10-07 17:17:59.706  3733  5530 D AtomRemoteGatt: TCS18.5.1 PacketLink ATT queue idle: phase=transport-ready
+10-07 17:17:59.901  3733  5530 D AtomRemoteGatt: TCS18.5.1 PacketLink ATT queue idle: phase=transport-ready
+10-07 17:18:00.087   918  1119 D SurfaceFlinger: calculateTimeoutTime, triggerInterval = 1 sec + 197129615 nsec
+10-07 17:18:00.095  3733  5530 D AtomRemoteGatt: TCS18.5.1 PacketLink ATT queue idle: phase=transport-ready
+10-07 17:18:00.291  3733  5530 D AtomRemoteGatt: TCS18.5.1 PacketLink ATT queue idle: phase=transport-ready
+10-07 17:18:00.486  3733  5530 D AtomRemoteGatt: TCS18.5.1 PacketLink ATT queue idle: phase=transport-ready
+10-07 17:18:00.680  3733  5530 D AtomRemoteGatt: TCS18.5.1 PacketLink ATT queue idle: phase=transport-ready
+10-07 17:18:00.877  3733  5530 D AtomRemoteGatt: TCS18.5.1 PacketLink ATT queue idle: phase=transport-ready
+10-07 17:18:01.071  3733  5530 D AtomRemoteGatt: TCS18.5.1 PacketLink ATT queue idle: phase=transport-ready
+10-07 17:18:01.267  3733  5530 D AtomRemoteGatt: TCS18.5.1 PacketLink ATT queue idle: phase=transport-ready
+10-07 17:18:01.285   918  1119 D SurfaceFlinger: calculateTimeoutTime, triggerInterval = 1 sec + 194091770 nsec
+10-07 17:18:01.463  3733  5530 D AtomRemoteGatt: TCS18.5.1 PacketLink ATT queue idle: phase=transport-ready
+10-07 17:18:01.753  3733  5530 D AtomRemoteGatt: TCS18.5.1 PacketLink ATT queue idle: phase=transport-ready
+10-07 17:18:01.948  3733  5530 D AtomRemoteGatt: TCS18.5.1 PacketLink ATT queue idle: phase=transport-ready
+10-07 17:18:02.144  3733  5530 D AtomRemoteGatt: TCS18.5.1 PacketLink ATT queue idle: phase=transport-ready
+10-07 17:18:02.339  3733  5530 D AtomRemoteGatt: TCS18.5.1 PacketLink ATT queue idle: phase=transport-ready
+10-07 17:18:02.479   918  1119 D SurfaceFlinger: calculateTimeoutTime, triggerInterval = 1 sec + 194004000 nsec
+10-07 17:18:02.534  3733  5530 D AtomRemoteGatt: TCS18.5.1 PacketLink ATT queue idle: phase=transport-ready
+10-07 17:18:02.730  3733  5530 D AtomRemoteGatt: TCS18.5.1 PacketLink ATT queue idle: phase=transport-ready
+10-07 17:18:02.882  1628  2241 D Hiber/JobExtImpl: un_job=JobStatus{f8b9da0 #u0a243/489659 com.whatsapp.w4b/androidx.work.impl.background.systemjob.SystemJobService u=0 s=10243 TIME=+3m58s434ms:none satisfied:0xb400000 unsatisfied:0x80000000}for uid=10243
+10-07 17:18:02.882  1628  2241 D Hiber/JobExtImpl: un_job=JobStatus{ba1846f #u0a243/489667 com.whatsapp.w4b/androidx.work.impl.background.systemjob.SystemJobService u=0 s=10243 TIME=-1m24s263ms:none NET satisfied:0x1b400000 unsatisfied:0x80000000}for uid=10243
+10-07 17:18:02.882  1628  2241 D Hiber/JobExtImpl: un_job=JobStatus{ab70767 #u0a243/489271 com.whatsapp.w4b/androidx.work.impl.background.systemjob.SystemJobService u=0 s=10243 TIME=+15h26m30s290ms:none satisfied:0xb400000 unsatisfied:0x80000000}for uid=10243
+10-07 17:18:02.882  1628  2241 D Hiber/JobExtImpl: un_job=JobStatus{5e81f26 #u0a243/489107 com.whatsapp.w4b/androidx.work.impl.background.systemjob.SystemJobService u=0 s=10243 TIME=+7h4m27s559ms:none NET satisfied:0x1b400000 unsatisfied:0x80000000}for uid=10243
+10-07 17:18:02.882  1628  2241 D Hiber/JobExtImpl: un_job=JobStatus{583db0a #u0a243/489657 com.whatsapp.w4b/androidx.work.impl.background.systemjob.SystemJobService u=0 s=10243 TIME=+6m51s13ms:none NET satisfied:0x1b400000 unsatisfied:0x80000000}for uid=10243
+10-07 17:18:02.883  1628  2241 D Hiber/JobExtImpl: un_job=JobStatus{c79cd4 #u0a243/489660 com.whatsapp.w4b/androidx.work.impl.background.systemjob.SystemJobService u=0 s=10243 TIME=+9h5m56s101ms:none satisfied:0xb400000 unsatisfied:0x80000000}for uid=10243
+10-07 17:18:02.972  3733  5530 D AtomRemoteGatt: TCS18.5.1 PacketLink ATT queue idle: phase=transport-ready
+10-07 17:18:03.167  3733  5530 D AtomRemoteGatt: TCS18.5.1 PacketLink ATT queue idle: phase=transport-ready
+10-07 17:18:03.411  3733  5530 D AtomRemoteGatt: TCS18.5.1 PacketLink ATT queue idle: phase=transport-ready
+10-07 17:18:03.606  3733  5530 D AtomRemoteGatt: TCS18.5.1 PacketLink ATT queue idle: phase=transport-ready
+10-07 17:18:03.673   918  1119 D SurfaceFlinger: calculateTimeoutTime, triggerInterval = 1 sec + 194123077 nsec
+10-07 17:18:03.802  3733  5530 D AtomRemoteGatt: TCS18.5.1 PacketLink ATT queue idle: phase=transport-ready
+10-07 17:18:03.996  3733  5530 D AtomRemoteGatt: TCS18.5.1 PacketLink ATT queue idle: phase=transport-ready
+10-07 17:18:04.240  3733  5530 D AtomRemoteGatt: TCS18.5.1 PacketLink ATT queue idle: phase=transport-ready
+10-07 17:18:04.434  3733  5530 D AtomRemoteGatt: TCS18.5.1 PacketLink ATT queue idle: phase=transport-ready
+10-07 17:18:04.679  3733  5530 D AtomRemoteGatt: TCS18.5.1 PacketLink ATT queue idle: phase=transport-ready
+10-07 17:18:04.868   918  1119 D SurfaceFlinger: calculateTimeoutTime, triggerInterval = 1 sec + 194123923 nsec
+10-07 17:18:04.873  3733  5530 D AtomRemoteGatt: TCS18.5.1 PacketLink ATT queue idle: phase=transport-ready
+10-07 17:18:05.071  3733  5530 D AtomRemoteGatt: TCS18.5.1 PacketLink ATT queue idle: phase=transport-ready
+10-07 17:18:05.263  3733  5530 D AtomRemoteGatt: TCS18.5.1 PacketLink ATT queue idle: phase=transport-ready
+10-07 17:18:05.458  3733  5530 D AtomRemoteGatt: TCS18.5.1 PacketLink ATT queue idle: phase=transport-ready
+10-07 17:18:05.657  3733  5530 D AtomRemoteGatt: TCS18.5.1 PacketLink ATT queue idle: phase=transport-ready
+10-07 17:18:05.848  3733  5530 D AtomRemoteGatt: TCS18.5.1 PacketLink ATT queue idle: phase=transport-ready
+10-07 17:18:06.043  3733  5530 D AtomRemoteGatt: TCS18.5.1 PacketLink ATT queue idle: phase=transport-ready
+10-07 17:18:06.062   918  1119 D SurfaceFlinger: calculateTimeoutTime, triggerInterval = 1 sec + 194086231 nsec
+10-07 17:18:06.239  3733  5530 D AtomRemoteGatt: TCS18.5.1 PacketLink ATT queue idle: phase=transport-ready
+10-07 17:18:06.433  3733  5530 D AtomRemoteGatt: TCS18.5.1 PacketLink ATT queue idle: phase=transport-ready
+10-07 17:18:06.629  3733  5530 D AtomRemoteGatt: TCS18.5.1 PacketLink ATT queue idle: phase=transport-ready
+10-07 17:18:06.823  3733  5530 D AtomRemoteGatt: TCS18.5.1 PacketLink ATT queue idle: phase=transport-ready
+10-07 17:18:07.018  3733  5530 D AtomRemoteGatt: TCS18.5.1 PacketLink ATT queue idle: phase=transport-ready
+10-07 17:18:07.213  3733  5530 D AtomRemoteGatt: TCS18.5.1 PacketLink ATT queue idle: phase=transport-ready
+10-07 17:18:07.256   918  1119 D SurfaceFlinger: calculateTimeoutTime, triggerInterval = 1 sec + 194144539 nsec
+10-07 17:18:07.460  3733  5530 D AtomRemoteGatt: TCS18.5.1 PacketLink ATT queue idle: phase=transport-ready
+10-07 17:18:07.655  3733  5530 D AtomRemoteGatt: TCS18.5.1 PacketLink ATT queue idle: phase=transport-ready
+10-07 17:18:07.851  3733  5530 D AtomRemoteGatt: TCS18.5.1 PacketLink ATT queue idle: phase=transport-ready
+10-07 17:18:08.094  3733  5530 D AtomRemoteGatt: TCS18.5.1 PacketLink ATT queue idle: phase=transport-ready
+10-07 17:18:08.336  3733  5530 D AtomRemoteGatt: TCS18.5.1 PacketLink ATT queue idle: phase=transport-ready
+10-07 17:18:08.451   918  1119 D SurfaceFlinger: calculateTimeoutTime, triggerInterval = 1 sec + 194542154 nsec
+10-07 17:18:08.581  3733  5530 D AtomRemoteGatt: TCS18.5.1 PacketLink ATT queue idle: phase=transport-ready
+10-07 17:18:08.775  3733  5530 D AtomRemoteGatt: TCS18.5.1 PacketLink ATT queue idle: phase=transport-ready
+10-07 17:18:08.903  1628  2241 D Hiber/JobExtImpl: un_job=JobStatus{f8b9da0 #u0a243/489659 com.whatsapp.w4b/androidx.work.impl.background.systemjob.SystemJobService u=0 s=10243 TIME=+3m52s414ms:none satisfied:0xb400000 unsatisfied:0x80000000}for uid=10243
+10-07 17:18:08.903  1628  2241 D Hiber/JobExtImpl: un_job=JobStatus{ab70767 #u0a243/489271 com.whatsapp.w4b/androidx.work.impl.background.systemjob.SystemJobService u=0 s=10243 TIME=+15h26m24s269ms:none satisfied:0xb400000 unsatisfied:0x80000000}for uid=10243
+10-07 17:18:08.903  1628  2241 D Hiber/JobExtImpl: un_job=JobStatus{5e81f26 #u0a243/489107 com.whatsapp.w4b/androidx.work.impl.background.systemjob.SystemJobService u=0 s=10243 TIME=+7h4m21s538ms:none NET satisfied:0x1b400000 unsatisfied:0x80000000}for uid=10243
+10-07 17:18:08.903  1628  2241 D Hiber/JobExtImpl: un_job=JobStatus{583db0a #u0a243/489657 com.whatsapp.w4b/androidx.work.impl.background.systemjob.SystemJobService u=0 s=10243 TIME=+6m44s992ms:none NET satisfied:0x1b400000 unsatisfied:0x80000000}for uid=10243
+10-07 17:18:08.904  1628  2241 D Hiber/JobExtImpl: un_job=JobStatus{c79cd4 #u0a243/489660 com.whatsapp.w4b/androidx.work.impl.background.systemjob.SystemJobService u=0 s=10243 TIME=+9h5m50s80ms:none satisfied:0xb400000 unsatisfied:0x80000000}for uid=10243
+10-07 17:18:09.067  3733  5530 D AtomRemoteGatt: TCS18.5.1 PacketLink ATT queue idle: phase=transport-ready
+10-07 17:18:09.263  3733  5530 D AtomRemoteGatt: TCS18.5.1 PacketLink ATT queue idle: phase=transport-ready
+10-07 17:18:09.458  3733  5530 D AtomRemoteGatt: TCS18.5.1 PacketLink ATT queue idle: phase=transport-ready
+10-07 17:18:09.645   918  1119 D SurfaceFlinger: calculateTimeoutTime, triggerInterval = 1 sec + 194028000 nsec
+10-07 17:18:09.656  3733  3733 D AtomRemoteGatt: TCS18.5.1 PacketLink ATT queue idle: phase=transport-ready
+10-07 17:18:09.848  3733  5530 D AtomRemoteGatt: TCS18.5.1 PacketLink ATT queue idle: phase=transport-ready
+10-07 17:18:10.042  3733  5530 D AtomRemoteGatt: TCS18.5.1 PacketLink ATT queue idle: phase=transport-ready
+10-07 17:18:10.286  3733  5530 D AtomRemoteGatt: TCS18.5.1 PacketLink ATT queue idle: phase=transport-ready
+10-07 17:18:10.482  3733  5530 D AtomRemoteGatt: TCS18.5.1 PacketLink ATT queue idle: phase=transport-ready
+10-07 17:18:10.677  3733  5530 D AtomRemoteGatt: TCS18.5.1 PacketLink ATT queue idle: phase=transport-ready
+10-07 17:18:10.840   918  1119 D SurfaceFlinger: calculateTimeoutTime, triggerInterval = 1 sec + 197550230 nsec
+10-07 17:18:10.921  3733  5530 D AtomRemoteGatt: TCS18.5.1 PacketLink ATT queue idle: phase=transport-ready
+10-07 17:18:11.116  3733  5530 D AtomRemoteGatt: TCS18.5.1 PacketLink ATT queue idle: phase=transport-ready
+10-07 17:18:11.310  3733  5530 D AtomRemoteGatt: TCS18.5.1 PacketLink ATT queue idle: phase=transport-ready
+10-07 17:18:11.507  3733  3733 D AtomRemoteGatt: TCS18.5.1 PacketLink ATT queue idle: phase=transport-ready
+10-07 17:18:11.699  3733  5530 D AtomRemoteGatt: TCS18.5.1 PacketLink ATT queue idle: phase=transport-ready
+10-07 17:18:11.894  3733  5530 D AtomRemoteGatt: TCS18.5.1 PacketLink ATT queue idle: phase=transport-ready
+10-07 17:18:12.038   918  1119 D SurfaceFlinger: calculateTimeoutTime, triggerInterval = 1 sec + 198460308 nsec
+10-07 17:18:12.090  3733  5530 D AtomRemoteGatt: TCS18.5.1 PacketLink ATT queue idle: phase=transport-ready
+10-07 17:18:12.284  3733  5530 D AtomRemoteGatt: TCS18.5.1 PacketLink ATT queue idle: phase=transport-ready
+10-07 17:18:12.481  3733  3733 D AtomRemoteGatt: TCS18.5.1 PacketLink ATT queue idle: phase=transport-ready
+10-07 17:18:12.672  3733  5530 D AtomRemoteGatt: TCS18.5.1 PacketLink ATT queue idle: phase=transport-ready
+10-07 17:18:12.870  3733  5530 D AtomRemoteGatt: TCS18.5.1 PacketLink ATT queue idle: phase=transport-ready
+10-07 17:18:13.112  3733  5530 D AtomRemoteGatt: TCS18.5.1 PacketLink ATT queue idle: phase=transport-ready
+10-07 17:18:13.236   918  1119 D SurfaceFlinger: calculateTimeoutTime, triggerInterval = 1 sec + 194205154 nsec
+10-07 17:18:13.307  3733  5530 D AtomRemoteGatt: TCS18.5.1 PacketLink ATT queue idle: phase=transport-ready
+10-07 17:18:13.552  3733  5530 D AtomRemoteGatt: TCS18.5.1 PacketLink ATT queue idle: phase=transport-ready
+10-07 17:18:13.746  3733  5530 D AtomRemoteGatt: TCS18.5.1 PacketLink ATT queue idle: phase=transport-ready
+10-07 17:18:13.989  3733  5530 D AtomRemoteGatt: TCS18.5.1 PacketLink ATT queue idle: phase=transport-ready
+10-07 17:18:14.185  3733  5530 D AtomRemoteGatt: TCS18.5.1 PacketLink ATT queue idle: phase=transport-ready
+10-07 17:18:14.355  2209  2653 I bt_btm_pm: BTM_SetSsrParams: Set sniff subrating state:immediate:active[0] max_latency:0x04b0 min_remote_timeout:0x0002 min_local_timeout:0x0002
+10-07 17:18:14.359  2209  2653 W bt_l2cap: L2CA_SetFlushTimeout: L2CA_SetFlushTimeout Parameter deprecated for no automatic flush; please use 0x0000
+10-07 17:18:14.380  3733  5530 D AtomRemoteGatt: TCS18.5.1 PacketLink ATT queue idle: phase=transport-ready
+10-07 17:18:14.431   918  1119 D SurfaceFlinger: calculateTimeoutTime, triggerInterval = 1 sec + 193828000 nsec
+10-07 17:18:14.461  2209  2653 I bt_btm_pm: BTM_SetSsrParams: Set sniff subrating state:immediate:active[0] max_latency:0x04b0 min_remote_timeout:0x0002 min_local_timeout:0x0002
+10-07 17:18:14.574  3733  5530 D AtomRemoteGatt: TCS18.5.1 PacketLink ATT queue idle: phase=transport-ready
+10-07 17:18:14.771  3733  5530 D AtomRemoteGatt: TCS18.5.1 PacketLink ATT queue idle: phase=transport-ready
+10-07 17:18:14.964  3733  5530 D AtomRemoteGatt: TCS18.5.1 PacketLink ATT queue idle: phase=transport-ready
+10-07 17:18:15.159  3733  5530 D AtomRemoteGatt: TCS18.5.1 PacketLink ATT queue idle: phase=transport-ready
+10-07 17:18:15.353  3733  3782 D AtomRemoteGatt: TCS18.5.1 PacketLink ATT queue idle: phase=transport-ready
+10-07 17:18:15.414  4671  6008 D MediaCodec: [c2.mtk.vp9.decoder] config set c2 sleep timeout 500 kC2SleepTimeoutMs=500
+10-07 17:18:15.530  5793  5881 E ogle.android.gm: hiddenapi: Accessing hidden method Lcom/android/org/conscrypt/ConscryptEngineSocket;->setHandshakeTimeout(I)V (runtime_flags=CorePlatformApi, domain=core-platform, api=blocked,core-platform-api) from Lmej; (domain=app, TargetSdkVersion=37) using reflection: denied
+10-07 17:18:15.530  5793  5881 E ogle.android.gm: hiddenapi: Accessing hidden method Lcom/android/org/conscrypt/OpenSSLSocketImpl;->setHandshakeTimeout(I)V (runtime_flags=CorePlatformApi, domain=core-platform, api=max-target-r,core-platform-api) from Lmej; (domain=app, TargetSdkVersion=37) using reflection: denied
+10-07 17:18:15.530  5793  5881 E ogle.android.gm: hiddenapi: Accessing hidden method Lcom/android/org/conscrypt/AbstractConscryptSocket;->setHandshakeTimeout(I)V (runtime_flags=0, domain=core-platform, api=max-target-r) from Lmej; (domain=app, TargetSdkVersion=37) using reflection: denied
+10-07 17:18:15.531  5793  5881 W pwx     : [Gmail] SSLSocketFactoryWrapper: unable to set handshake timeout
+10-07 17:18:15.531  5793  5881 W pwx     : java.lang.NoSuchMethodException: com.android.org.conscrypt.Java8EngineSocket.setHandshakeTimeout [int]
+10-07 17:18:15.548  3733  3782 D AtomRemoteGatt: TCS18.5.1 PacketLink ATT queue idle: phase=transport-ready
+10-07 17:18:15.625   918  1119 D SurfaceFlinger: calculateTimeoutTime, triggerInterval = 1 sec + 199307692 nsec
+10-07 17:18:15.693   905  1240 D APM_AudioPolicyManager: listAudioPorts mAvailableInputDevices 0x80000004, 0x80000008, 0x80000040, 0x80000080, 0x80000100, 0x80002000, 0x90000000
+10-07 17:18:15.732   905  9048 D APM_AudioPolicyManager: listAudioPorts mAvailableInputDevices 0x80000004, 0x80000008, 0x80000040, 0x80000080, 0x80000100, 0x80002000, 0x90000000
+10-07 17:18:15.747  3733  3782 D AtomRemoteGatt: TCS18.5.1 PacketLink ATT queue idle: phase=transport-ready
+10-07 17:18:15.987  3733  3782 D AtomRemoteGatt: TCS18.5.1 PacketLink ATT queue idle: phase=transport-ready
+10-07 17:18:16.183  3733  3782 D AtomRemoteGatt: TCS18.5.1 PacketLink ATT queue idle: phase=transport-ready
+10-07 17:18:16.378  3733  3782 D AtomRemoteGatt: TCS18.5.1 PacketLink ATT queue idle: phase=transport-ready
+10-07 17:18:16.572  3733  3782 D AtomRemoteGatt: TCS18.5.1 PacketLink ATT queue idle: phase=transport-ready
+10-07 17:18:16.572   879   962 I mtkpower@impl: [powerd_req] TIMER_MSG_PERF_LOCK_TIMEOUT hdl:15601
+10-07 17:18:16.770  3733  3782 D AtomRemoteGatt: TCS18.5.1 PacketLink ATT queue idle: phase=transport-ready
+10-07 17:18:16.824   918  1119 D SurfaceFlinger: calculateTimeoutTime, triggerInterval = 1 sec + 188892615 nsec
+10-07 17:18:16.963  3733  3782 D AtomRemoteGatt: TCS18.5.1 PacketLink ATT queue idle: phase=transport-ready
+10-07 17:18:17.159  3733  3782 D AtomRemoteGatt: TCS18.5.1 PacketLink ATT queue idle: phase=transport-ready
+10-07 17:18:17.354  3733  3782 D AtomRemoteGatt: TCS18.5.1 PacketLink ATT queue idle: phase=transport-ready
+10-07 17:18:17.433  1628  2241 D Hiber/JobExtImpl: un_job=JobStatus{f8b9da0 #u0a243/489659 com.whatsapp.w4b/androidx.work.impl.background.systemjob.SystemJobService u=0 s=10243 TIME=+3m43s883ms:none satisfied:0xb400000 unsatisfied:0x80000000}for uid=10243
+10-07 17:18:17.434  1628  2241 D Hiber/JobExtImpl: un_job=JobStatus{ab70767 #u0a243/489271 com.whatsapp.w4b/androidx.work.impl.background.systemjob.SystemJobService u=0 s=10243 TIME=+15h26m15s739ms:none satisfied:0xb400000 unsatisfied:0x80000000}for uid=10243
+10-07 17:18:17.434  1628  2241 D Hiber/JobExtImpl: un_job=JobStatus{950e5ff #u0a243/489669 com.whatsapp.w4b/androidx.work.impl.background.systemjob.SystemJobService u=0 s=10243 TIME=+21s186ms:none NET satisfied:0x1b400000 unsatisfied:0x80000000}for uid=10243
+10-07 17:18:17.435  1628  2241 D Hiber/JobExtImpl: un_job=JobStatus{5e81f26 #u0a243/489107 com.whatsapp.w4b/androidx.work.impl.background.systemjob.SystemJobService u=0 s=10243 TIME=+7h4m13s6ms:none NET satisfied:0x1b400000 unsatisfied:0x80000000}for uid=10243
+10-07 17:18:17.436  1628  2241 D Hiber/JobExtImpl: un_job=JobStatus{583db0a #u0a243/489657 com.whatsapp.w4b/androidx.work.impl.background.systemjob.SystemJobService u=0 s=10243 TIME=+6m36s460ms:none NET satisfied:0x1b400000 unsatisfied:0x80000000}for uid=10243
+10-07 17:18:17.437  1628  2241 D Hiber/JobExtImpl: un_job=JobStatus{c79cd4 #u0a243/489660 com.whatsapp.w4b/androidx.work.impl.background.systemjob.SystemJobService u=0 s=10243 TIME=+9h5m41s547ms:none satisfied:0xb400000 unsatisfied:0x80000000}for uid=10243
+10-07 17:18:17.597  3733  3782 D AtomRemoteGatt: TCS18.5.1 PacketLink ATT queue idle: phase=transport-ready
+10-07 17:18:17.794  3733  3782 D AtomRemoteGatt: TCS18.5.1 PacketLink ATT queue idle: phase=transport-ready
+10-07 17:18:17.988  3733  3782 D AtomRemoteGatt: TCS18.5.1 PacketLink ATT queue idle: phase=transport-ready
+10-07 17:18:18.013   918  1119 D SurfaceFlinger: calculateTimeoutTime, triggerInterval = 1 sec + 192916615 nsec
+10-07 17:18:18.181  3733  3782 D AtomRemoteGatt: TCS18.5.1 PacketLink ATT queue idle: phase=transport-ready
+10-07 17:18:18.378  3733  3782 D AtomRemoteGatt: TCS18.5.1 PacketLink ATT queue idle: phase=transport-ready
+10-07 17:18:18.574  3733  3782 D AtomRemoteGatt: TCS18.5.1 PacketLink ATT queue idle: phase=transport-ready
+10-07 17:18:18.769  3733  3782 D AtomRemoteGatt: TCS18.5.1 PacketLink ATT queue idle: phase=transport-ready
+10-07 17:18:19.013  3733  3782 D AtomRemoteGatt: TCS18.5.1 PacketLink ATT queue idle: phase=transport-ready
+10-07 17:18:19.207   918  1119 D SurfaceFlinger: calculateTimeoutTime, triggerInterval = 1 sec + 185662385 nsec
+10-07 17:18:19.207  3733  3782 D AtomRemoteGatt: TCS18.5.1 PacketLink ATT queue idle: phase=transport-ready
+10-07 17:18:19.401  3733  3733 D AtomRemoteGatt: TCS18.5.1 PacketLink ATT queue idle: phase=transport-ready
+10-07 17:18:19.597  3733  3782 D AtomRemoteGatt: TCS18.5.1 PacketLink ATT queue idle: phase=transport-ready
+10-07 17:18:19.672  5793  5881 E ogle.android.gm: hiddenapi: Accessing hidden method Lcom/android/org/conscrypt/ConscryptEngineSocket;->setHandshakeTimeout(I)V (runtime_flags=CorePlatformApi, domain=core-platform, api=blocked,core-platform-api) from Lmej; (domain=app, TargetSdkVersion=37) using reflection: denied
+10-07 17:18:19.672  5793  5881 E ogle.android.gm: hiddenapi: Accessing hidden method Lcom/android/org/conscrypt/OpenSSLSocketImpl;->setHandshakeTimeout(I)V (runtime_flags=CorePlatformApi, domain=core-platform, api=max-target-r,core-platform-api) from Lmej; (domain=app, TargetSdkVersion=37) using reflection: denied
+10-07 17:18:19.673  5793  5881 E ogle.android.gm: hiddenapi: Accessing hidden method Lcom/android/org/conscrypt/AbstractConscryptSocket;->setHandshakeTimeout(I)V (runtime_flags=0, domain=core-platform, api=max-target-r) from Lmej; (domain=app, TargetSdkVersion=37) using reflection: denied
+10-07 17:18:19.673  5793  5881 W pwx     : [Gmail] SSLSocketFactoryWrapper: unable to set handshake timeout
+10-07 17:18:19.673  5793  5881 W pwx     : java.lang.NoSuchMethodException: com.android.org.conscrypt.Java8EngineSocket.setHandshakeTimeout [int]
+10-07 17:18:19.790  3733  3782 D AtomRemoteGatt: TCS18.5.1 PacketLink ATT queue idle: phase=transport-ready
+10-07 17:18:19.986  3733  3782 D AtomRemoteGatt: TCS18.5.1 PacketLink ATT queue idle: phase=transport-ready
+10-07 17:18:20.183  3733  3782 D AtomRemoteGatt: TCS18.5.1 PacketLink ATT queue idle: phase=transport-ready
+10-07 17:18:20.377  3733  3782 D AtomRemoteGatt: TCS18.5.1 PacketLink ATT queue idle: phase=transport-ready
+10-07 17:18:20.392   918  1119 D SurfaceFlinger: calculateTimeoutTime, triggerInterval = 1 sec + 192959154 nsec
+10-07 17:18:20.439   879   962 I mtkpower@impl: [powerd_req] TIMER_MSG_PERF_LOCK_TIMEOUT hdl:15604
+10-07 17:18:20.571  3733  3782 D AtomRemoteGatt: TCS18.5.1 PacketLink ATT queue idle: phase=transport-ready
+10-07 17:18:20.766  3733  3778 D AtomRemoteGatt: TCS18.5.1 PacketLink ATT queue idle: phase=transport-ready
+10-07 17:18:20.963  3733  3778 D AtomRemoteGatt: TCS18.5.1 PacketLink ATT queue idle: phase=transport-ready
+10-07 17:18:21.157  3733  3778 D AtomRemoteGatt: TCS18.5.1 PacketLink ATT queue idle: phase=transport-ready
+10-07 17:18:21.218   879   962 I mtkpower@impl: [powerd_req] TIMER_MSG_PERF_LOCK_TIMEOUT hdl:15605
+10-07 17:18:21.288  3733  3733 D AtomRemoteGatt: TCS20.15R16.2 CODEC NONREBOOT SET cmd=0x13f m_isLocal=0 logical=2 wire=1 bitDepth=1 proto=08011001
+10-07 17:18:21.288  3733  3733 D AtomRemoteGatt: TCS20.15R16.4 CODEC QUEUE label=Codec ProRes LT cmd=0x13F packetId=0 m_isLocal=0 payloadLen=4 proto=08011001 body=0004003F0108011001
+10-07 17:18:21.288  3733  3733 D AtomRemoteGatt: TCS18.8.1 PLINK BUFFER label=Codec ProRes LT cmd=319 packetId=0 m_isLocal=0 atom=0004003F0108011001 packetIdRule=official-one-shot-zero
+10-07 17:18:21.449  3733  3778 D AtomRemoteGatt: TCS18.5.1 PacketLink ATT queue idle: phase=queued
+10-07 17:18:21.586   918  1119 D SurfaceFlinger: calculateTimeoutTime, triggerInterval = 1 sec + 185367615 nsec
+10-07 17:18:21.643  3733  3782 D AtomRemoteGatt: TCS18.9.1 TRANSPORT DELIVERED label=Codec ProRes LT cmd=319; PacketLink transport complete; recorder action unconfirmed
+10-07 17:18:21.644  3733  3782 D AtomRemoteGatt: TCS20.15R16.4 CODEC POST-APPLY TYPED VERIFY schedule source=non-reboot expected=2/1 delayMs=650 packetId=0
+10-07 17:18:21.645  3733  3782 D AtomRemoteGatt: TCS18.5.1 PacketLink ATT queue idle: phase=transport-ready
+10-07 17:18:21.887  3733  3778 D AtomRemoteGatt: TCS18.5.1 PacketLink ATT queue idle: phase=transport-ready
+10-07 17:18:22.082  3733  3778 D AtomRemoteGatt: TCS18.5.1 PacketLink ATT queue idle: phase=transport-ready
+10-07 17:18:22.278  3733  3778 D AtomRemoteGatt: TCS18.5.1 PacketLink ATT queue idle: phase=transport-ready
+10-07 17:18:22.296  3733  3733 D AtomRemoteGatt: TCS20.15R16.2 CODEC READBACK TX typed=1 cmd=0x13a source=non-reboot expected=2/1 payloadLen=4 proto=08011001 m_isLocal=0
+10-07 17:18:22.299  3733  3733 D AtomRemoteGatt: TCS20.15R16.4 CODEC QUEUE label=Codec readback cmd=0x13A packetId=0 m_isLocal=0 payloadLen=4 proto=08011001 body=0004003A0108011001
+10-07 17:18:22.301  3733  3733 D AtomRemoteGatt: TCS18.8.1 PLINK BUFFER label=Codec readback cmd=314 packetId=0 m_isLocal=0 atom=0004003A0108011001 packetIdRule=official-one-shot-zero
+10-07 17:18:22.472  3733  3778 D AtomRemoteGatt: TCS18.5.1 PacketLink ATT queue idle: phase=queued
+10-07 17:18:22.669  3733  3778 D AtomRemoteGatt: TCS18.9.1 TRANSPORT DELIVERED label=Codec readback cmd=314; PacketLink transport complete; recorder action unconfirmed
+10-07 17:18:22.670  3733  3778 D AtomRemoteGatt: TCS18.5.1 PacketLink ATT queue idle: phase=transport-ready
+10-07 17:18:22.771   918  1119 D SurfaceFlinger: calculateTimeoutTime, triggerInterval = 1 sec + 184154770 nsec
+10-07 17:18:22.773  5793  5881 E ogle.android.gm: hiddenapi: Accessing hidden method Lcom/android/org/conscrypt/ConscryptEngineSocket;->setHandshakeTimeout(I)V (runtime_flags=CorePlatformApi, domain=core-platform, api=blocked,core-platform-api) from Lmej; (domain=app, TargetSdkVersion=37) using reflection: denied
+10-07 17:18:22.773  5793  5881 E ogle.android.gm: hiddenapi: Accessing hidden method Lcom/android/org/conscrypt/OpenSSLSocketImpl;->setHandshakeTimeout(I)V (runtime_flags=CorePlatformApi, domain=core-platform, api=max-target-r,core-platform-api) from Lmej; (domain=app, TargetSdkVersion=37) using reflection: denied
+10-07 17:18:22.773  5793  5881 E ogle.android.gm: hiddenapi: Accessing hidden method Lcom/android/org/conscrypt/AbstractConscryptSocket;->setHandshakeTimeout(I)V (runtime_flags=0, domain=core-platform, api=max-target-r) from Lmej; (domain=app, TargetSdkVersion=37) using reflection: denied
+10-07 17:18:22.773  5793  5881 W pwx     : [Gmail] SSLSocketFactoryWrapper: unable to set handshake timeout
+10-07 17:18:22.773  5793  5881 W pwx     : java.lang.NoSuchMethodException: com.android.org.conscrypt.Java8EngineSocket.setHandshakeTimeout [int]
+10-07 17:18:22.912  3733  3778 D AtomRemoteGatt: TCS18.5.1 PacketLink ATT queue idle: phase=transport-ready
+10-07 17:18:23.156  3733  3733 D AtomRemoteGatt: TCS18.5.1 PacketLink ATT queue idle: phase=transport-ready
+10-07 17:18:23.339   879   962 I mtkpower@impl: [powerd_req] TIMER_MSG_PERF_LOCK_TIMEOUT hdl:15606
+10-07 17:18:23.351  3733  3778 D AtomRemoteGatt: TCS18.5.1 PacketLink ATT queue idle: phase=transport-ready
+10-07 17:18:23.444  1628  2241 D Hiber/JobExtImpl: un_job=JobStatus{f8b9da0 #u0a243/489659 com.whatsapp.w4b/androidx.work.impl.background.systemjob.SystemJobService u=0 s=10243 TIME=+3m37s873ms:none satisfied:0xb400000 unsatisfied:0x80000000}for uid=10243
+10-07 17:18:23.445  1628  2241 D Hiber/JobExtImpl: un_job=JobStatus{ab70767 #u0a243/489271 com.whatsapp.w4b/androidx.work.impl.background.systemjob.SystemJobService u=0 s=10243 TIME=+15h26m9s728ms:none satisfied:0xb400000 unsatisfied:0x80000000}for uid=10243
+10-07 17:18:23.445  1628  2241 D Hiber/JobExtImpl: un_job=JobStatus{950e5ff #u0a243/489669 com.whatsapp.w4b/androidx.work.impl.background.systemjob.SystemJobService u=0 s=10243 TIME=+15s175ms:none NET satisfied:0x1b400000 unsatisfied:0x80000000}for uid=10243
+10-07 17:18:23.446  1628  2241 D Hiber/JobExtImpl: un_job=JobStatus{5e81f26 #u0a243/489107 com.whatsapp.w4b/androidx.work.impl.background.systemjob.SystemJobService u=0 s=10243 TIME=+7h4m6s996ms:none NET satisfied:0x1b400000 unsatisfied:0x80000000}for uid=10243
+10-07 17:18:23.446  1628  2241 D Hiber/JobExtImpl: un_job=JobStatus{583db0a #u0a243/489657 com.whatsapp.w4b/androidx.work.impl.background.systemjob.SystemJobService u=0 s=10243 TIME=+6m30s449ms:none NET satisfied:0x1b400000 unsatisfied:0x80000000}for uid=10243
+10-07 17:18:23.447  1628  2241 D Hiber/JobExtImpl: un_job=JobStatus{c79cd4 #u0a243/489660 com.whatsapp.w4b/androidx.work.impl.background.systemjob.SystemJobService u=0 s=10243 TIME=+9h5m35s536ms:none satisfied:0xb400000 unsatisfied:0x80000000}for uid=10243
+10-07 17:18:23.501  3733  3733 D AtomRemoteGatt: TCS19.12.10 CODEC READBACK TIMEOUT expected=2/1 source=non-reboot
+10-07 17:18:23.502  3733  3733 D AtomRemoteGatt: TCS19.12.10 SNAPSHOT {"generation":0,"source":"codec-timeout","running":false,"inputExpected":3,"inputResponses":0,"codecProfile":-1,"codecBitDepth":-1,"input":{}}
+10-07 17:18:23.545  3733  3782 D AtomRemoteGatt: TCS18.5.1 PacketLink ATT queue idle: phase=transport-ready
+10-07 17:18:23.740  3733  3782 D AtomRemoteGatt: TCS18.5.1 PacketLink ATT queue idle: phase=transport-ready
+10-07 17:18:23.936  3733  3782 D AtomRemoteGatt: TCS18.5.1 PacketLink ATT queue idle: phase=transport-ready
+10-07 17:18:23.956   918  1119 D SurfaceFlinger: calculateTimeoutTime, triggerInterval = 1 sec + 193397231 nsec
+10-07 17:18:24.131  3733  3782 D AtomRemoteGatt: TCS18.5.1 PacketLink ATT queue idle: phase=transport-ready
+10-07 17:18:24.325  3733  3782 D AtomRemoteGatt: TCS18.5.1 PacketLink ATT queue idle: phase=transport-ready
+10-07 17:18:24.520  3733  3782 D AtomRemoteGatt: TCS18.5.1 PacketLink ATT queue idle: phase=transport-ready
+10-07 17:18:24.565   879   962 I mtkpower@impl: [powerd_req] TIMER_MSG_PERF_LOCK_TIMEOUT hdl:15607
+10-07 17:18:24.626  3733  3733 D AtomRemoteGatt: TCS20.15R16.2 CODEC NONREBOOT SET cmd=0x13f m_isLocal=0 logical=2 wire=1 bitDepth=2 proto=08011002
+10-07 17:18:24.627  3733  3733 D AtomRemoteGatt: TCS20.15R16.4 CODEC QUEUE label=Codec ProRes LT cmd=0x13F packetId=0 m_isLocal=0 payloadLen=4 proto=08011002 body=0004003F0108011002
+10-07 17:18:24.629  3733  3733 D AtomRemoteGatt: TCS18.8.1 PLINK BUFFER label=Codec ProRes LT cmd=319 packetId=0 m_isLocal=0 atom=0004003F0108011002 packetIdRule=official-one-shot-zero
+10-07 17:18:24.764  3733  3782 D AtomRemoteGatt: TCS18.5.1 PacketLink ATT queue idle: phase=queued
+10-07 17:18:24.959  3733  3782 D AtomRemoteGatt: TCS18.9.1 TRANSPORT DELIVERED label=Codec ProRes LT cmd=319; PacketLink transport complete; recorder action unconfirmed
+10-07 17:18:24.960  3733  3782 D AtomRemoteGatt: TCS20.15R16.4 CODEC POST-APPLY TYPED VERIFY schedule source=non-reboot expected=2/2 delayMs=650 packetId=0
+10-07 17:18:24.961  3733  3782 D AtomRemoteGatt: TCS18.5.1 PacketLink ATT queue idle: phase=transport-ready
+10-07 17:18:25.150   918  1119 D SurfaceFlinger: calculateTimeoutTime, triggerInterval = 1 sec + 184819384 nsec
+10-07 17:18:25.153  3733  5530 D AtomRemoteGatt: TCS18.5.1 PacketLink ATT queue idle: phase=transport-ready
+10-07 17:18:25.351  3733  3778 D AtomRemoteGatt: TCS18.5.1 PacketLink ATT queue idle: phase=transport-ready
+10-07 17:18:25.613  3733  3733 D AtomRemoteGatt: TCS20.15R16.2 CODEC READBACK TX typed=1 cmd=0x13a source=non-reboot expected=2/2 payloadLen=4 proto=08011002 m_isLocal=0
+10-07 17:18:25.624  3733  3733 D AtomRemoteGatt: TCS20.15R16.4 CODEC QUEUE label=Codec readback cmd=0x13A packetId=0 m_isLocal=0 payloadLen=4 proto=08011002 body=0004003A0108011002
+10-07 17:18:25.626  3733  3733 D AtomRemoteGatt: TCS18.8.1 PLINK BUFFER label=Codec readback cmd=314 packetId=0 m_isLocal=0 atom=0004003A0108011002 packetIdRule=official-one-shot-zero
+10-07 17:18:25.641  3733  3782 D AtomRemoteGatt: TCS18.5.1 PacketLink ATT queue idle: phase=queued
+10-07 17:18:25.836  3733  3782 D AtomRemoteGatt: TCS18.9.1 TRANSPORT DELIVERED label=Codec readback cmd=314; PacketLink transport complete; recorder action unconfirmed
+10-07 17:18:25.837  3733  3782 D AtomRemoteGatt: TCS18.5.1 PacketLink ATT queue idle: phase=transport-ready
+10-07 17:18:26.082  3733  3782 D AtomRemoteGatt: TCS18.5.1 PacketLink ATT queue idle: phase=transport-ready
+10-07 17:18:26.276  3733  3782 D AtomRemoteGatt: TCS18.5.1 PacketLink ATT queue idle: phase=transport-ready
+10-07 17:18:26.335   918  1119 D SurfaceFlinger: calculateTimeoutTime, triggerInterval = 1 sec + 184556000 nsec
+10-07 17:18:26.521  3733  3782 D AtomRemoteGatt: TCS18.5.1 PacketLink ATT queue idle: phase=transport-ready
+10-07 17:18:26.714  3733  3782 D AtomRemoteGatt: TCS18.5.1 PacketLink ATT queue idle: phase=transport-ready
+10-07 17:18:26.827  3733  3733 D AtomRemoteGatt: TCS19.12.10 CODEC READBACK TIMEOUT expected=2/2 source=non-reboot
+10-07 17:18:26.829  3733  3733 D AtomRemoteGatt: TCS19.12.10 SNAPSHOT {"generation":0,"source":"codec-timeout","running":false,"inputExpected":3,"inputResponses":0,"codecProfile":-1,"codecBitDepth":-1,"input":{}}
+10-07 17:18:26.909  3733  3782 D AtomRemoteGatt: TCS18.5.1 PacketLink ATT queue idle: phase=transport-ready
+10-07 17:18:27.105  3733  3782 D AtomRemoteGatt: TCS18.5.1 PacketLink ATT queue idle: phase=transport-ready
+10-07 17:18:27.300  3733  3782 D AtomRemoteGatt: TCS18.5.1 PacketLink ATT queue idle: phase=transport-ready
+10-07 17:18:27.520   918  1119 D SurfaceFlinger: calculateTimeoutTime, triggerInterval = 1 sec + 193224000 nsec
+10-07 17:18:27.543  3733  3782 D AtomRemoteGatt: TCS18.5.1 PacketLink ATT queue idle: phase=transport-ready
+10-07 17:18:27.740  3733  3782 D AtomRemoteGatt: TCS18.5.1 PacketLink ATT queue idle: phase=transport-ready
+10-07 17:18:27.934  3733  3782 D AtomRemoteGatt: TCS18.5.1 PacketLink ATT queue idle: phase=transport-ready
+10-07 17:18:28.176  3733  3782 D AtomRemoteGatt: TCS18.5.1 PacketLink ATT queue idle: phase=transport-ready
+10-07 17:18:28.373  3733  3782 D AtomRemoteGatt: TCS18.5.1 PacketLink ATT queue idle: phase=transport-ready
+10-07 17:18:28.477  1628  2241 D Hiber/JobExtImpl: un_job=JobStatus{f8b9da0 #u0a243/489659 com.whatsapp.w4b/androidx.work.impl.background.systemjob.SystemJobService u=0 s=10243 TIME=+3m32s839ms:none satisfied:0xb400000 unsatisfied:0x80000000}for uid=10243
+10-07 17:18:28.478  1628  2241 D Hiber/JobExtImpl: un_job=JobStatus{ab70767 #u0a243/489271 com.whatsapp.w4b/androidx.work.impl.background.systemjob.SystemJobService u=0 s=10243 TIME=+15h26m4s695ms:none satisfied:0xb400000 unsatisfied:0x80000000}for uid=10243
+10-07 17:18:28.478  1628  2241 D Hiber/JobExtImpl: un_job=JobStatus{950e5ff #u0a243/489669 com.whatsapp.w4b/androidx.work.impl.background.systemjob.SystemJobService u=0 s=10243 TIME=+10s143ms:none NET satisfied:0x1b400000 unsatisfied:0x80000000}for uid=10243
+10-07 17:18:28.478  1628  2241 D Hiber/JobExtImpl: un_job=JobStatus{5e81f26 #u0a243/489107 com.whatsapp.w4b/androidx.work.impl.background.systemjob.SystemJobService u=0 s=10243 TIME=+7h4m1s963ms:none NET satisfied:0x1b400000 unsatisfied:0x80000000}for uid=10243
+10-07 17:18:28.479  1628  2241 D Hiber/JobExtImpl: un_job=JobStatus{583db0a #u0a243/489657 com.whatsapp.w4b/androidx.work.impl.background.systemjob.SystemJobService u=0 s=10243 TIME=+6m25s417ms:none NET satisfied:0x1b400000 unsatisfied:0x80000000}for uid=10243
+10-07 17:18:28.479  1628  2241 D Hiber/JobExtImpl: un_job=JobStatus{c79cd4 #u0a243/489660 com.whatsapp.w4b/androidx.work.impl.background.systemjob.SystemJobService u=0 s=10243 TIME=+9h5m30s505ms:none satisfied:0xb400000 unsatisfied:0x80000000}for uid=10243
+10-07 17:18:28.615  3733  3782 D AtomRemoteGatt: TCS18.5.1 PacketLink ATT queue idle: phase=transport-ready
+10-07 17:18:28.713   918  1119 D SurfaceFlinger: calculateTimeoutTime, triggerInterval = 1 sec + 194248000 nsec
+10-07 17:18:28.809  3733  3782 D AtomRemoteGatt: TCS18.5.1 PacketLink ATT queue idle: phase=transport-ready
+10-07 17:18:29.006  3733  3782 D AtomRemoteGatt: TCS18.5.1 PacketLink ATT queue idle: phase=transport-ready
+10-07 17:18:29.249  3733  3782 D AtomRemoteGatt: TCS18.5.1 PacketLink ATT queue idle: phase=transport-ready
+10-07 17:18:29.446  3733  3782 D AtomRemoteGatt: TCS18.5.1 PacketLink ATT queue idle: phase=transport-ready
+10-07 17:18:29.641  3733  3782 D AtomRemoteGatt: TCS18.5.1 PacketLink ATT queue idle: phase=transport-ready
+10-07 17:18:29.836  3733  3782 D AtomRemoteGatt: TCS18.5.1 PacketLink ATT queue idle: phase=transport-ready
+10-07 17:18:29.907   918  1119 D SurfaceFlinger: calculateTimeoutTime, triggerInterval = 1 sec + 194030461 nsec
+10-07 17:18:30.030  3733  3782 D AtomRemoteGatt: TCS18.5.1 PacketLink ATT queue idle: phase=transport-ready
+10-07 17:18:30.223  3733  3782 D AtomRemoteGatt: TCS18.5.1 PacketLink ATT queue idle: phase=transport-ready
+10-07 17:18:30.423  3733  3782 D AtomRemoteGatt: TCS18.5.1 PacketLink ATT queue idle: phase=transport-ready
+10-07 17:18:30.614  3733  3782 D AtomRemoteGatt: TCS18.5.1 PacketLink ATT queue idle: phase=transport-ready
+10-07 17:18:30.808  3733  3782 D AtomRemoteGatt: TCS18.5.1 PacketLink ATT queue idle: phase=transport-ready
+10-07 17:18:31.004  3733  3782 D AtomRemoteGatt: TCS18.5.1 PacketLink ATT queue idle: phase=transport-ready
+10-07 17:18:31.102   918  1119 D SurfaceFlinger: calculateTimeoutTime, triggerInterval = 1 sec + 194007077 nsec
+10-07 17:18:31.201  3733  3782 D AtomRemoteGatt: TCS18.5.1 PacketLink ATT queue idle: phase=transport-ready
+10-07 17:18:31.394  3733  3782 D AtomRemoteGatt: TCS18.5.1 PacketLink ATT queue idle: phase=transport-ready

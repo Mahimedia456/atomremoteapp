@@ -1,0 +1,577 @@
+{
+  "tool": "AtomRemote firmware protocol inspector 17.7",
+  "input": "C:\\Users\\hp\\Downloads\\ATOMSGU_11.18.0.zip",
+  "sha256": "eb10550836434f6291e0d97c5f81e12be5b166c42f04532c4d41a06baa7ad7da",
+  "files": [
+    {
+      "name": "ATOMSGU.FW",
+      "size": 384044412,
+      "entropy_first_8MiB": 8.0,
+      "hits": [
+        {
+          "type": "ascii-term",
+          "term": "BLE",
+          "offset": 2278635,
+          "context": "f..........\\..AZ.gH..;U,...X..=.....Q.1..$...@p..E.....7.4]......O.......Q....=e=.-..Q..x..._$.)BLE.|F.XM.5.cA...~...G.....3..d.!E.....J4ih....f>...t...O.r.e........Z7..u...of...... .?.\"...@..",
+          "printable_ratio": 0.37,
+          "evidence": "weak-high-entropy-collision-risk"
+        },
+        {
+          "type": "ascii-term",
+          "term": "S1C",
+          "offset": 8388120,
+          "context": "...G...n...P!....(.]@S0....6.....G...c.\"s...).... ...7.r.ur~7..c......[..y!0..B....0\\\\..........S1C.f8......7..+.m!HY..G.:...frC(.*..1.2.:.R.h.\\.\\......>....D4...x..'.qn.7 ....k.3~N...m.......",
+          "printable_ratio": 0.391,
+          "evidence": "weak-high-entropy-collision-risk"
+        },
+        {
+          "type": "ascii-term",
+          "term": "S1C",
+          "offset": 12820252,
+          "context": "&...;l.V.}...#.}.a|..V_...QG5.....x..~}..[9aS.....\"...3...]L.1.t...dcD..\".+%...Xs.T2PR..Z....IYGS1C.\"..._8d......-..%&...m.yM...\\\".h...<....M..?a.7..4..A...<.C..{.x.H.@..[8.Q..C( .....S.M..y.x",
+          "printable_ratio": 0.443,
+          "evidence": "weak-high-entropy-collision-risk"
+        },
+        {
+          "type": "ascii-term",
+          "term": "BLE",
+          "offset": 15990499,
+          "context": "...qAi..r.$(........lI..KX&....:x..e.v...v..t|....(+\\.1<.y..3.7.&........*.}........P...l...*...BLE.....=Z........L...7....}........b-x-.D.<j.B.p|.....tn.....Z.V{..`qsq....jmg^WZ...bv]a..F..#.",
+          "printable_ratio": 0.385,
+          "evidence": "weak-high-entropy-collision-risk"
+        },
+        {
+          "type": "ascii-term",
+          "term": "BLE",
+          "offset": 22753318,
+          "context": "A%../..V.....#...K...!...F...y>&10...>...........Q.X.........M...wA_/...D....].0D..ka.....H....|BLE.....Tdl....lS..F.D..H.X.5G..6...QD..L.\\...B...k,.+.+..e....>..K.p...A..o.~.e<.Z.e..u..:..W.r",
+          "printable_ratio": 0.365,
+          "evidence": "weak-high-entropy-collision-risk"
+        },
+        {
+          "type": "ascii-term",
+          "term": "S1C",
+          "offset": 33376875,
+          "context": "...mj.D...-..1Y1..z..\\..B.a8,.B...5....F$.+I.Msm....v..}..zXM...K..}...RHo....Ge....PG]h.....,.hS1C.k..t.%.....9.4..../M7dy..UO.o..bUB-......\\..Z%..........Q....)G6.....>..vg...x...{>...=.....",
+          "printable_ratio": 0.411,
+          "evidence": "weak-high-entropy-collision-risk"
+        },
+        {
+          "type": "ascii-term",
+          "term": "S1C",
+          "offset": 48847195,
+          "context": "F.%k.V.*.d.Ez.bu..G`1l..<....y.'.g.<rX7\"..nywp!.m..c>...}..X.........--.D.6.st.Z.g..^...X.C...+.S1Cr$..(x..u..].c...aC...Rp..vZ....X..U.PI.%.].c#~>t.g.y.....d.^q........d4T1...M..U.GQ.|{..P...",
+          "printable_ratio": 0.464,
+          "evidence": "weak-binary-context"
+        },
+        {
+          "type": "ascii-term",
+          "term": "S1C",
+          "offset": 65841985,
+          "context": "2..S.9q.F2...L........6..;....Sl>.%Uxh%3/3'.zcO{l.....E......u.T BN]........Y.../..%.<...>]...7.S1C\\..../[.......*.Y.P.S...y(..|..5.<a&.v....t.|\\).\"....-..p.......=.\\.|..W...]^....b......6.t.K",
+          "printable_ratio": 0.391,
+          "evidence": "weak-high-entropy-collision-risk"
+        },
+        {
+          "type": "ascii-term",
+          "term": "BLE",
+          "offset": 70165007,
+          "context": "B..^...m...N..a.e..%...j.p....06..k.... A.ql.....eM....N....].<4.T`#u..#..Z;.t.B=..1B.!.......LEBLE....J.......e.......5...P.........u9..=sE.>.....M..ro.RE;5............B...'].r...b....1...P..",
+          "printable_ratio": 0.354,
+          "evidence": "weak-high-entropy-collision-risk"
+        },
+        {
+          "type": "ascii-term",
+          "term": "S1C",
+          "offset": 73230248,
+          "context": "...q.....(..7Be+\\..P.L..X.S.{...........e..Y.S.(.....|...[\"].......G..O.W..=.v&......!....03..A.S1C....B....I.....Q..7..z...hH...b.......a.n.../... .M...+.T^_..+...4.m*C..-JJ;y...]..7..5......",
+          "printable_ratio": 0.349,
+          "evidence": "weak-high-entropy-collision-risk"
+        },
+        {
+          "type": "ascii-term",
+          "term": "S1C",
+          "offset": 88839363,
+          "context": ".&.._9'.L.Q...O#.........b.F.wM.Z..7........gK.p..6..!A~.E9#.w0...X9....a.....5..{m'.....lP.....S1C..[.?..).\\.....C{m\"l...s.:.-...r.}..TS.6P..Y..cD....,....9K5...7.../{r'.j... ....^...Ru...*N.",
+          "printable_ratio": 0.391,
+          "evidence": "weak-high-entropy-collision-risk"
+        },
+        {
+          "type": "ascii-term",
+          "term": "BLE",
+          "offset": 89719999,
+          "context": ".....|..jjO.......M......u..<..Q.g+..u.Sk..V]1.h@.j...&H.........2M..8.*.Vx....b.9W8...P..u.....BLE.....v.KAm......c.h.5.........wW.*.0..?...K.Y.L..d.t]..M...1nr..7..F....53.....;....Ak...[Kg.",
+          "printable_ratio": 0.359,
+          "evidence": "weak-high-entropy-collision-risk"
+        },
+        {
+          "type": "ascii-term",
+          "term": "S1C",
+          "offset": 98906049,
+          "context": "-7C;v.b..K.........8.n....V.........4J.`....+...>......M.O\".._~..p.k../.4..../&@c..Q7.s..D.....iS1C..`.....qc+C..:.w.c+)!Z.:}Q...#&..8<.M.2....v+.+.&-..c\".l=.'..........m..l.k...2q.exFTYJt..g.",
+          "printable_ratio": 0.422,
+          "evidence": "weak-high-entropy-collision-risk"
+        },
+        {
+          "type": "ascii-term",
+          "term": "S1C",
+          "offset": 99433330,
+          "context": ",...n.-.....~!.....[...... Cp...Ae.j.E.+!...OYR.G.Z.............-.jW......#....&n.6e5^+.F;..Rw..S1C.E.b.ur...pDe...=.&.1u....|....N.@.R.hp.Y.j.V...-.j...O.g. ..2=6....P7....v8.\\.....h....M..;q",
+          "printable_ratio": 0.396,
+          "evidence": "weak-high-entropy-collision-risk"
+        },
+        {
+          "type": "ascii-term",
+          "term": "BLE",
+          "offset": 109477908,
+          "context": "..!........>t~h....?2.....W.....D.n9..X..=.,...'...4s>.f.\"..O...bg.Qh.X....md.S..^....1.._.Hr...BLE.t}=A.{6...ao.L.Y.....t.|A......\\/.....|..|..<].....H|r.B.....3Z.......8i.-\".e.......M.}.T\\.0",
+          "printable_ratio": 0.385,
+          "evidence": "weak-high-entropy-collision-risk"
+        },
+        {
+          "type": "ascii-term",
+          "term": "8bee",
+          "offset": 118807934,
+          "context": ".OP..-.re1K/!.O......H..C.O.f.#%.P0N)..{.......]:......N..$............t..mM._.?..t....|;.1.W.g[8bee......?.ZD....B.=.E.X^pR...gpc..'{..I..H...]..k.w*...R.,oEhZlEA..7}F.5..b.Y..t3r............",
+          "printable_ratio": 0.427,
+          "evidence": "weak-high-entropy-collision-risk"
+        },
+        {
+          "type": "ascii-term",
+          "term": "BLE",
+          "offset": 128719894,
+          "context": ".Pt7.4-..y,...C.........y....-....M.@'N..]...........n+G'..=Mbc...1....].5H..q..4....1<..\"......BLE.....Y...............Von.....>a...^.....S.a-.nna...4.-..&.S.7....T..%.q+x./{;T,......A.......",
+          "printable_ratio": 0.339,
+          "evidence": "weak-high-entropy-collision-risk"
+        },
+        {
+          "type": "ascii-term",
+          "term": "GCMD",
+          "offset": 135763719,
+          "context": "bS.<..T.CP.d..P...i.6H.}.......b...!EF....K..Kc..?/...l..2..l.....9....R.i....I.G.)...L...x...?9GCMD};s...........[p.xg...#..V.;1.......>.#=.#.th..}.0y...yJ.=..(.DD.....}|...9.........%E#..W.\\",
+          "printable_ratio": 0.396,
+          "evidence": "weak-high-entropy-collision-risk"
+        },
+        {
+          "type": "ascii-term",
+          "term": "S1C",
+          "offset": 145710552,
+          "context": ".%3?..%......./..)...._..;4.....*j.........iJd...Zm..O...G...k.3.....07...)P+^Fi.uY.H.&..r......S1C.Y.......G1.........R.........7.....M..C1&m]7I)...)P.!.e..xJ@.g..2.PH.H...0=).k.O.IGB}.V..1..",
+          "printable_ratio": 0.391,
+          "evidence": "weak-high-entropy-collision-risk"
+        },
+        {
+          "type": "ascii-term",
+          "term": "BLE",
+          "offset": 151248429,
+          "context": "$....x>...r!.\\.G.....%....................O....\".~].jm0....G<...._.x........._.r..LR.....;..,...BLE/...Q>....P.....<..,...f..g....p.)cM{...g.#......r?F..R.n#.._.L....=.....#@.(..._......$2e./.",
+          "printable_ratio": 0.323,
+          "evidence": "weak-high-entropy-collision-risk"
+        },
+        {
+          "type": "ascii-term",
+          "term": "BLE",
+          "offset": 163596086,
+          "context": "\\l.P2u.y|u.\"M...3../.a..~..*...4.)HX...\"...0~..... .(....,........P..P..@.4....8F7...........70.BLEr4...p.0 ..g..bRx..0c.$0%HT.....c1...B..........c.-........kk6EF.7f..-....Zdj@..7...p8..QW.^.",
+          "printable_ratio": 0.417,
+          "evidence": "weak-high-entropy-collision-risk"
+        },
+        {
+          "type": "ascii-term",
+          "term": "BLE",
+          "offset": 192806712,
+          "context": "..+..b.F..........+Q.G+4.@hL|A~..>.$.P........I.?c.J.....F.N.1...#....g...{~%..3?...............BLE&......t.z..Y..K.G.......<.....Z....SeEq.(.......Z..N..j..v.2=....q,..W.W....H._...H.`q..G...",
+          "printable_ratio": 0.339,
+          "evidence": "weak-high-entropy-collision-risk"
+        },
+        {
+          "type": "ascii-term",
+          "term": "S1C",
+          "offset": 216390213,
+          "context": ".\\.... ..`.....A.R...)...4...H....w....&*..;.qp.m...k].T. .oy....[N%zQ.........>...v...2iz......S1C,np...RT.....PL.......*A.)/.....7.Y.Q65{.....=..Z....?.......g.`..eQ..4..~y.`e..h.!..~.s.C..3",
+          "printable_ratio": 0.359,
+          "evidence": "weak-high-entropy-collision-risk"
+        },
+        {
+          "type": "ascii-term",
+          "term": "S1C",
+          "offset": 220955780,
+          "context": "{pd'7ck.........x.....h.....).....B.A`.A.n.......~.M........R...F`h........ .A..2o..Bn..........S1C...o.z......+.........n....V|(,.*.2.....?..+..l.R..G.Ttzb..QA8.A.....G/.2..J.5.m._L.3.[.ql..8",
+          "printable_ratio": 0.365,
+          "evidence": "weak-high-entropy-collision-risk"
+        },
+        {
+          "type": "ascii-term",
+          "term": "BLE",
+          "offset": 240324065,
+          "context": ".P.u..w\"..}...;.K.KE...\\....Qo.EU.....N?-.N... ^.4....R.....6r...[.....@.L.....!?..x....l....x..BLElqw(..m..w.q.......qn.... ...v.../c...7.3...d.u.....+..>Z..]...2U.8,.1T....*{......W~.&F.X..#",
+          "printable_ratio": 0.37,
+          "evidence": "weak-high-entropy-collision-risk"
+        },
+        {
+          "type": "ascii-term",
+          "term": "S1C",
+          "offset": 258398728,
+          "context": "g.6i)|z.X...S....2U.^......Qr~R.g!.,.[I{.J.vF....+#......B.........._.f...f....g.J.$z..%....&...S1C.k...4.'.7)....7.S..>.O..~.../0,U.:............7.T;/..}..B.g...s.Kqs..XU.A..(.Eays..).Y..q...",
+          "printable_ratio": 0.422,
+          "evidence": "weak-high-entropy-collision-risk"
+        },
+        {
+          "type": "ascii-term",
+          "term": "S1C",
+          "offset": 289704215,
+          "context": "!^\"~7..H.Gj.K...:?9....I..|.......id.f6..;.v@&.h.?{n!......J+~...%.J_.......s.LS\\._..B.W..7.f...S1Cv^..J.......AY.#*AE..<.A.\\zs..[Gr.#&.....^.=n.o..]...+.n...s.8|T...u........_i.Z$T..........V",
+          "printable_ratio": 0.438,
+          "evidence": "weak-high-entropy-collision-risk"
+        },
+        {
+          "type": "ascii-term",
+          "term": "S1C",
+          "offset": 312003722,
+          "context": "...66......e...=.2.T9..m..B..}.Y$.6h..g..S.7T.......P..U..Y=\"d.....R.As._!X;._..7...A...G.......S1C.....H..,....).7...{..C.94...L%..'{.9.....{.:.s_..%.)...#..=.d.....kP\".P ..*x.f...R.w-q.5;...",
+          "printable_ratio": 0.406,
+          "evidence": "weak-high-entropy-collision-risk"
+        },
+        {
+          "type": "ascii-term",
+          "term": "BTST",
+          "offset": 312343012,
+          "context": "......Y...7..!_.~K...e.b..O8{z4`....\\B.......5..{......;m&.c...I..]..W...m.ji....!.'k..tm...8...BTSTGH....D.L.~..m.Xj>z..$'XB<<...Kt.......as#p.w......}.`.W.<s.G.j.O2y....\".*{7y..../...?..L4..",
+          "printable_ratio": 0.438,
+          "evidence": "weak-high-entropy-collision-risk"
+        },
+        {
+          "type": "ascii-term",
+          "term": "BLE",
+          "offset": 319204249,
+          "context": ".V.V.H.H.H.H.H.H.H.P.P.P.P.PT.t.t...................................WJ*.8.(y?Y8y y %898.s...`3.ABLEE.]...w.c.a.`.l.m.n.o.i.t.u.w.s.q.p...{.9#LN.Q....$.D....a.f.gEg.g.g.bEb.b.c.c.A.............",
+          "printable_ratio": 0.427,
+          "evidence": "weak-high-entropy-collision-risk"
+        },
+        {
+          "type": "ascii-term",
+          "term": "S1C",
+          "offset": 328734180,
+          "context": ".=....u.E..+...3c+?k.W.q@...&...:.+...x....S..7T...Y..C..YP.i.g.Z.WC.R..?........<......d0..I...S1C...J....{.n.~l^..V}.`Y...............b..2....M..6.*d;.]..XF...q............b.1.f.O....(-;....",
+          "printable_ratio": 0.375,
+          "evidence": "weak-high-entropy-collision-risk"
+        },
+        {
+          "type": "ascii-term",
+          "term": "S1C",
+          "offset": 331243162,
+          "context": "..Y.d......R..S/R.6..\\Dz.[...VWXG.D.....0..=bx3q.......ZJ.._...,..u./....x/3...t....l.~....Il.JNS1C.T.........d..r..?..l...x[._e~MU.w.....r7{4.....[..~........^......|J...Y.d.....2..w.[.....j.",
+          "printable_ratio": 0.37,
+          "evidence": "weak-high-entropy-collision-risk"
+        },
+        {
+          "type": "ascii-term",
+          "term": "S1C",
+          "offset": 336828855,
+          "context": "G...f.x\\.+|Rh.F.8....._'.\\a.)I.w.....1-.C|.....K.uy...A.6..m_(.~.;.m.v..i.v..\"...#m.@........9..S1C......@k.=o.'..[....[..vN.p....ro..8.&.k.7.5jb6......g.`z.......Mr.....#M. ...|....)}5.......",
+          "printable_ratio": 0.401,
+          "evidence": "weak-high-entropy-collision-risk"
+        },
+        {
+          "type": "ascii-term",
+          "term": "pairing",
+          "offset": 348672996,
+          "context": " GPIO output value..   Warning: value of pin is still %d..%s: %s dev %d NOT available..repair.Repairing GPT: .Writing GPT: .No partition list provided..Missing disk guid..Partition list incomp",
+          "printable_ratio": 0.958,
+          "evidence": "moderate-string-region"
+        },
+        {
+          "type": "ascii-term",
+          "term": "BLE",
+          "offset": 348677397,
+          "context": "art_config info for ver. 0x%x..EXT_CSD[179], PARTITION_CONFIG:.BOOT_ACK: 0x%x.BOOT_PARTITION_ENABLE: 0x%x.PARTITION_ACCESS: 0x%x...MMC read: dev # %d, block # %d, count %d ... .%d blocks read:",
+          "printable_ratio": 0.984,
+          "evidence": "moderate-string-region"
+        },
+        {
+          "type": "ascii-term",
+          "term": "BLE",
+          "offset": 348677515,
+          "context": "CESS: 0x%x...MMC read: dev # %d, block # %d, count %d ... .%d blocks read: %s..Invalid RST_n_ENABLE value..RST_n_FUNCTION only exists on eMMC..no mmc device at slot %x..OK, force rescan.set ds",
+          "printable_ratio": 0.964,
+          "evidence": "moderate-string-region"
+        },
+        {
+          "type": "ascii-term",
+          "term": "Remote",
+          "offset": 348799276,
+          "context": "e).UFI.SFF-8070.Transp. SCSI.Command/Bulk.Command/Bulk/Int.Bulk only.Self Powered .Bus Powered .Remote Wakeup .In.Out.   Configuration: %d..   - Interfaces: %d %s%s%dmA..     Interface: %d..  ",
+          "printable_ratio": 0.922,
+          "evidence": "moderate-string-region"
+        },
+        {
+          "type": "ascii-term",
+          "term": "BLE",
+          "offset": 351610012,
+          "context": ";yl..[.WB.,.Io|r..uQ9....a...dax....%...a.C.<.`2.A>u...]8@....nV-.^..$. _`....R.n......vu.e..;P1BLE......\".....S........{.[.W.V/..7Bn.T....JoY.`,.t../:{..z.... d..q..b......{.+.....x...}....oV",
+          "printable_ratio": 0.438,
+          "evidence": "weak-high-entropy-collision-risk"
+        },
+        {
+          "type": "ascii-term",
+          "term": "BLE",
+          "offset": 361040144,
+          "context": ".G.....\"F.j..a..l.....Zwo..o.0~hC.\\-R.].O.R.x?51f3/.......Fb..'..5....oU\"c.c.U.{c..N....n..{Z...BLEW.......n..dR.h...M{.....7...G..C..P..s.8.F!..YKy.a...d.3...YW.?......]U........DN.....cx....",
+          "printable_ratio": 0.422,
+          "evidence": "weak-high-entropy-collision-risk"
+        },
+        {
+          "type": "ascii-term",
+          "term": "BLE",
+          "offset": 363999095,
+          "context": "f.5..P...s...i.,HP.Y..9..... ..`...'...?.....a./s&..].K.5....'....D7.TO]ttt.M=DJ..0....+..`]m9..BLE.....A.x...s?.i.aBH).....P.7...5.L...P.............i.1e.O.t.W>...7X.R.x.?~..!*a..G.....O.....",
+          "printable_ratio": 0.391,
+          "evidence": "weak-high-entropy-collision-risk"
+        }
+      ],
+      "protocol_strings": [
+        {
+          "offset": 34765046,
+          "text": "oj5\"fcC1"
+        },
+        {
+          "offset": 110075500,
+          "text": "GCCtsK"
+        },
+        {
+          "offset": 135763717,
+          "text": "?9GCMD};s"
+        },
+        {
+          "offset": 238654035,
+          "text": "X8GcmD"
+        },
+        {
+          "offset": 312343012,
+          "text": "BTSTGH"
+        },
+        {
+          "offset": 318947832,
+          "text": "93839"
+        },
+        {
+          "offset": 347627691,
+          "text": "remote_request_region"
+        },
+        {
+          "offset": 347627713,
+          "text": "remote_response_region"
+        },
+        {
+          "offset": 347653753,
+          "text": "remote_response_region"
+        },
+        {
+          "offset": 347653776,
+          "text": "remote_request_region"
+        },
+        {
+          "offset": 347654161,
+          "text": "remote_response_region"
+        },
+        {
+          "offset": 347654184,
+          "text": "remote_request_region"
+        },
+        {
+          "offset": 347654569,
+          "text": "remote_response_region"
+        },
+        {
+          "offset": 347654592,
+          "text": "remote_request_region"
+        },
+        {
+          "offset": 347654977,
+          "text": "remote_response_region"
+        },
+        {
+          "offset": 347655000,
+          "text": "remote_request_region"
+        },
+        {
+          "offset": 347655385,
+          "text": "remote_response_region"
+        },
+        {
+          "offset": 347655408,
+          "text": "remote_request_region"
+        },
+        {
+          "offset": 347655793,
+          "text": "remote_response_region"
+        },
+        {
+          "offset": 347655816,
+          "text": "remote_request_region"
+        },
+        {
+          "offset": 348672987,
+          "text": "repair"
+        },
+        {
+          "offset": 348672994,
+          "text": "Repairing GPT: "
+        },
+        {
+          "offset": 348691896,
+          "text": "%s %s: failed to send remote wakeup"
+        },
+        {
+          "offset": 348745161,
+          "text": "remote receiver status OK"
+        },
+        {
+          "offset": 348745419,
+          "text": "remote fault"
+        },
+        {
+          "offset": 348763807,
+          "text": " gpt repair mmc 0"
+        },
+        {
+          "offset": 348763825,
+          "text": "    - repair the GPT on the device"
+        },
+        {
+          "offset": 348765502,
+          "text": "    - list environment name=value pairs matching 'string'"
+        },
+        {
+          "offset": 348799276,
+          "text": "Remote Wakeup "
+        },
+        {
+          "offset": 348799939,
+          "text": "The remote end did not respond in time."
+        },
+        {
+          "offset": 348812252,
+          "text": "remote_request_region"
+        },
+        {
+          "offset": 348812274,
+          "text": "%s %s: No reg property for remote_request_region"
+        },
+        {
+          "offset": 348812324,
+          "text": "remote_response_region"
+        },
+        {
+          "offset": 348812347,
+          "text": "%s %s: No reg property for remote_response_region"
+        }
+      ],
+      "container_or_executable_magic": [
+        {
+          "type": "gzip",
+          "offset": 2144
+        },
+        {
+          "type": "gzip",
+          "offset": 5481931
+        },
+        {
+          "type": "gzip",
+          "offset": 28337876
+        },
+        {
+          "type": "gzip",
+          "offset": 30814618
+        },
+        {
+          "type": "gzip",
+          "offset": 47537991
+        },
+        {
+          "type": "gzip",
+          "offset": 47729993
+        },
+        {
+          "type": "gzip",
+          "offset": 51074201
+        },
+        {
+          "type": "gzip",
+          "offset": 56922852
+        },
+        {
+          "type": "gzip",
+          "offset": 60341331
+        },
+        {
+          "type": "gzip",
+          "offset": 62504209
+        },
+        {
+          "type": "gzip",
+          "offset": 67484105
+        },
+        {
+          "type": "gzip",
+          "offset": 115745728
+        },
+        {
+          "type": "gzip",
+          "offset": 122479118
+        },
+        {
+          "type": "gzip",
+          "offset": 162938252
+        },
+        {
+          "type": "gzip",
+          "offset": 201461752
+        },
+        {
+          "type": "gzip",
+          "offset": 212105369
+        },
+        {
+          "type": "gzip",
+          "offset": 238682313
+        },
+        {
+          "type": "gzip",
+          "offset": 259692806
+        },
+        {
+          "type": "gzip",
+          "offset": 269319523
+        },
+        {
+          "type": "gzip",
+          "offset": 271139325
+        },
+        {
+          "type": "gzip",
+          "offset": 271923244
+        },
+        {
+          "type": "gzip",
+          "offset": 314427274
+        },
+        {
+          "type": "gzip",
+          "offset": 318298737
+        },
+        {
+          "type": "zip",
+          "offset": 362205511
+        }
+      ]
+    }
+  ],
+  "notes": [
+    "Static string/UUID extraction only. It does not decrypt signed/encrypted firmware.",
+    "ATOMOS 9-digit Pairing ID and Android SMP passkey are treated as separate layers.",
+    "High-entropy firmware can contain accidental short ASCII collisions. Isolated S1C/BLE/BTPR/UUID fragments are weak evidence unless clustered in a structured executable/string region.",
+    "The 17.7 Android build does not send BTPR/S1C ASCII into the proprietary 9383 GATT service without a proven transport mapping.",
+    "Use hit.evidence: weak-high-entropy-collision-risk means the token is not protocol proof by itself. Full UUID/magic/string clusters in structured regions are stronger evidence."
+  ]
+}

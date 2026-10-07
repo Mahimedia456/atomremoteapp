@@ -1,0 +1,39 @@
+{
+  "schema": "atomos-native-protocol-v2",
+  "name": "Validated Atomos Profile",
+  "validated": false,
+  "serviceUuid": "",
+  "commandCharacteristicUuid": "",
+  "statusCharacteristicUuid": "",
+  "notifyCharacteristicUuid": "",
+  "writeWithResponse": true,
+  "commands": {
+    "recordStartBase64": "",
+    "recordStopBase64": "",
+    "playBase64": "",
+    "pauseBase64": "",
+    "waveformOnBase64": "",
+    "waveformOffBase64": "",
+    "zebraOnBase64": "",
+    "zebraOffBase64": "",
+    "peakingOnBase64": "",
+    "peakingOffBase64": "",
+    "falseColorOnBase64": "",
+    "falseColorOffBase64": "",
+    "zoomOnBase64": "",
+    "zoomOffBase64": "",
+    "guidesOnBase64": "",
+    "guidesOffBase64": ""
+  },
+  "extraCommands": {
+    "input-gamma-log": "",
+    "input-gamma-rec709": "",
+    "input-gamut-native": "",
+    "record-codec-prores-hq": "",
+    "record-codec-prores-422": "",
+    "output-lut-preview-on": "",
+    "output-lut-preview-off": "",
+    "output-hdr-on": "",
+    "output-hdr-off": ""
+  }
+}

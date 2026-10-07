@@ -1,0 +1,39 @@
+ATOMREMOTE SCREENSHOT FOLLOW-UP BACKLOG
+Status: deliberately deferred until the 19.12 baseline build/test is completed.
+
+Visible recorder sub-settings captured in the supplied screenshots:
+
+1. Frame Guide
+   - Aspect ratio presets visible: 16:9, 2.4, 2.35, 1.9, 1.0, 1.85, 4:3, 1:1, 4:5
+   - Custom Ratio entry
+
+2. Display
+   - Backlight
+   - Lift
+   - Gamma
+   - Gain
+   - Reset
+
+3. LUTs
+   - LUT slots 1 through 8 are visible
+   - During Record
+   - During Output
+   - Compare
+
+4. False Color
+   - ATOMOS
+   - EL ZONE
+   - ARRI
+   - Recorder UI warns that camera Log output must be specified in Input for ARRI False Color / EL Zone workflows
+
+5. Focus Peaking
+   - Multiple peaking display/style choices are visible
+   - A color palette is visible
+
+6. Zebra
+   - Multiple zebra style/threshold choices are visible
+   - Opacity control
+   - Brightness control
+
+Implementation rule for follow-up:
+Do not infer numeric RemoteApi message IDs from these screenshots. Use the macOS executable/resources plus recorder logs to recover each getter/setter, protobuf schema, response mapping and local/remote envelope before wiring controls.

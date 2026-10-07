@@ -1,0 +1,78 @@
+Input: C:\Users\hp\Downloads\ATOMSGU_11.18.0.zip
+SHA256: eb10550836434f6291e0d97c5f81e12be5b166c42f04532c4d41a06baa7ad7da
+
+FILE ATOMSGU.FW size=384044412 entropy=8.0
+  0x0022C4EB ascii-term BLE 
+  0x007FFE18 ascii-term S1C 
+  0x00C39F1C ascii-term S1C 
+  0x00F3FEE3 ascii-term BLE 
+  0x015B3026 ascii-term BLE 
+  0x01FD4A6B ascii-term S1C 
+  0x02E9595B ascii-term S1C 
+  0x03ECAB41 ascii-term S1C 
+  0x042EA20F ascii-term BLE 
+  0x045D67A8 ascii-term S1C 
+  0x054B94C3 ascii-term S1C 
+  0x055904BF ascii-term BLE 
+  0x05E52FC1 ascii-term S1C 
+  0x05ED3B72 ascii-term S1C 
+  0x06868014 ascii-term BLE 
+  0x0714DD7E ascii-term 8bee 
+  0x07AC1C16 ascii-term BLE 
+  0x08179707 ascii-term GCMD 
+  0x08AF5DD8 ascii-term S1C 
+  0x0903DE2D ascii-term BLE 
+  0x09C04736 ascii-term BLE 
+  0x0B7DFF38 ascii-term BLE 
+  0x0CE5DA45 ascii-term S1C 
+  0x0D2B8484 ascii-term S1C 
+  0x0E530DE1 ascii-term BLE 
+  0x0F66DA08 ascii-term S1C 
+  0x11448917 ascii-term S1C 
+  0x1298CC8A ascii-term S1C 
+  0x129DF9E4 ascii-term BTST 
+  0x1306AB99 ascii-term BLE 
+  0x139815E4 ascii-term S1C 
+  0x13BE5E9A ascii-term S1C 
+  0x141399B7 ascii-term S1C 
+  0x14C853E4 ascii-term pairing 
+  0x14C86515 ascii-term BLE 
+  0x14C8658B ascii-term BLE 
+  0x14CA412C ascii-term Remote 
+  0x14F5249C ascii-term BLE 
+  0x15850910 ascii-term BLE 
+  0x15B22F77 ascii-term BLE 
+  STR 0x021278F6: oj5"fcC1
+  STR 0x068F9E6C: GCCtsK
+  STR 0x08179705: ?9GCMD};s
+  STR 0x0E399253: X8GcmD
+  STR 0x129DF9E4: BTSTGH
+  STR 0x1302C1F8: 93839
+  STR 0x14B860AB: remote_request_region
+  STR 0x14B860C1: remote_response_region
+  STR 0x14B8C679: remote_response_region
+  STR 0x14B8C690: remote_request_region
+  STR 0x14B8C811: remote_response_region
+  STR 0x14B8C828: remote_request_region
+  STR 0x14B8C9A9: remote_response_region
+  STR 0x14B8C9C0: remote_request_region
+  STR 0x14B8CB41: remote_response_region
+  STR 0x14B8CB58: remote_request_region
+  STR 0x14B8CCD9: remote_response_region
+  STR 0x14B8CCF0: remote_request_region
+  STR 0x14B8CE71: remote_response_region
+  STR 0x14B8CE88: remote_request_region
+  STR 0x14C853DB: repair
+  STR 0x14C853E2: Repairing GPT: 
+  STR 0x14C89DB8: %s %s: failed to send remote wakeup
+  STR 0x14C96DC9: remote receiver status OK
+  STR 0x14C96ECB: remote fault
+  STR 0x14C9B69F:  gpt repair mmc 0
+  STR 0x14C9B6B1:     - repair the GPT on the device
+  STR 0x14C9BD3E:     - list environment name=value pairs matching 'string'
+  STR 0x14CA412C: Remote Wakeup 
+  STR 0x14CA43C3: The remote end did not respond in time.
+  STR 0x14CA73DC: remote_request_region
+  STR 0x14CA73F2: %s %s: No reg property for remote_request_region
+  STR 0x14CA7424: remote_response_region
+  STR 0x14CA743B: %s %s: No reg property for remote_response_region

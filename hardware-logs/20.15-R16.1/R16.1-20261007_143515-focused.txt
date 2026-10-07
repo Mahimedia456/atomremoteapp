@@ -1,0 +1,220 @@
+﻿10-07 14:37:02.076   879   962 I mtkpower@impl: [powerd_req] TIMER_MSG_PERF_LOCK_TIMEOUT hdl:7709
+10-07 14:37:15.498   879   962 I mtkpower@impl: [powerd_req] TIMER_MSG_PERF_LOCK_TIMEOUT hdl:7717
+10-07 14:38:00.263  8410 11021 E ogle.android.gm: hiddenapi: Accessing hidden method Lcom/android/org/conscrypt/ConscryptEngineSocket;->setHandshakeTimeout(I)V (runtime_flags=CorePlatformApi, domain=core-platform, api=blocked,core-platform-api) from Lmej; (domain=app, TargetSdkVersion=37) using reflection: denied
+10-07 14:38:00.263  8410 11021 E ogle.android.gm: hiddenapi: Accessing hidden method Lcom/android/org/conscrypt/OpenSSLSocketImpl;->setHandshakeTimeout(I)V (runtime_flags=CorePlatformApi, domain=core-platform, api=max-target-r,core-platform-api) from Lmej; (domain=app, TargetSdkVersion=37) using reflection: denied
+10-07 14:38:00.263  8410 11021 E ogle.android.gm: hiddenapi: Accessing hidden method Lcom/android/org/conscrypt/AbstractConscryptSocket;->setHandshakeTimeout(I)V (runtime_flags=0, domain=core-platform, api=max-target-r) from Lmej; (domain=app, TargetSdkVersion=37) using reflection: denied
+10-07 14:38:00.266  8410 11021 W pwx     : [Gmail] SSLSocketFactoryWrapper: unable to set handshake timeout
+10-07 14:38:00.266  8410 11021 W pwx     : java.lang.NoSuchMethodException: com.android.org.conscrypt.Java8EngineSocket.setHandshakeTimeout [int]
+10-07 14:38:02.128  8410 11022 E ogle.android.gm: hiddenapi: Accessing hidden method Lcom/android/org/conscrypt/ConscryptEngineSocket;->setHandshakeTimeout(I)V (runtime_flags=CorePlatformApi, domain=core-platform, api=blocked,core-platform-api) from Lmej; (domain=app, TargetSdkVersion=37) using reflection: denied
+10-07 14:38:02.129  8410 11022 E ogle.android.gm: hiddenapi: Accessing hidden method Lcom/android/org/conscrypt/OpenSSLSocketImpl;->setHandshakeTimeout(I)V (runtime_flags=CorePlatformApi, domain=core-platform, api=max-target-r,core-platform-api) from Lmej; (domain=app, TargetSdkVersion=37) using reflection: denied
+10-07 14:38:02.129  8410 11022 E ogle.android.gm: hiddenapi: Accessing hidden method Lcom/android/org/conscrypt/AbstractConscryptSocket;->setHandshakeTimeout(I)V (runtime_flags=0, domain=core-platform, api=max-target-r) from Lmej; (domain=app, TargetSdkVersion=37) using reflection: denied
+10-07 14:38:02.129  8410 11022 W pwx     : [Gmail] SSLSocketFactoryWrapper: unable to set handshake timeout
+10-07 14:38:02.129  8410 11022 W pwx     : java.lang.NoSuchMethodException: com.android.org.conscrypt.Java8EngineSocket.setHandshakeTimeout [int]
+10-07 14:38:14.449   879   962 I mtkpower@impl: [powerd_req] TIMER_MSG_PERF_LOCK_TIMEOUT hdl:7718
+10-07 14:38:14.721  4671  6859 I MediaCodec: [c2.mtk.vp9.decoder] setting surface generation to 4783111
+10-07 14:38:14.810  4671  4836 W YT.codecreuse: Codec reused by Factory: c2.mtk.vp9.decoder
+10-07 14:38:14.976   905   655 D APM_AudioPolicyManager: listAudioPorts mAvailableInputDevices 0x80000004, 0x80000008, 0x80000040, 0x80000080, 0x80000100, 0x80002000, 0x90000000
+10-07 14:38:14.992   905   655 D APM_AudioPolicyManager: listAudioPorts mAvailableInputDevices 0x80000004, 0x80000008, 0x80000040, 0x80000080, 0x80000100, 0x80002000, 0x90000000
+10-07 14:38:15.913 11042 11062 W System.err: java.lang.VerifyError: Verifier rejected class d1.b4: int d1.b4.a(java.io.File) failed to verify: int d1.b4.a(java.io.File): [0x55] instance field access on object that has non-reference type PositiveByteConstant
+10-07 14:38:16.096   879   962 I mtkpower@impl: [powerd_req] TIMER_MSG_PERF_LOCK_TIMEOUT hdl:7719
+10-07 14:38:24.841   879   962 I mtkpower@impl: [powerd_req] TIMER_MSG_PERF_LOCK_TIMEOUT hdl:7723
+10-07 14:38:27.008   879   962 I mtkpower@impl: [powerd_req] TIMER_MSG_PERF_LOCK_TIMEOUT hdl:7725
+10-07 14:38:27.745   879   962 I mtkpower@impl: [powerd_req] TIMER_MSG_PERF_LOCK_TIMEOUT hdl:7726
+10-07 14:38:28.414   879   962 I mtkpower@impl: [powerd_req] TIMER_MSG_PERF_LOCK_TIMEOUT hdl:7727
+10-07 14:38:29.164   879   962 I mtkpower@impl: [powerd_req] TIMER_MSG_PERF_LOCK_TIMEOUT hdl:7728
+10-07 14:38:30.053   879   962 I mtkpower@impl: [powerd_req] TIMER_MSG_PERF_LOCK_TIMEOUT hdl:7729
+10-07 14:38:31.622   879   962 I mtkpower@impl: [powerd_req] TIMER_MSG_PERF_LOCK_TIMEOUT hdl:7731
+10-07 14:38:32.082   879   962 I mtkpower@impl: [powerd_req] TIMER_MSG_PERF_LOCK_TIMEOUT hdl:7732
+10-07 14:38:32.477   879   962 I mtkpower@impl: [powerd_req] TIMER_MSG_PERF_LOCK_TIMEOUT hdl:7733
+10-07 14:38:32.744   879   962 I mtkpower@impl: [powerd_req] TIMER_MSG_PERF_LOCK_TIMEOUT hdl:7734
+10-07 14:38:33.254   879   962 I mtkpower@impl: [powerd_req] TIMER_MSG_PERF_LOCK_TIMEOUT hdl:7736
+10-07 14:38:33.783   879   962 I mtkpower@impl: [powerd_req] TIMER_MSG_PERF_LOCK_TIMEOUT hdl:7737
+10-07 14:38:34.246   879   962 I mtkpower@impl: [powerd_req] TIMER_MSG_PERF_LOCK_TIMEOUT hdl:7738
+10-07 14:38:39.205 10295 10295 D AtomRemoteGatt: TCS19.12.10 CODEC READBACK TIMEOUT expected=3/2 source=non-reboot
+10-07 14:38:39.207 10295 10295 D AtomRemoteGatt: TCS19.12.10 SNAPSHOT {"generation":0,"source":"codec-timeout","running":false,"inputExpected":3,"inputResponses":0,"codecProfile":-1,"codecBitDepth":-1,"input":{}}
+10-07 14:38:39.252  4671  4761 E YT.qoe  : Pinging https://s.youtube.com/api/stats/qoe?adcontext=CAESEwigxM_3zaeXAxV2aB0JHU0eHgUgASgWMAE&adformat=15_2_1&cl=993313847&ei=-BLGasv7Jo_nxN8P68CBsQ0&el=detailpage&event=streamingstats&ns=yt&plid=AAZdPN76pYpubE_v&cpn=CHpj-MAggFJbK_8v&cplatform=mobile&cbr=com.google.android.apps.youtube.music&cff=SMALL_FORM_FACTOR&c=android_music&cmodel=Infinix%20X6837&cos=Android&soc=Mediatek%3AMT6789&csdk=33&cbrver=9.40.51&cver=9.40.51&cosver=13&cbrand=INFINIX&qclc=ChBDSHBqLU1BZ2dGSmJLXzh2qgEA&vis=0.042:0&conn=0.010:3&vfs=0.152:779:::i:sms.1&df=0.152:0&cplayer=PLATYPUS&cache_bytes=0.312:233059&decoder=0.349:1:c2.mtk.vp9.decoder:2:LibopusAudioRenderer&afs=0.152:251::i:sms.1;fl.-20.12;tl.-12.0;vg.0.0;nm.2&is_offline=0.008:0&sur=0.005:3&view=0.152:500:500&bat=0.010:0.270:0,24.565:0.270:0&rate=0.034:1.0&cat=sabr&vps=0.031:B,0.312:PL&user_intent=0.002&ctmp=pcmp:u,du:used.259752179.268435456;avail.52738125824.245037498368;;inst.ytm,mem:tot.145;max.512;free.77;heap.511;hpall.426;hpfree.71,poa:0,vnorm:rt.0.034;rng.0.0;trkcfg.-20.11;tarcfg.-12.0;mode.STATEFUL;tar.-12.0;pre.-20.11;ang.0.0;inpvol.1.0;mult.1.0;outvol.1.0,mlat:rt.0.034;loadVideo.31648,llv:31,vc:i.6,flags:74,pmqs:none,cir:rt.0.127;reused.true;mode.CODEC_REUSE_MODE_REUSE_WITH_RECONFIGURATION,vnorm:rt.0.151;rng.0.0;trkcfg.-20.11;tarcfg.-12.0;trkfmt.-20.12;mode.STATEFUL;tar.-12.0;pre.-20.12;ang.0.0;inpvol.1.0;mult.1.0;outvol.1.0,vnorm:rt.0.152;rng.0.0;trkcfg.-20.11;tarcfg.-12.0;trkfmt.-20.12;mode.STATEFUL;tar.-12.0;pre.-20.12;ang.0.0;inpvol.1.0;mult.1.0;outvol.1.0,bh0:tr1.24.021;tr1end.1;tr2.24.000;tr2end.1&spatial=0.008:0:0&seq=2&aur=0.312:3&docid=(scrubbed) 
+10-07 14:38:39.289  4671  6859 D MediaCodec: [0xb400007e36ad4ce0] setState: 7
+10-07 14:38:39.296  4671  4909 D skia    : SkJpegCodec::onGetPixels +
+10-07 14:38:39.296   867   992 D C2MtkVdec: [0xEF8C3260] VCodec Flushed, mGeneration: 12
+10-07 14:38:39.298  4671  6859 D MediaCodec: [0xb400007e36ad4ce0] setState: 8
+10-07 14:38:39.298  4671  4836 D MediaCodec: keep callback message for reclaim
+10-07 14:38:39.298  4671  6859 D MediaCodec: [0xb400007e36ad4ce0] setState: 6
+10-07 14:38:39.299  4671  6859 I CCodecConfig: query failed after returning 17 values (BAD_INDEX)
+10-07 14:38:39.299  4671  6859 D CCodecConfig: c2 config diff is   c2::u32 output.delay.value = 12
+10-07 14:38:39.299  4671  6859 D CCodecConfig:   c2::u32 raw.max-size.height = 1080
+10-07 14:38:39.301  4671  6859 W Codec2Client: query -- param skipped: index = 1342179345.
+10-07 14:38:39.301  4671  6859 W Codec2Client: query -- param skipped: index = 2415921170.
+10-07 14:38:39.301  4671  6859 W Codec2Client: query -- param skipped: index = 1610614798.
+10-07 14:38:39.305  4671  4909 D skia    : SkJpegCodec::onGetPixels -
+10-07 14:38:39.305   918  1119 D SurfaceFlinger: calculateTimeoutTime, triggerInterval = 1 sec + 186175462 nsec
+10-07 14:38:39.305  4671  6859 D MediaCodec: [0xb400007e36ad4ce0] setState: 7
+10-07 14:38:39.309   867   992 D C2MtkVdec: [0xEF8C3260] VCodec Flushed, mGeneration: 13
+10-07 14:38:39.309  4671  6859 D MediaCodec: [0xb400007e36ad4ce0] setState: 8
+10-07 14:38:39.309  4671  4836 D MediaCodec: keep callback message for reclaim
+10-07 14:38:39.309  4671  6859 D MediaCodec: [0xb400007e36ad4ce0] setState: 6
+10-07 14:38:39.310  4671  6859 I CCodecConfig: query failed after returning 17 values (BAD_INDEX)
+10-07 14:38:39.310  4671  6859 W Codec2Client: query -- param skipped: index = 1342179345.
+10-07 14:38:39.310  4671  6859 W Codec2Client: query -- param skipped: index = 2415921170.
+10-07 14:38:39.310  4671  6859 W Codec2Client: query -- param skipped: index = 1610614798.
+10-07 14:38:39.324  4671  6859 D MediaCodec: [0xb400007e36ad4ce0] [c2.mtk.vp9.decoder] connectToSurface: surface 0xb400007e66851c70, mSurface 0xb400007e668ba180
+10-07 14:38:39.324  4671  6859 I MediaCodec: [c2.mtk.vp9.decoder] setting surface generation to 4783112
+10-07 14:38:39.325  4671  6859 D Codec2-OutputBufferQueue: remote graphic buffer migration 0/0
+10-07 14:38:39.326  4671  6859 D Codec2Client: setOutputSurface -- generation=4783112 consumer usage=0x900
+10-07 14:38:39.340  4671  6859 D Codec2Client: Surface configure completed
+10-07 14:38:39.340  4671  6859 D MediaCodec: [0xb400007e36ad4ce0] [c2.mtk.vp9.decoder] disconnectFromSurface: mSurface 0xb400007e668ba180
+10-07 14:38:39.360  4671  6859 D MediaCodec: [0xb400007e36ad4ce0] [c2.mtk.vp9.decoder] connectToSurface: surface 0xb400007e668ba180, mSurface 0xb400007e66851c70
+10-07 14:38:39.360  4671  6859 I MediaCodec: [c2.mtk.vp9.decoder] setting surface generation to 4783113
+10-07 14:38:39.361  4671  6859 D Codec2-OutputBufferQueue: remote graphic buffer migration 0/0
+10-07 14:38:39.362  4671  6859 D Codec2Client: setOutputSurface -- generation=4783113 consumer usage=0x900
+10-07 14:38:39.380  4671  6859 D Codec2Client: Surface configure completed
+10-07 14:38:39.380  4671  6859 D MediaCodec: [0xb400007e36ad4ce0] [c2.mtk.vp9.decoder] disconnectFromSurface: mSurface 0xb400007e66851c70
+10-07 14:38:39.381  4671  4836 W YT.codecreuse: Codec reused by Factory: c2.mtk.vp9.decoder
+10-07 14:38:40.491   918  1119 D SurfaceFlinger: calculateTimeoutTime, triggerInterval = 1 sec + 198810692 nsec
+10-07 14:38:40.627  4671  6860 D CCodecBufferChannel: [c2.mtk.vp9.decoder#795] flushed work; ignored.
+10-07 14:38:40.627  4671  6860 D CCodecBufferChannel: [c2.mtk.vp9.decoder#795] Discard frames from previous generation.
+10-07 14:38:40.628  4671  6860 D CCodecBufferChannel: [c2.mtk.vp9.decoder#795] flushed work not feedInput.
+10-07 14:38:40.629  4671  6860 D CCodecBufferChannel: [c2.mtk.vp9.decoder#795] flushed work; ignored.
+10-07 14:38:40.629  4671  6860 D CCodecBufferChannel: [c2.mtk.vp9.decoder#795] Discard frames from previous generation.
+10-07 14:38:40.629  4671  6860 D CCodecBufferChannel: [c2.mtk.vp9.decoder#795] flushed work not feedInput.
+10-07 14:38:40.630  4671  6860 D CCodecBufferChannel: [c2.mtk.vp9.decoder#795] flushed work; ignored.
+10-07 14:38:40.630  4671  6860 D CCodecBufferChannel: [c2.mtk.vp9.decoder#795] Discard frames from previous generation.
+10-07 14:38:40.630  4671  6860 D CCodecBufferChannel: [c2.mtk.vp9.decoder#795] flushed work not feedInput.
+10-07 14:38:40.632  4671  6860 D CCodecBufferChannel: [c2.mtk.vp9.decoder#795] flushed work; ignored.
+10-07 14:38:40.632  4671  6860 D CCodecBufferChannel: [c2.mtk.vp9.decoder#795] Discard frames from previous generation.
+10-07 14:38:40.632  4671  6860 D CCodecBufferChannel: [c2.mtk.vp9.decoder#795] flushed work not feedInput.
+10-07 14:38:40.633  4671  6860 D CCodecBufferChannel: [c2.mtk.vp9.decoder#795] flushed work; ignored.
+10-07 14:38:40.633  4671  6860 D CCodecBufferChannel: [c2.mtk.vp9.decoder#795] Discard frames from previous generation.
+10-07 14:38:40.633  4671  6860 D CCodecBufferChannel: [c2.mtk.vp9.decoder#795] flushed work not feedInput.
+10-07 14:38:40.633  4671  6860 D CCodecBufferChannel: [c2.mtk.vp9.decoder#795] flushed work; ignored.
+10-07 14:38:40.633  4671  6860 D CCodecBufferChannel: [c2.mtk.vp9.decoder#795] Discard frames from previous generation.
+10-07 14:38:40.633  4671  6860 D CCodecBufferChannel: [c2.mtk.vp9.decoder#795] flushed work not feedInput.
+10-07 14:38:40.634  4671  6860 D CCodecBufferChannel: [c2.mtk.vp9.decoder#795] flushed work; ignored.
+10-07 14:38:40.634  4671  6860 D CCodecBufferChannel: [c2.mtk.vp9.decoder#795] Discard frames from previous generation.
+10-07 14:38:40.635  4671  6860 D CCodecBufferChannel: [c2.mtk.vp9.decoder#795] flushed work not feedInput.
+10-07 14:38:40.635  4671  6860 D CCodecBufferChannel: [c2.mtk.vp9.decoder#795] flushed work; ignored.
+10-07 14:38:40.635  4671  6860 D CCodecBufferChannel: [c2.mtk.vp9.decoder#795] Discard frames from previous generation.
+10-07 14:38:40.635  4671  6860 D CCodecBufferChannel: [c2.mtk.vp9.decoder#795] flushed work not feedInput.
+10-07 14:38:40.636  4671  6860 D CCodecBufferChannel: [c2.mtk.vp9.decoder#795] flushed work; ignored.
+10-07 14:38:40.636  4671  6860 D CCodecBufferChannel: [c2.mtk.vp9.decoder#795] Discard frames from previous generation.
+10-07 14:38:40.636  4671  6860 D CCodecBufferChannel: [c2.mtk.vp9.decoder#795] flushed work not feedInput.
+10-07 14:38:40.637  4671  6860 D CCodecBufferChannel: [c2.mtk.vp9.decoder#795] flushed work; ignored.
+10-07 14:38:40.637  4671  6860 D CCodecBufferChannel: [c2.mtk.vp9.decoder#795] Discard frames from previous generation.
+10-07 14:38:40.637  4671  6860 D CCodecBufferChannel: [c2.mtk.vp9.decoder#795] flushed work not feedInput.
+10-07 14:38:40.638  4671  6860 D CCodecBufferChannel: [c2.mtk.vp9.decoder#795] flushed work; ignored.
+10-07 14:38:40.638  4671  6860 D CCodecBufferChannel: [c2.mtk.vp9.decoder#795] Discard frames from previous generation.
+10-07 14:38:40.638  4671  6860 D CCodecBufferChannel: [c2.mtk.vp9.decoder#795] flushed work not feedInput.
+10-07 14:38:40.638  4671  6860 D CCodecBufferChannel: [c2.mtk.vp9.decoder#795] flushed work; ignored.
+10-07 14:38:40.638  4671  6860 D CCodecBufferChannel: [c2.mtk.vp9.decoder#795] Discard frames from previous generation.
+10-07 14:38:40.638  4671  6860 D CCodecBufferChannel: [c2.mtk.vp9.decoder#795] flushed work not feedInput.
+10-07 14:38:40.639  4671  6860 D CCodecBufferChannel: [c2.mtk.vp9.decoder#795] flushed work; ignored.
+10-07 14:38:40.639  4671  6860 D CCodecBufferChannel: [c2.mtk.vp9.decoder#795] Discard frames from previous generation.
+10-07 14:38:40.639  4671  6860 D CCodecBufferChannel: [c2.mtk.vp9.decoder#795] flushed work not feedInput.
+10-07 14:38:40.640  4671  6860 D CCodecBufferChannel: [c2.mtk.vp9.decoder#795] flushed work; ignored.
+10-07 14:38:40.640  4671  6860 D CCodecBufferChannel: [c2.mtk.vp9.decoder#795] Discard frames from previous generation.
+10-07 14:38:40.640  4671  6860 D CCodecBufferChannel: [c2.mtk.vp9.decoder#795] flushed work not feedInput.
+10-07 14:38:40.640  4671  6860 D CCodecBufferChannel: [c2.mtk.vp9.decoder#795] flushed work; ignored.
+10-07 14:38:40.640  4671  6860 D CCodecBufferChannel: [c2.mtk.vp9.decoder#795] Discard frames from previous generation.
+10-07 14:38:40.640  4671  6860 D CCodecBufferChannel: [c2.mtk.vp9.decoder#795] flushed work not feedInput.
+10-07 14:38:40.641  4671  6860 D CCodecBufferChannel: [c2.mtk.vp9.decoder#795] flushed work; ignored.
+10-07 14:38:40.641  4671  6860 D CCodecBufferChannel: [c2.mtk.vp9.decoder#795] Discard frames from previous generation.
+10-07 14:38:40.641  4671  6860 D CCodecBufferChannel: [c2.mtk.vp9.decoder#795] flushed work not feedInput.
+10-07 14:38:40.642  4671  6860 D CCodecBufferChannel: [c2.mtk.vp9.decoder#795] flushed work; ignored.
+10-07 14:38:40.642  4671  6860 D CCodecBufferChannel: [c2.mtk.vp9.decoder#795] Discard frames from previous generation.
+10-07 14:38:40.642  4671  6860 D CCodecBufferChannel: [c2.mtk.vp9.decoder#795] flushed work not feedInput.
+10-07 14:38:40.642  4671  6860 D CCodecBufferChannel: [c2.mtk.vp9.decoder#795] flushed work; ignored.
+10-07 14:38:40.642  4671  6860 D CCodecBufferChannel: [c2.mtk.vp9.decoder#795] Discard frames from previous generation.
+10-07 14:38:40.642  4671  6860 D CCodecBufferChannel: [c2.mtk.vp9.decoder#795] flushed work not feedInput.
+10-07 14:38:40.642  4671  6860 D CCodecBufferChannel: [c2.mtk.vp9.decoder#795] flushed work; ignored.
+10-07 14:38:40.642  4671  6860 D CCodecBufferChannel: [c2.mtk.vp9.decoder#795] Discard frames from previous generation.
+10-07 14:38:40.642  4671  6860 D CCodecBufferChannel: [c2.mtk.vp9.decoder#795] flushed work not feedInput.
+10-07 14:38:40.643  4671  6860 D CCodecBufferChannel: [c2.mtk.vp9.decoder#795] flushed work; ignored.
+10-07 14:38:40.643  4671  6860 D CCodecBufferChannel: [c2.mtk.vp9.decoder#795] Discard frames from previous generation.
+10-07 14:38:40.643  4671  6860 D CCodecBufferChannel: [c2.mtk.vp9.decoder#795] flushed work not feedInput.
+10-07 14:38:40.644  4671  6860 D CCodecBufferChannel: [c2.mtk.vp9.decoder#795] flushed work; ignored.
+10-07 14:38:40.644  4671  6860 D CCodecBufferChannel: [c2.mtk.vp9.decoder#795] Discard frames from previous generation.
+10-07 14:38:40.644  4671  6860 D CCodecBufferChannel: [c2.mtk.vp9.decoder#795] flushed work not feedInput.
+10-07 14:38:40.644  4671  6860 D CCodecBufferChannel: [c2.mtk.vp9.decoder#795] flushed work; ignored.
+10-07 14:38:40.644  4671  6860 D CCodecBufferChannel: [c2.mtk.vp9.decoder#795] Discard frames from previous generation.
+10-07 14:38:40.645  4671  6860 D CCodecBufferChannel: [c2.mtk.vp9.decoder#795] flushed work not feedInput.
+10-07 14:38:40.645  4671  6860 D CCodecBufferChannel: [c2.mtk.vp9.decoder#795] flushed work; ignored.
+10-07 14:38:40.645  4671  6860 D CCodecBufferChannel: [c2.mtk.vp9.decoder#795] Discard frames from previous generation.
+10-07 14:38:40.645  4671  6860 D CCodecBufferChannel: [c2.mtk.vp9.decoder#795] flushed work not feedInput.
+10-07 14:38:40.646  4671  6860 D CCodecBufferChannel: [c2.mtk.vp9.decoder#795] flushed work; ignored.
+10-07 14:38:40.646  4671  6860 D CCodecBufferChannel: [c2.mtk.vp9.decoder#795] Discard frames from previous generation.
+10-07 14:38:40.646  4671  6860 D CCodecBufferChannel: [c2.mtk.vp9.decoder#795] flushed work not feedInput.
+10-07 14:38:40.647  4671  6860 D CCodecBufferChannel: [c2.mtk.vp9.decoder#795] flushed work; ignored.
+10-07 14:38:40.647  4671  6860 D CCodecBufferChannel: [c2.mtk.vp9.decoder#795] Discard frames from previous generation.
+10-07 14:38:40.647  4671  6860 D CCodecBufferChannel: [c2.mtk.vp9.decoder#795] flushed work not feedInput.
+10-07 14:38:40.660  4671  6860 D CCodecConfig: c2 config diff is   c2::u32 output.delay.value = 25
+10-07 14:38:40.661  4671  6860 D CCodecBufferChannel: [c2.mtk.vp9.decoder#795] Discard frames from previous generation.
+10-07 14:38:40.661  4671  6860 D Codec2-OutputBufferQueue: set max dequeue count 32 from update
+10-07 14:38:40.664  4671  6864 D CCodecBufferChannel: [c2.mtk.vp9.decoder#795] Ignoring stale input buffer done callback: last flush index = 10367, frameIndex = 10367
+10-07 14:38:40.669  4671  6860 D CCodecConfig: c2 config diff is   c2::u32 raw.crop.height = 360
+10-07 14:38:40.669  4671  6860 D CCodecConfig:   c2::u32 raw.crop.width = 524
+10-07 14:38:40.669  4671  6860 D CCodecConfig:   c2::u32 raw.size.height = 360
+10-07 14:38:40.669  4671  6860 D CCodecConfig:   c2::u32 raw.size.width = 524
+10-07 14:38:40.670  4671  6860 D CCodecBuffers: [c2.mtk.vp9.decoder#795:2D-Output] popFromStashAndRegister: at 1000000000000us, output format changed to AMessage(what = 0x00000000) = {
+10-07 14:38:40.670  4671  6860 D CCodecBuffers:   int32_t android._color-format = 2135033992
+10-07 14:38:40.670  4671  6860 D CCodecBuffers:   int32_t android._video-scaling = 1
+10-07 14:38:40.670  4671  6860 D CCodecBuffers:   int32_t sar-width = 1
+10-07 14:38:40.670  4671  6860 D CCodecBuffers:   int32_t color-standard = 1
+10-07 14:38:40.670  4671  6860 D CCodecBuffers:   int32_t color-range = 2
+10-07 14:38:40.670  4671  6860 D CCodecBuffers:   int32_t color-transfer = 3
+10-07 14:38:40.670  4671  6860 D CCodecBuffers:   int32_t android._dataspace = 260
+10-07 14:38:40.670  4671  6860 D CCodecBuffers:   int32_t width = 524
+10-07 14:38:40.670  4671  6860 D CCodecBuffers:   int32_t rotation-degrees = 0
+10-07 14:38:40.670  4671  6860 D CCodecBuffers:   int32_t sar-height = 1
+10-07 14:38:40.670  4671  6860 D CCodecBuffers:   int32_t max-width = 1280
+10-07 14:38:40.670  4671  6860 D CCodecBuffers:   int32_t max-height = 1080
+10-07 14:38:40.670  4671  6860 D CCodecBuffers:   int32_t priority = 0
+10-07 14:38:40.670  4671  6860 D CCodecBuffers:   string mime = "video/raw"
+10-07 14:38:40.670  4671  6860 D CCodecBuffers:   Rect crop(0, 0, 523, 359)
+10-07 14:38:40.670  4671  6860 D CCodecBuffers:   Buffer hdr-static-info = {
+10-07 14:38:40.670  4671  6860 D CCodecBuffers:     00000000:  00 00 00 00 00 00 00 00  00 00 00 00 00 00 00 00  ................
+10-07 14:38:40.670  4671  6860 D CCodecBuffers:     00000010:  00 00 00 00 00 00 00 00  00                       .........
+10-07 14:38:40.670  4671  6860 D CCodecBuffers:   }
+10-07 14:38:40.670  4671  6860 D CCodecBuffers:   int32_t frame-rate = 30
+10-07 14:38:40.670  4671  6860 D CCodecBuffers:   int32_t height = 360
+10-07 14:38:40.670  4671  6860 D CCodecBuffers:   int32_t color-format = 2130708361
+10-07 14:38:40.670  4671  6860 D CCodecBuffers: }
+10-07 14:38:40.701   905   655 D APM_AudioPolicyManager: listAudioPorts mAvailableInputDevices 0x80000004, 0x80000008, 0x80000040, 0x80000080, 0x80000100, 0x80002000, 0x90000000
+10-07 14:38:40.706   905   655 D APM_AudioPolicyManager: listAudioPorts mAvailableInputDevices 0x80000004, 0x80000008, 0x80000040, 0x80000080, 0x80000100, 0x80002000, 0x90000000
+10-07 14:38:41.691   918  1119 D SurfaceFlinger: calculateTimeoutTime, triggerInterval = 1 sec + 193712385 nsec
+10-07 14:38:42.590  4671  6861 D CCodecBufferChannel: elapsed: mInputMetEos 0, hasPendingOutputsInClient 1, n 33
+10-07 14:38:42.788  8410 11111 E ogle.android.gm: hiddenapi: Accessing hidden method Lcom/android/org/conscrypt/ConscryptEngineSocket;->setHandshakeTimeout(I)V (runtime_flags=CorePlatformApi, domain=core-platform, api=blocked,core-platform-api) from Lmej; (domain=app, TargetSdkVersion=37) using reflection: denied
+10-07 14:38:42.788  8410 11111 E ogle.android.gm: hiddenapi: Accessing hidden method Lcom/android/org/conscrypt/OpenSSLSocketImpl;->setHandshakeTimeout(I)V (runtime_flags=CorePlatformApi, domain=core-platform, api=max-target-r,core-platform-api) from Lmej; (domain=app, TargetSdkVersion=37) using reflection: denied
+10-07 14:38:42.788  8410 11111 E ogle.android.gm: hiddenapi: Accessing hidden method Lcom/android/org/conscrypt/AbstractConscryptSocket;->setHandshakeTimeout(I)V (runtime_flags=0, domain=core-platform, api=max-target-r) from Lmej; (domain=app, TargetSdkVersion=37) using reflection: denied
+10-07 14:38:42.789  8410 11111 W pwx     : [Gmail] SSLSocketFactoryWrapper: unable to set handshake timeout
+10-07 14:38:42.789  8410 11111 W pwx     : java.lang.NoSuchMethodException: com.android.org.conscrypt.Java8EngineSocket.setHandshakeTimeout [int]
+10-07 14:38:42.884   918  1119 D SurfaceFlinger: calculateTimeoutTime, triggerInterval = 1 sec + 194223308 nsec
+10-07 14:38:43.639  1628  2241 D Hiber/JobExtImpl: un_job=JobStatus{9ce57f4 #u0a276/1073741829 com.microsoft.skydrive/.jobs.LocalNotificationDailyJob u=0 s=10276 TIME=+21h19m36s828ms:none PERSISTED satisfied:0xb400000 unsatisfied:0x80000000}for uid=10276
+10-07 14:38:44.079   918  1119 D SurfaceFlinger: calculateTimeoutTime, triggerInterval = 1 sec + 197030769 nsec
+10-07 14:38:44.094 12654 13380 W Kolun.TPMSConfigProxy:  getRemoteConfig timeout
+10-07 14:38:44.202 12654 13380 W Kolun.TPMSConfigProxy:  getRemoteConfig timeout
+10-07 14:38:44.208 12654 13380 W Kolun.TPMSConfigProxy:  getRemoteConfig timeout
+10-07 14:38:45.276   918  1119 D SurfaceFlinger: calculateTimeoutTime, triggerInterval = 1 sec + 199684000 nsec
+10-07 14:38:45.908  4671  6861 D CCodecBufferChannel: elapsed: mInputMetEos 0, hasPendingOutputsInClient 1, n 33
+10-07 14:38:46.476   918  1119 D SurfaceFlinger: calculateTimeoutTime, triggerInterval = 1 sec + 193933461 nsec
+10-07 14:38:47.670   918  1119 D SurfaceFlinger: calculateTimeoutTime, triggerInterval = 1 sec + 194031154 nsec
+10-07 14:38:47.800 11129 11294 W ApiInvoke1.5.150: OxygenBusUtils: isAppServiceProcessStarted, isMainLooper:false, timeout:1000, started:true, cost:7ms
+10-07 14:38:47.803 11129 11297 W ApiInvoke1.5.150: OxygenBusUtils: isAppServiceProcessStarted, isMainLooper:false, timeout:1000, started:true, cost:0ms
+10-07 14:38:47.809 11129 11300 W ApiInvoke1.5.150: OxygenBusUtils: isAppServiceProcessStarted, isMainLooper:false, timeout:1000, started:true, cost:0ms
+10-07 14:38:47.869 11129 11129 D phonemaster_log: HiManager_DangerAppsManager: Σ║«σ▒Åµë½µÅÅ-reject : lastScanTime=2026-10-07 02:31:24, interval=1440, start check cache:process_active
+10-07 14:38:47.996  1628  2241 D Hiber/JobExtImpl: un_job=JobStatus{c3e15e3 #u0a243/489421 com.whatsapp.w4b/androidx.work.impl.background.systemjob.SystemJobService u=0 s=10243 TIME=+43m10s452ms:none satisfied:0xb400000 unsatisfied:0x80000000}for uid=10243
+10-07 14:38:47.997  1628  2241 D Hiber/JobExtImpl: un_job=JobStatus{3998f91 #u0a243/489107 com.whatsapp.w4b/androidx.work.impl.background.systemjob.SystemJobService u=0 s=10243 TIME=+9h43m56s283ms:none NET satisfied:0x1b400000 unsatisfied:0x80000000}for uid=10243
+10-07 14:38:47.997  1628  2241 D Hiber/JobExtImpl: un_job=JobStatus{2fcbe6c #u0a243/489498 com.whatsapp.w4b/androidx.work.impl.background.systemjob.SystemJobService u=0 s=10243 TIME=+11h45m10s986ms:none satisfied:0xb400000 unsatisfied:0x80000000}for uid=10243
+10-07 14:38:47.997  1628  2241 D Hiber/JobExtImpl: un_job=JobStatus{7d173a #u0a243/489504 com.whatsapp.w4b/androidx.work.impl.background.systemjob.SystemJobService u=0 s=10243 TIME=+14s613ms:none NET satisfied:0x1b400000 unsatisfied:0x80000000}for uid=10243
+10-07 14:38:47.998  1628  2241 D Hiber/JobExtImpl: un_job=JobStatus{2a76ce #u0a243/489271 com.whatsapp.w4b/androidx.work.impl.background.systemjob.SystemJobService u=0 s=10243 TIME=+18h5m58s864ms:none satisfied:0xb400000 unsatisfied:0x80000000}for uid=10243
+10-07 14:38:48.662 11129 11294 W ApiInvoke1.5.150: OxygenBusUtils: isAppServiceProcessStarted, isMainLooper:false, timeout:1000, started:true, cost:6ms
+10-07 14:38:48.864   918  1119 D SurfaceFlinger: calculateTimeoutTime, triggerInterval = 1 sec + 194042461 nsec
+10-07 14:38:49.153  8410 11111 E ogle.android.gm: hiddenapi: Accessing hidden method Lcom/android/org/conscrypt/ConscryptEngineSocket;->setHandshakeTimeout(I)V (runtime_flags=CorePlatformApi, domain=core-platform, api=blocked,core-platform-api) from Lmej; (domain=app, TargetSdkVersion=37) using reflection: denied
+10-07 14:38:49.153  8410 11111 E ogle.android.gm: hiddenapi: Accessing hidden method Lcom/android/org/conscrypt/OpenSSLSocketImpl;->setHandshakeTimeout(I)V (runtime_flags=CorePlatformApi, domain=core-platform, api=max-target-r,core-platform-api) from Lmej; (domain=app, TargetSdkVersion=37) using reflection: denied
+10-07 14:38:49.153  8410 11111 E ogle.android.gm: hiddenapi: Accessing hidden method Lcom/android/org/conscrypt/AbstractConscryptSocket;->setHandshakeTimeout(I)V (runtime_flags=0, domain=core-platform, api=max-target-r) from Lmej; (domain=app, TargetSdkVersion=37) using reflection: denied
+10-07 14:38:49.158  8410 11111 W pwx     : [Gmail] SSLSocketFactoryWrapper: unable to set handshake timeout
+10-07 14:38:49.158  8410 11111 W pwx     : java.lang.NoSuchMethodException: com.android.org.conscrypt.Java8EngineSocket.setHandshakeTimeout [int]
+10-07 14:38:49.222  4671  6861 D CCodecBufferChannel: elapsed: mInputMetEos 0, hasPendingOutputsInClient 1, n 33
+10-07 14:38:50.059   918  1119 D SurfaceFlinger: calculateTimeoutTime, triggerInterval = 1 sec + 194585231 nsec
+10-07 14:38:51.253   918  1119 D SurfaceFlinger: calculateTimeoutTime, triggerInterval = 1 sec + 193807616 nsec
+10-07 14:38:52.447   918  1119 D SurfaceFlinger: calculateTimeoutTime, triggerInterval = 1 sec + 194070462 nsec
+10-07 14:38:52.587  4671  6861 D CCodecBufferChannel: elapsed: mInputMetEos 0, hasPendingOutputsInClient 1, n 33
+10-07 14:38:53.642   918  1119 D SurfaceFlinger: calculateTimeoutTime, triggerInterval = 1 sec + 193956308 nsec

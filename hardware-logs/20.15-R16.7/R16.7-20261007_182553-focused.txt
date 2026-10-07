@@ -1,0 +1,12 @@
+﻿10-07 18:28:00.989  2209  2653 I bt_stack: [INFO:gatt_api.cc(711)] GATTC_Discover conn_id=0x0006, disc_type=1, s_handle=0x0001, e_handle=0xffff
+10-07 18:28:08.499  2209  2653 I bt_stack: [INFO:gatt_api.cc(711)] GATTC_Discover conn_id=0x0006, disc_type=1, s_handle=0x0001, e_handle=0xffff
+10-07 18:29:20.280  7411  7411 D AtomRemoteSession: TCS20.15R16.6 CODEC UI SYNC TAP draft=2/0
+10-07 18:29:20.283  7411  7411 D AtomRemoteGatt: TCS20.15R16.7 CODEC QUEUE label=Codec supported profiles cmd=0x13D packetId=24 m_isLocal=0 payloadLen=0 proto= body=1800003D01
+10-07 18:29:20.284  7411  7411 D AtomRemoteGatt: TCS18.8.1 PLINK BUFFER label=Codec supported profiles cmd=317 packetId=24 m_isLocal=0 atom=1800003D01 packetIdRule=official-one-shot-zero
+10-07 18:29:20.284  7411  7411 D AtomRemoteSession: TCS20.15R16.6 CODEC UI QUEUE label=Codec Sync attempt=1 queued=true
+10-07 18:29:20.529  7411  7423 D AtomRemoteGatt: TCS18.9.1 TRANSPORT DELIVERED label=Codec supported profiles cmd=317; PacketLink transport complete; recorder action unconfirmed
+10-07 18:29:20.887  7411  7411 D AtomRemoteSession: TCS20.15R16.6 CODEC UI SYNC TAP draft=2/0
+10-07 18:29:20.889  7411  7411 D AtomRemoteGatt: TCS20.15R16.7 CODEC QUEUE label=Codec supported profiles cmd=0x13D packetId=25 m_isLocal=0 payloadLen=0 proto= body=1900003D01
+10-07 18:29:20.890  7411  7411 D AtomRemoteGatt: TCS18.8.1 PLINK BUFFER label=Codec supported profiles cmd=317 packetId=25 m_isLocal=0 atom=1900003D01 packetIdRule=official-one-shot-zero
+10-07 18:29:20.890  7411  7411 D AtomRemoteSession: TCS20.15R16.6 CODEC UI QUEUE label=Codec Sync attempt=1 queued=true
+10-07 18:29:21.353  7411  7740 D AtomRemoteGatt: TCS18.9.1 TRANSPORT DELIVERED label=Codec supported profiles cmd=317; PacketLink transport complete; recorder action unconfirmed

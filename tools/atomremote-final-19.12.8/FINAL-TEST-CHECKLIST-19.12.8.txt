@@ -1,0 +1,52 @@
+ATOMREMOTE 19.12.8 FINAL BASELINE TEST
+
+Goal: test only the feature currently under test and keep one filtered log per feature.
+Do not mix feature presses between stages.
+
+01 TRANSPORT
+Record Start -> Record Stop -> Play -> Pause
+
+02 SAFE AREA
+Action -> Title -> Off
+Write physical result: one frame / double frame / off / unchanged
+
+03 GRID
+ON -> OFF
+Write physical result.
+
+04 ZOOM
+1:1 -> 2:1 -> Off
+Write physical result and any viewport waiting message.
+
+05 CODEC
+ProRes 422 APPLY
+If physically unchanged and recorder is NOT recording: APPLY + RESTART
+Write physical recorder codec before and after.
+
+06 MONITOR MODES
+Native -> Rec.709 -> HLG -> PQ -> LUT
+These were previously confirmed working and are regression only.
+
+07 INPUT TAB
+Open, wait, REFRESH SIGNAL once, wait.
+Confirm whether Source/Codec/Camera/Gamma/Gamut/Output show recorder data.
+
+08 AUDIO TAB
+Open, wait, CH1 then CH2.
+Record which values remain placeholders.
+
+09 MEDIA TAB
+Open and wait. Never run format/secure format.
+Record which values remain placeholders.
+
+10 OUTPUT TAB
+Open, wait, REFRESH OUTPUT once, wait.
+Confirm Signal/HDR/Gamut state.
+
+11 SETTINGS TAB
+Open and wait.
+Confirm identity, BLE/session status and note any date/time/timecode/firmware placeholders.
+
+12 NAV/CRASH
+Remote -> Input -> Audio -> Media -> Output -> Settings -> Remote.
+If crash occurs, stop immediately so AndroidRuntime is preserved in this stage log.

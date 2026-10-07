@@ -1,0 +1,195 @@
+# =========================================================
+# AtomRemote / AtomRemoteBackend root .gitignore
+# =========================================================
+
+# ---------------------------------------------------------
+# Archives / packaged backups
+# ---------------------------------------------------------
+*.zip
+*.rar
+*.7z
+*.tar
+*.tar.gz
+*.tgz
+
+# ---------------------------------------------------------
+# Project backups / generated test output
+# ---------------------------------------------------------
+agent7-backups/
+phase-backups/
+local-test-logs/
+final-test/
+
+# Optional local backup folders
+*_backup/
+*-backup/
+backup/
+backups/
+
+# ---------------------------------------------------------
+# Node / Backend
+# ---------------------------------------------------------
+backend/node_modules/
+backend/dist/
+backend/build/
+backend/coverage/
+backend/.cache/
+backend/.vercel/
+
+backend/.env
+backend/.env.*
+!backend/.env.example
+
+# ---------------------------------------------------------
+# Cloud Relay / Vercel
+# ---------------------------------------------------------
+cloud-relay/node_modules/
+cloud-relay/dist/
+cloud-relay/build/
+cloud-relay/coverage/
+cloud-relay/.cache/
+cloud-relay/.vercel/
+
+cloud-relay/.env
+cloud-relay/.env.*
+!cloud-relay/.env.example
+
+# ---------------------------------------------------------
+# Generic Node folders
+# ---------------------------------------------------------
+node_modules/
+dist/
+coverage/
+.nyc_output/
+.cache/
+
+# ---------------------------------------------------------
+# Mobile / Expo
+# ---------------------------------------------------------
+mobile/node_modules/
+mobile/.expo/
+mobile/dist/
+mobile/web-build/
+
+mobile/.env
+mobile/.env.*
+!mobile/.env.example
+
+# Expo generated native folders if created locally
+mobile/android/
+mobile/ios/
+
+# ---------------------------------------------------------
+# Android native
+# ---------------------------------------------------------
+native-android/.gradle/
+native-android/local.properties
+native-android/**/build/
+
+*.apk
+*.aab
+
+# Android generated/cache
+.gradle/
+**/.gradle/
+**/build/
+
+# ---------------------------------------------------------
+# Signing / credentials / certificates
+# ---------------------------------------------------------
+*.jks
+*.keystore
+*.p12
+*.pfx
+*.mobileprovision
+*.cer
+*.crt
+*.pem
+*.key
+
+# ---------------------------------------------------------
+# Environment files - global protection
+# ---------------------------------------------------------
+.env
+.env.*
+!*.env.example
+!**/.env.example
+
+# ---------------------------------------------------------
+# Vercel local configuration
+# ---------------------------------------------------------
+.vercel/
+**/.vercel/
+
+# ---------------------------------------------------------
+# IDE / editors
+# ---------------------------------------------------------
+.idea/
+.vscode/
+
+*.iml
+*.ipr
+*.iws
+
+# ---------------------------------------------------------
+# OS generated files
+# ---------------------------------------------------------
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ---------------------------------------------------------
+# Logs / temp
+# ---------------------------------------------------------
+*.log
+*.tmp
+*.temp
+*.bak
+*.swp
+*.swo
+
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# ---------------------------------------------------------
+# TypeScript / tooling cache
+# ---------------------------------------------------------
+*.tsbuildinfo
+.eslintcache
+
+# ---------------------------------------------------------
+# Java / Kotlin generated
+# ---------------------------------------------------------
+*.class
+*.dex
+*.hprof
+
+# ---------------------------------------------------------
+# Python if any helper tools are used
+# ---------------------------------------------------------
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# ---------------------------------------------------------
+# Windows / PowerShell temporary files
+# ---------------------------------------------------------
+*.stackdump
+*.ps1xml.tmp
+
+# ---------------------------------------------------------
+# Local secrets / credentials
+# ---------------------------------------------------------
+credentials.json
+service-account*.json
+secrets.json
+secret.json
+
+# ---------------------------------------------------------
+# Misc generated files
+# ---------------------------------------------------------
+*.orig
+*.rej

@@ -1,0 +1,98 @@
+ATOMREMOTE 19.12 FINAL HARDWARE TEST CHECKLIST
+
+RULES
+- Test exactly one feature at a time.
+- Observe the physical Shogun Ultra AG2 screen after every action.
+- Do not classify transport delivery as hardware success.
+- If the app crashes, stop that item, reopen the app, and continue only after noting where it crashed.
+- Keep the master capture running for the entire pass.
+
+01 PAIRING / TRUSTED RECONNECT
+[ ] Existing trusted AG2 auto-opens Remote without repeating pairing.
+[ ] If fresh pairing is required, official TCS flow completes normally.
+
+02 CORE TRANSPORT
+[ ] Record Start physically starts recording.
+[ ] Record Stop physically stops recording.
+[ ] Play physically starts playback.
+[ ] Pause physically pauses playback.
+
+03 MONITOR MODES - LOCKED REGRESSION
+[ ] Native
+[ ] Rec.709
+[ ] HLG
+[ ] PQ
+[ ] LUT
+
+04 SAFE AREA
+[ ] Action
+[ ] Title / double-frame behavior
+[ ] Off completely removes Safe Area
+Record physical result after every press.
+
+05 9-GRID
+[ ] On shows 3x3 grid
+[ ] Off removes grid
+
+06 FRAME GUIDE
+[ ] Existing Frame Guide behavior still works
+
+07 ZOOM
+[ ] 1:1
+[ ] 2:1
+[ ] Off
+[ ] Viewport state appears if recorder provides it
+[ ] Pan only if viewport data is valid
+
+08 RECORD CODEC
+Test while NOT recording.
+[ ] ProRes supported profile
+[ ] DNxHD supported profile
+[ ] H.265 supported profile
+[ ] ProRes RAW supported profile if licensed/available
+For each: note physical recorder codec before and after.
+[ ] Recorder readback confirms actual state, if supported by this firmware path
+
+09 INPUT
+[ ] Input screen opens
+[ ] Current signal/format appears if recorder reports it
+[ ] HDMI/SDI source information
+[ ] Gamma/Gamut information
+[ ] Refresh does not crash or disconnect core Remote controls
+
+10 AUDIO
+[ ] Audio screen opens
+[ ] Recorder-backed state appears where implemented
+[ ] UI-only placeholders remain clearly marked, not shown as confirmed
+
+11 MEDIA
+[ ] Media screen opens
+[ ] Capacity/free/remaining data appears if recorder reports it
+[ ] No destructive format action is enabled without verified transport
+
+12 OUTPUT
+[ ] Output screen opens
+[ ] HDMI/SDI/output state appears if recorder reports it
+[ ] HDR/LUT/downscale values are not falsely shown as confirmed
+
+13 SETTINGS / DEVICE
+[ ] Recorder identity/name
+[ ] Model code
+[ ] Firmware/AirGlu data if available
+[ ] Date/Time/Timecode state if available
+[ ] No unverified destructive/system setter is active
+
+14 NAVIGATION / SESSION
+[ ] Input -> Back returns Remote
+[ ] Audio -> Back returns Remote
+[ ] Media -> Back returns Remote
+[ ] Output -> Back returns Remote
+[ ] Settings -> Back returns Remote
+[ ] Remote Back shows disconnect confirmation
+[ ] Cancel keeps session
+[ ] Explicit Disconnect returns Home and clears app-side session as designed
+
+15 CRASH / STABILITY
+[ ] No app crash during complete pass
+[ ] If crash occurs, exact preceding action is written in results template
+[ ] FULL-LOGCAT contains AndroidRuntime/FATAL EXCEPTION stack

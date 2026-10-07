@@ -1,0 +1,1882 @@
+package com.atomosremote.nativeapp.ui
+
+import android.bluetooth.BluetoothAdapter
+import android.bluetooth.BluetoothDevice
+import android.content.Intent
+import android.content.pm.PackageManager
+import android.provider.Settings
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.Image
+import androidx.compose.foundation.background
+import androidx.compose.foundation.border
+import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.verticalScroll
+import androidx.compose.material3.*
+import androidx.compose.runtime.*
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.res.painterResource
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
+import androidx.core.content.ContextCompat
+import androidx.lifecycle.viewmodel.compose.viewModel
+import com.atomosremote.nativeapp.R
+import com.atomosremote.nativeapp.advanced.AdvancedControlCatalog
+import com.atomosremote.nativeapp.airglu.AirGluRole
+import com.atomosremote.nativeapp.atomos.AtomosCapability
+import com.atomosremote.nativeapp.atomos.AtomosProfiles
+import com.atomosremote.nativeapp.atomos.CapabilityStatus
+import com.atomosremote.nativeapp.atomos.TelemetryParser
+import com.atomosremote.nativeapp.ble.BleAdvertisement
+import com.atomosremote.nativeapp.ble.BlePermission
+import com.atomosremote.nativeapp.network.LanDeviceCandidate
+import com.atomosremote.nativeapp.network.NetworkServiceCandidate
+import com.atomosremote.nativeapp.ndi.NdiPreviewState
+import com.atomosremote.nativeapp.ndi.NdiSourceRegistry
+import com.atomosremote.nativeapp.ui.theme.AtomosCyan
+import com.atomosremote.nativeapp.ui.theme.AtomosRed
+import com.atomosremote.nativeapp.ui.theme.AtomosSurface2
+import com.atomosremote.nativeapp.viewmodel.AtomosViewModel
+
+@Composable
+fun AtomosApp(vm: AtomosViewModel = viewModel()) {
+    val screen by vm.screen.collectAsState()
+    Surface(Modifier.fillMaxSize()) {
+        when (screen) {
+            AtomosViewModel.Screen.HOME -> HomeScreen(vm)
+            AtomosViewModel.Screen.CONNECT -> ConnectScreen(vm)
+            AtomosViewModel.Screen.PAIR -> PairScreen(vm)
+            AtomosViewModel.Screen.REMOTE -> RemoteScreen(vm)
+            AtomosViewModel.Screen.GATT -> GattScreen(vm)
+            AtomosViewModel.Screen.PROTOCOL -> ProtocolScreen(vm)
+            AtomosViewModel.Screen.COMPATIBILITY -> CompatibilityScreen(vm)
+            AtomosViewModel.Screen.NETWORK -> NetworkScreen(vm)
+            AtomosViewModel.Screen.MULTI -> MultiDeviceScreen(vm)
+            AtomosViewModel.Screen.AIRGLU -> AirGluScreen(vm)
+            AtomosViewModel.Screen.NDI -> NdiPreviewScreen(vm)
+            AtomosViewModel.Screen.ADVANCED -> AdvancedControlsScreen(vm)
+            AtomosViewModel.Screen.PRESETS -> PresetsScreen(vm)
+            AtomosViewModel.Screen.CAPTURE -> CaptureScreen(vm)
+            AtomosViewModel.Screen.QA -> FinalQaScreen(vm)
+        }
+    }
+}
+
+@Composable
+private fun AppHeader(title: String, subtitle: String? = null, onBack: (() -> Unit)? = null) {
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .background(Color(0xFF0A0D0F))
+            .statusBarsPadding()
+            .heightIn(min = 64.dp)
+            .padding(horizontal = 16.dp, vertical = 10.dp),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        if (onBack != null) {
+            TextButton(onClick = onBack, contentPadding = PaddingValues(horizontal = 4.dp, vertical = 0.dp)) {
+                Text("‹", fontSize = 32.sp, color = AtomosCyan)
+            }
+            Spacer(Modifier.width(4.dp))
+        }
+        Box(Modifier.size(8.dp).background(AtomosCyan, CircleShape))
+        Spacer(Modifier.width(9.dp))
+        Column(Modifier.weight(1f)) {
+            Text(title, fontWeight = FontWeight.ExtraBold, fontSize = 19.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
+            if (subtitle != null) Text(subtitle, color = Color(0xFF868D90), fontSize = 11.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
+        }
+        Text("ATOMOS", color = AtomosCyan, fontWeight = FontWeight.Black, letterSpacing = 1.4.sp, fontSize = 14.sp)
+    }
+}
+
+@Composable
+private fun HomeScreen(vm: AtomosViewModel) {
+    val saved by vm.saved.collectAsState()
+    val savedAll by vm.savedAll.collectAsState()
+    val networkStatus by vm.networkStatus.collectAsState()
+    val lanDevices by vm.lanDevices.collectAsState()
+
+    DisposableEffect(Unit) {
+        vm.startNetworkDiscovery()
+        onDispose { vm.stopNetworkDiscovery() }
+    }
+
+    Box(Modifier.fillMaxSize().background(MaterialTheme.colorScheme.background)) {
+        Column(
+            Modifier.fillMaxSize().padding(24.dp).verticalScroll(rememberScrollState()),
+            horizontalAlignment = Alignment.CenterHorizontally,
+            verticalArrangement = Arrangement.Center
+        ) {
+            Image(painterResource(R.drawable.atomos_logo), contentDescription = "ATOMOS", modifier = Modifier.size(112.dp))
+            Spacer(Modifier.height(14.dp))
+            Text("ATOMOS REMOTE", fontSize = 28.sp, fontWeight = FontWeight.Black)
+            Text("Native Android Control Studio", color = Color.Gray)
+            Spacer(Modifier.height(28.dp))
+            Button(
+                onClick = { vm.go(AtomosViewModel.Screen.CONNECT) },
+                modifier = Modifier.fillMaxWidth().height(56.dp)
+            ) { Text("CONNECT ATOMOS", fontWeight = FontWeight.Bold) }
+
+            if (saved != null) {
+                Spacer(Modifier.height(10.dp))
+                OutlinedButton(
+                    onClick = { vm.reconnectSaved() },
+                    modifier = Modifier.fillMaxWidth().height(50.dp)
+                ) { Text("RECONNECT ${saved!!.name.uppercase()}") }
+            }
+
+            Spacer(Modifier.height(12.dp))
+            Card(Modifier.fillMaxWidth(), colors = CardDefaults.cardColors(containerColor = AtomosSurface2)) {
+                Column(Modifier.padding(12.dp)) {
+                    Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                        Column(Modifier.weight(1f)) {
+                            Text("SAME WI-FI / LAN", color = AtomosCyan, fontWeight = FontWeight.Bold, fontSize = 12.sp)
+                            Text(
+                                "${networkStatus.transport} • ${if (networkStatus.connected) "CONNECTED" else "OFFLINE"} • ${lanDevices.size} device(s)",
+                                color = Color.LightGray,
+                                fontSize = 11.sp
+                            )
+                            networkStatus.localAddresses.firstOrNull { it.contains('.') }?.let {
+                                Text("Phone: $it", color = Color.Gray, fontSize = 10.sp)
+                            }
+                        }
+                        TextButton(onClick = { vm.stopNetworkDiscovery(); vm.startNetworkDiscovery() }) { Text("SCAN") }
+                    }
+                    if (lanDevices.isEmpty()) {
+                        Text("Searching mDNS, SSDP and the current local subnet...", color = Color.Gray, fontSize = 10.sp)
+                    } else {
+                        lanDevices.take(4).forEach { device ->
+                            Spacer(Modifier.height(6.dp))
+                            Row(Modifier.fillMaxWidth()) {
+                                Column(Modifier.weight(1f)) {
+                                    Text(
+                                        if (device.likelyAtomos) "ATOMOS CANDIDATE • ${device.displayName}" else device.displayName,
+                                        color = if (device.likelyAtomos) AtomosCyan else Color.White,
+                                        fontSize = 11.sp,
+                                        fontWeight = if (device.likelyAtomos) FontWeight.Bold else FontWeight.Normal,
+                                        maxLines = 1,
+                                        overflow = TextOverflow.Ellipsis
+                                    )
+                                    Text(
+                                        "${device.host} • ${device.sources.joinToString()}${if (device.openPorts.isNotEmpty()) " • ports ${device.openPorts.sorted().joinToString()}" else ""}",
+                                        color = Color.Gray,
+                                        fontSize = 9.sp,
+                                        maxLines = 1,
+                                        overflow = TextOverflow.Ellipsis
+                                    )
+                                }
+                                if (device.likelyAtomos) {
+                                    TextButton(onClick = { vm.startWifiAssistedRemote(device) }) { Text("PAIR REMOTE") }
+                                }
+                            }
+                        }
+                        if (lanDevices.size > 4) {
+                            TextButton(onClick = { vm.go(AtomosViewModel.Screen.NETWORK) }) { Text("VIEW ALL ${lanDevices.size} DEVICES") }
+                        }
+                    }
+                }
+            }
+
+            Spacer(Modifier.height(12.dp))
+            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                OutlinedButton(onClick = { vm.go(AtomosViewModel.Screen.NETWORK) }, modifier = Modifier.weight(1f)) { Text("NETWORK (${lanDevices.size})") }
+                OutlinedButton(onClick = { vm.go(AtomosViewModel.Screen.MULTI) }, modifier = Modifier.weight(1f)) { Text("MULTI (${savedAll.size})") }
+            }
+            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                OutlinedButton(onClick = { vm.go(AtomosViewModel.Screen.COMPATIBILITY) }, modifier = Modifier.weight(1f)) { Text("DEVICES") }
+                OutlinedButton(onClick = { vm.go(AtomosViewModel.Screen.AIRGLU) }, modifier = Modifier.weight(1f)) { Text("AIRGLU") }
+            }
+            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                OutlinedButton(onClick = { vm.go(AtomosViewModel.Screen.NDI) }, modifier = Modifier.weight(1f)) { Text("NDI") }
+                OutlinedButton(onClick = { vm.go(AtomosViewModel.Screen.PRESETS) }, modifier = Modifier.weight(1f)) { Text("PRESETS") }
+            }
+            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                OutlinedButton(onClick = { vm.go(AtomosViewModel.Screen.CAPTURE) }, modifier = Modifier.weight(1f)) { Text("CAPTURE") }
+                OutlinedButton(onClick = { vm.go(AtomosViewModel.Screen.QA) }, modifier = Modifier.weight(1f)) { Text("FINAL QA") }
+            }
+            Text(
+                "Same Wi-Fi discovery now feeds directly into Bluetooth remote pairing. The app can identify the Shogun by hostname/IP, then pair the actual AtomRemote/AirGlu BLE endpoint. Wi-Fi remains discovery/network transport; recorder-control commands unlock only after a validated BLE/S1C control channel is confirmed.",
+                color = Color.Gray,
+                fontSize = 11.sp,
+                modifier = Modifier.padding(top = 14.dp)
+            )
+        }
+    }
+}
+
+private fun permissionsGranted(context: android.content.Context): Boolean = BlePermission.runtimePermissions().all {
+    ContextCompat.checkSelfPermission(context, it) == PackageManager.PERMISSION_GRANTED
+}
+
+@Composable
+private fun ConnectScreen(vm: AtomosViewModel) {
+    val context = LocalContext.current
+    val devices by vm.devices.collectAsState()
+    val scanState by vm.scanState.collectAsState()
+    val wifiAssistTarget by vm.wifiAssistTarget.collectAsState()
+    var permissionDenied by remember { mutableStateOf(false) }
+
+    val enableBt = rememberLauncherForActivityResult(ActivityResultContracts.StartActivityForResult()) {
+        if (vm.bluetoothEnabled()) vm.startScan()
+    }
+    val permissionLauncher = rememberLauncherForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) { result ->
+        val ok = BlePermission.runtimePermissions().all { result[it] == true || ContextCompat.checkSelfPermission(context, it) == PackageManager.PERMISSION_GRANTED }
+        permissionDenied = !ok
+        if (ok) {
+            if (vm.bluetoothEnabled()) vm.startScan() else enableBt.launch(Intent(BluetoothAdapter.ACTION_REQUEST_ENABLE))
+        }
+    }
+
+    fun begin() {
+        permissionDenied = false
+        if (!permissionsGranted(context)) permissionLauncher.launch(BlePermission.runtimePermissions())
+        else if (!vm.bluetoothEnabled()) enableBt.launch(Intent(BluetoothAdapter.ACTION_REQUEST_ENABLE))
+        else vm.startScan()
+    }
+
+    LaunchedEffect(Unit) { begin() }
+    DisposableEffect(Unit) { onDispose { vm.stopScan() } }
+
+    Column(Modifier.fillMaxSize().background(Color(0xFF0A0C0D))) {
+        AppHeader(
+            "Find your device",
+            "Shogun Ultra · AirGlu BT pairing",
+            onBack = { vm.stopScan(); vm.stopPairingPresence(); vm.clearWifiAssist(); vm.go(AtomosViewModel.Screen.HOME) }
+        )
+
+        LazyColumn(
+            Modifier.fillMaxSize(),
+            contentPadding = PaddingValues(horizontal = 18.dp, vertical = 16.dp),
+            verticalArrangement = Arrangement.spacedBy(12.dp)
+        ) {
+            item {
+                Column {
+                    Text("Connect Shogun Ultra", fontSize = 22.sp, fontWeight = FontWeight.ExtraBold)
+                    Text(
+                        "Open Sync Config → Bluetooth / AirGlu BT → Pair on the recorder. Keep that screen open while Android scans, then connects directly to AG2 as a BLE central/GATT client.",
+                        color = Color(0xFF868D90),
+                        fontSize = 12.sp,
+                        lineHeight = 18.sp
+                    )
+                }
+            }
+
+            wifiAssistTarget?.let { target ->
+                item {
+                    Card(colors = CardDefaults.cardColors(containerColor = Color(0xFF151A1C)), shape = RoundedCornerShape(14.dp)) {
+                        Column(Modifier.padding(14.dp)) {
+                            Text("SAME WI-FI RECORDER", color = AtomosCyan, fontWeight = FontWeight.Bold, fontSize = 11.sp)
+                            Text(target.displayName, fontWeight = FontWeight.Bold, modifier = Modifier.padding(top = 3.dp))
+                            Text(target.host, color = Color(0xFF868D90), fontSize = 11.sp)
+                        }
+                    }
+                }
+            }
+
+            item {
+                Card(colors = CardDefaults.cardColors(containerColor = Color(0xFF151A1C)), shape = RoundedCornerShape(14.dp)) {
+                    Row(Modifier.fillMaxWidth().padding(14.dp), verticalAlignment = Alignment.CenterVertically) {
+                        Box(Modifier.size(9.dp).background(AtomosCyan, CircleShape))
+                        Spacer(Modifier.width(10.dp))
+                        Column(Modifier.weight(1f)) {
+                            Text("PAIRING ARCHITECTURE", color = Color(0xFF868D90), fontSize = 10.sp, fontWeight = FontWeight.Bold)
+                            Text("OFFICIAL TCS · PAIRING + REMOTE", fontWeight = FontWeight.Bold, color = AtomosCyan)
+                        }
+                        Text("18.3", color = Color(0xFF575D5F), fontSize = 11.sp)
+                    }
+                }
+            }
+
+            item {
+                Column(horizontalAlignment = Alignment.CenterHorizontally, modifier = Modifier.fillMaxWidth()) {
+                    Box(Modifier.size(118.dp).border(1.dp, Color(0xFF2B3032), CircleShape), contentAlignment = Alignment.Center) {
+                        Box(Modifier.size(80.dp).border(1.dp, Color(0xFF2B3032), CircleShape))
+                        Box(Modifier.size(42.dp).border(1.dp, Color(0xFF2B3032), CircleShape))
+                        if (scanState == "scanning") CircularProgressIndicator(Modifier.size(112.dp), strokeWidth = 2.dp, color = AtomosCyan)
+                        Box(Modifier.size(10.dp).background(AtomosCyan, CircleShape))
+                    }
+                    Spacer(Modifier.height(12.dp))
+                    Text(
+                        if (scanState == "scanning") "Scanning for AirGlu BT devices…" else "Scan state: $scanState",
+                        color = Color(0xFF868D90),
+                        fontSize = 12.sp
+                    )
+                    TextButton(onClick = { begin() }) { Text("SCAN AGAIN") }
+                }
+            }
+
+            if (permissionDenied) {
+                item { Text("Nearby Bluetooth permission is required for BLE discovery.", color = AtomosRed, fontSize = 12.sp) }
+            }
+
+            val visibleDevices = devices.filter { isAirGluSyncAdvertisement(it) && it.connectable != false }
+            if (visibleDevices.isEmpty()) {
+                item {
+                    Card(colors = CardDefaults.cardColors(containerColor = Color(0xFF151A1C)), shape = RoundedCornerShape(14.dp)) {
+                        Text(
+                            "No connectable AG2 / AirGlu endpoint yet. Leave Shogun Ultra on the Pair screen and scan again.",
+                            color = Color(0xFF868D90),
+                            fontSize = 12.sp,
+                            modifier = Modifier.padding(16.dp)
+                        )
+                    }
+                }
+            } else {
+                items(visibleDevices, key = { it.address }) { ad ->
+                    DeviceCard(ad, wifiAssistTarget != null) { vm.selectAndConnect(ad) }
+                }
+            }
+        }
+    }
+}
+
+private fun isAirGluSyncAdvertisement(ad: BleAdvertisement): Boolean {
+    val n = ad.name?.trim()?.lowercase().orEmpty()
+    val hasFcc1 = ad.serviceUuids.any { it.lowercase().contains("fcc1") }
+    val hasCapturedShogunService = ad.serviceUuids.any { it.equals(AtomosViewModel.AIRGLU_SHOGUN_SERVICE_UUID, ignoreCase = true) }
+    return hasFcc1 || hasCapturedShogunService || n == "ag2" || n == "ag" || n.startsWith("ag2-") || n.startsWith("ag-")
+}
+
+private fun likelyAtomosAdvertisement(ad: BleAdvertisement): Boolean {
+    val n = ad.name?.trim()?.lowercase().orEmpty()
+    return ad.advertisedPairingId != null || isAirGluSyncAdvertisement(ad) || AtomosProfiles.match(ad.name) != null ||
+        n.contains("atomos") || n.contains("shogun") || n.contains("ninja") || n.contains("neon")
+}
+
+@Composable
+private fun DeviceCard(ad: BleAdvertisement, wifiAssist: Boolean = false, onClick: () -> Unit) {
+    val service9383 = ad.serviceUuids.any { it.equals(AtomosViewModel.AIRGLU_SHOGUN_SERVICE_UUID, ignoreCase = true) }
+    Card(
+        onClick = onClick,
+        modifier = Modifier.fillMaxWidth(),
+        colors = CardDefaults.cardColors(containerColor = Color(0xFF1A1F21)),
+        shape = RoundedCornerShape(14.dp)
+    ) {
+        Row(Modifier.fillMaxWidth().padding(15.dp), verticalAlignment = Alignment.CenterVertically) {
+            Box(Modifier.size(38.dp).background(Color(0xFF222729), RoundedCornerShape(10.dp)), contentAlignment = Alignment.Center) {
+                Box(Modifier.size(11.dp).background(AtomosCyan, CircleShape))
+            }
+            Spacer(Modifier.width(12.dp))
+            Column(Modifier.weight(1f)) {
+                Text(ad.name ?: "AirGlu device", fontSize = 15.sp, fontWeight = FontWeight.Bold)
+                Text(
+                    if (service9383) "Shogun AirGlu service · 9383b854" else "AirGlu BT / AtomRemote candidate",
+                    color = AtomosCyan,
+                    fontSize = 11.sp,
+                    fontWeight = FontWeight.SemiBold
+                )
+                Text("${ad.address} · ${ad.rssi} dBm", color = Color(0xFF868D90), fontSize = 10.sp)
+                ad.advertisedPairingId?.let { Text("Pairing ID $it", color = Color(0xFFE8A23B), fontSize = 11.sp, fontWeight = FontWeight.Bold) }
+            }
+            Text(if (wifiAssist) "PAIR" else "CONNECT", color = AtomosCyan, fontWeight = FontWeight.Bold, fontSize = 12.sp)
+        }
+    }
+}
+
+@Composable
+private fun PairScreen(vm: AtomosViewModel) {
+    val selected by vm.selected.collectAsState()
+    val state by vm.gattState.collectAsState()
+    val bondState by vm.bondState.collectAsState()
+    val snapshot by vm.gattSnapshot.collectAsState()
+    val tcsPairing by vm.tcsPairingState.collectAsState()
+    val tcsRemote by vm.tcsRemoteState.collectAsState()
+    val disconnectReason by vm.gattDisconnectReason.collectAsState()
+    val s1c by vm.s1cStatus.collectAsState()
+    val protocol by vm.protocol.collectAsState()
+    val commandStatus by vm.commandStatus.collectAsState()
+    val pairingAccepted by vm.pairingCodeAccepted.collectAsState()
+    val codeCandidates by vm.pairingCodeCandidates.collectAsState()
+    val scanState by vm.scanState.collectAsState()
+    val gattEvents by vm.gattEvents.collectAsState()
+    val smpPasskey by vm.peripheralSmpPasskey.collectAsState()
+    val peripheralState by vm.peripheralState.collectAsState()
+    val inboundAddress by vm.peripheralCentralAddress.collectAsState()
+    val inboundPairingId by vm.peripheralPairingId.collectAsState()
+    val context = LocalContext.current
+    var traceMessage by remember { mutableStateOf<String?>(null) }
+
+    val pairingId = selected?.advertisedPairingId ?: snapshot?.pairingId ?: inboundPairingId
+    val remoteReady = tcsRemote.available || tcsRemote.linked || s1c.ready || protocol?.canTransmit == true
+    val centralLinked = state in setOf("connected", "services-ready", "tcs-pairing", "passive-pair-capture", "pair-discovery") || s1c.ready
+    val busy = state == "connecting" || (state == "tcs-pairing" && tcsPairing.phase !in setOf("can-accept", "waiting-for-bcid", "accepted"))
+    val staleBond = selected?.device?.bondState == BluetoothDevice.BOND_BONDED && !pairingAccepted && pairingId == null
+
+    Column(Modifier.fillMaxSize().background(Color(0xFF0A0C0D))) {
+        AppHeader(
+            selected?.name ?: "Connect recorder",
+            selected?.address ?: "Shogun Ultra",
+            onBack = { vm.stopScan(); vm.stopPairingPresence(); vm.gatt.disconnect(); vm.go(AtomosViewModel.Screen.CONNECT) }
+        )
+
+        LazyColumn(
+            Modifier.fillMaxSize(),
+            contentPadding = PaddingValues(horizontal = 18.dp, vertical = 18.dp),
+            verticalArrangement = Arrangement.spacedBy(12.dp)
+        ) {
+            item {
+                Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                    PairStageChip("AG2", selected != null, Modifier.weight(1f))
+                    PairStageChip("GATT", centralLinked, Modifier.weight(1f))
+                    PairStageChip("CODE", pairingId != null || pairingAccepted, Modifier.weight(1f))
+                    PairStageChip("REMOTE", remoteReady, Modifier.weight(1f))
+                }
+            }
+
+            item {
+                Card(colors = CardDefaults.cardColors(containerColor = Color(0xFF151A1C)), shape = RoundedCornerShape(16.dp)) {
+                    Column(Modifier.fillMaxWidth().padding(18.dp), horizontalAlignment = Alignment.CenterHorizontally) {
+                        Text("PAIRING ID", color = Color(0xFF868D90), fontSize = 10.sp, letterSpacing = 1.2.sp)
+                        Spacer(Modifier.height(10.dp))
+                        Text(
+                            pairingId ?: if (pairingAccepted) "Accepted" else "Waiting…",
+                            fontSize = if (pairingId != null) 34.sp else 24.sp,
+                            fontWeight = FontWeight.ExtraBold,
+                            letterSpacing = if (pairingId != null) 1.2.sp else 0.sp
+                        )
+                        Spacer(Modifier.height(8.dp))
+                        Text(
+                            when {
+                                remoteReady -> "Recorder control channel confirmed."
+                                pairingAccepted -> "Matching code accepted. Official TCS ~CCID acceptance has been sent to SHOGUN."
+                                pairingId != null -> "Official AtomRemote-style Connect Name. SHOGUN should show this same 9-digit code. Accept only if it matches exactly."
+                                centralLinked -> "AG2 GATT is connected. Starting the recovered official TCS pairing sequence."
+                                else -> "Keep Sync Config → Bluetooth / AirGlu BT → Pair open on Shogun Ultra."
+                            },
+                            color = Color(0xFF868D90),
+                            fontSize = 12.sp,
+                            lineHeight = 18.sp
+                        )
+                        smpPasskey?.let { passkey ->
+                            Spacer(Modifier.height(10.dp))
+                            Text(
+                                "Android SMP passkey observed: $passkey (security layer only, not the ATOMOS 9-digit ID)",
+                                color = Color(0xFFE8A23B), fontSize = 10.sp, lineHeight = 15.sp
+                            )
+                        }
+                        if (busy) {
+                            Spacer(Modifier.height(14.dp))
+                            CircularProgressIndicator(Modifier.size(28.dp), strokeWidth = 2.5.dp, color = AtomosCyan)
+                        }
+                    }
+                }
+            }
+
+            item {
+                Card(colors = CardDefaults.cardColors(containerColor = Color(0xFF10201F)), shape = RoundedCornerShape(14.dp)) {
+                    Column(Modifier.fillMaxWidth().padding(14.dp)) {
+                        Text("18.3 OFFICIAL TCS PAIRING + REMOTE", color = AtomosCyan, fontSize = 11.sp, fontWeight = FontWeight.Bold)
+                        Text(
+                            "Pairing keeps the proven official TCS flow: ID slots -> 9-digit Connect Name -> CCID -> BCID -> user confirm -> ~CCID. After acceptance, 18.3 opens the recovered TCS Packet Link on cxtic 12/13 and moves directly to Remote.",
+                            color = Color(0xFFB7BFC1), fontSize = 11.sp, lineHeight = 16.sp, modifier = Modifier.padding(top = 5.dp)
+                        )
+                    }
+                }
+            }
+
+            if (staleBond) {
+                item {
+                    Card(colors = CardDefaults.cardColors(containerColor = Color(0xFF2A2115)), shape = RoundedCornerShape(14.dp)) {
+                        Column(Modifier.fillMaxWidth().padding(15.dp)) {
+                            Text("STALE ANDROID BOND DETECTED", color = Color(0xFFE8A23B), fontSize = 11.sp, fontWeight = FontWeight.Bold)
+                            Text(
+                                "AG2 is already BONDED before a fresh Pairing ID exists. Clear the Android bond and use Unpair All once on Shogun before another clean capture.",
+                                color = Color(0xFFD7C4A5), fontSize = 11.sp, lineHeight = 16.sp, modifier = Modifier.padding(top = 5.dp)
+                            )
+                            Button(onClick = { vm.clearAndroidBondAndRetry() }, modifier = Modifier.fillMaxWidth().padding(top = 10.dp).height(50.dp)) {
+                                Text("RESET STALE BOND + RESTART", fontWeight = FontWeight.Bold)
+                            }
+                            OutlinedButton(
+                                onClick = {
+                                    runCatching {
+                                        context.startActivity(Intent(Settings.ACTION_BLUETOOTH_SETTINGS).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
+                                    }
+                                },
+                                modifier = Modifier.fillMaxWidth().padding(top = 8.dp).height(46.dp)
+                            ) { Text("OPEN ANDROID BLUETOOTH SETTINGS") }
+                        }
+                    }
+                }
+            }
+
+            if (!pairingAccepted && codeCandidates.isNotEmpty()) {
+                item {
+                    Text("PAIRING CODES SEEN IN BLE SCAN", color = Color(0xFF868D90), fontSize = 10.sp, fontWeight = FontWeight.Bold)
+                    Text("Use only a code that exactly matches the Shogun screen.", color = Color(0xFF868D90), fontSize = 11.sp)
+                }
+                items(codeCandidates, key = { "scan-${it.pairingId}-${it.sourceAddress}" }) { candidate ->
+                    Card(
+                        onClick = { vm.selectPairingCodeCandidate(candidate.pairingId) },
+                        colors = CardDefaults.cardColors(containerColor = if (pairingId == candidate.pairingId) Color(0xFF173331) else Color(0xFF1A1F21)),
+                        shape = RoundedCornerShape(12.dp)
+                    ) {
+                        Row(Modifier.fillMaxWidth().padding(13.dp), verticalAlignment = Alignment.CenterVertically) {
+                            Column(Modifier.weight(1f)) {
+                                Text(candidate.pairingId, fontSize = 19.sp, fontWeight = FontWeight.Bold)
+                                Text(
+                                    if (candidate.exactAg2Source) "Direct AG2 advertisement" else "Pair-session beacon · ${candidate.hits} hit(s) · ${candidate.rssi} dBm",
+                                    color = Color(0xFF868D90), fontSize = 10.sp
+                                )
+                            }
+                            Text(if (pairingId == candidate.pairingId) "SELECTED" else "USE IF MATCH", color = AtomosCyan, fontSize = 10.sp, fontWeight = FontWeight.Bold)
+                        }
+                    }
+                }
+            }
+
+            if (!pairingAccepted && pairingId != null) {
+                item {
+                    Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                        OutlinedButton(onClick = { vm.retryPairingIdScan() }, modifier = Modifier.weight(1f).height(50.dp)) { Text("RESCAN") }
+                        Button(
+                            onClick = { vm.confirmPairingCodeAndContinue() },
+                            enabled = tcsPairing.canAccept,
+                            modifier = Modifier.weight(1.5f).height(50.dp)
+                        ) {
+                            Text(if (tcsPairing.canAccept) "ACCEPT MATCHING CODE" else "WAIT FOR SHOGUN", fontWeight = FontWeight.Bold)
+                        }
+                    }
+                }
+            } else if (!pairingAccepted) {
+                item {
+                    OutlinedButton(onClick = { vm.retryPairingIdScan() }, modifier = Modifier.fillMaxWidth().height(50.dp)) {
+                        Text("RECONNECT AG2 + CAPTURE")
+                    }
+                }
+            }
+
+            item {
+                Card(colors = CardDefaults.cardColors(containerColor = Color(0xFF151A1C)), shape = RoundedCornerShape(14.dp)) {
+                    Column(Modifier.padding(14.dp)) {
+                        Text("OFFICIAL TCS PAIR LINK", color = AtomosCyan, fontSize = 10.sp, fontWeight = FontWeight.Bold)
+                        Text("Phone advertising: OFF (official central flow)", fontSize = 11.sp, modifier = Modifier.padding(top = 5.dp))
+                        Text("TCS phase: ${tcsPairing.phase.uppercase()}", color = AtomosCyan, fontSize = 10.sp)
+                        Text("Remote link: ${tcsRemote.phase.uppercase()}", color = if (tcsRemote.available) AtomosCyan else Color(0xFF868D90), fontSize = 10.sp)
+                        tcsPairing.slotsAvailable?.let { Text("ID slots available: $it", color = Color(0xFFB7BFC1), fontSize = 10.sp) }
+                        tcsPairing.bcid?.let { Text("BCID: 0x%08X".format(it), color = Color(0xFF868D90), fontSize = 9.sp) }
+                        tcsPairing.lastError?.let { Text("TCS error: $it", color = AtomosRed, fontSize = 10.sp) }
+
+                        Text("AG2 GATT client: ${state.uppercase()}", color = Color(0xFFB7BFC1), fontSize = 10.sp)
+                        Text("Android bond: ${bondState.uppercase()}", color = Color(0xFF868D90), fontSize = 10.sp)
+                        Text("AirGlu service: 9383b854-8bee-11e7-bb31-be2e44b06b34", color = Color(0xFF868D90), fontSize = 9.sp)
+                        val model = snapshot?.characteristics?.firstOrNull { it.characteristicUuid.equals("9383b110-8bee-11e7-bb79-be2e44b06b34", true) }?.lastValueAscii
+                        val session = snapshot?.characteristics?.firstOrNull { it.characteristicUuid.equals("ce8dadf8-b7e0-4d9e-94cd-43f84803b361", true) }?.lastValueHex
+                        if (!model.isNullOrBlank()) Text("Recorder identity: $model", color = Color(0xFF868D90), fontSize = 9.sp)
+                        if (!session.isNullOrBlank()) Text("Session value ce8d…: $session", color = Color(0xFF868D90), fontSize = 9.sp)
+                    }
+                }
+            }
+
+            if (pairingAccepted && !remoteReady) {
+                item {
+                    Button(onClick = { vm.startPairingDiscovery() }, modifier = Modifier.fillMaxWidth().height(52.dp)) {
+                        Text("OPEN REMOTE", fontWeight = FontWeight.Bold)
+                    }
+                }
+            }
+
+            disconnectReason?.let { reason -> item { Text("Last disconnect: $reason", color = AtomosRed, fontSize = 11.sp) } }
+            commandStatus?.let { status -> item { Text(status, color = Color(0xFFB7BFC1), fontSize = 11.sp, lineHeight = 17.sp) } }
+
+            item {
+                Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    OutlinedButton(onClick = { vm.retrySelectedConnection() }, modifier = Modifier.weight(1f)) { Text("RESTART LINK") }
+                    OutlinedButton(
+                        onClick = {
+                            vm.exportPairingTrace().fold(
+                                onSuccess = { result ->
+                                    traceMessage = result.summary
+                                    val share = Intent(Intent.ACTION_SEND).apply {
+                                        type = "application/json"
+                                        putExtra(Intent.EXTRA_STREAM, result.uri)
+                                        addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                                    }
+                                    context.startActivity(Intent.createChooser(share, "Share ATOMOS pairing trace"))
+                                },
+                                onFailure = { traceMessage = it.message ?: "Pairing trace export failed" }
+                            )
+                        },
+                        modifier = Modifier.weight(1f)
+                    ) { Text("SHARE TRACE") }
+                }
+                traceMessage?.let { Text(it, color = Color(0xFF868D90), fontSize = 9.sp, modifier = Modifier.padding(top = 5.dp)) }
+            }
+
+            if (gattEvents.isNotEmpty()) {
+                item {
+                    Card(colors = CardDefaults.cardColors(containerColor = Color(0xFF111517)), shape = RoundedCornerShape(12.dp)) {
+                        Column(Modifier.padding(12.dp)) {
+                            Text("CENTRAL GATT TRACE", color = Color(0xFF868D90), fontSize = 9.sp, fontWeight = FontWeight.Bold)
+                            gattEvents.takeLast(8).forEach { event ->
+                                Text(event, color = Color(0xFF747C7E), fontSize = 8.sp, modifier = Modifier.padding(top = 3.dp))
+                            }
+                        }
+                    }
+                }
+            }
+
+            item {
+                TextButton(onClick = { vm.go(AtomosViewModel.Screen.GATT) }, modifier = Modifier.fillMaxWidth()) { Text("GATT / PROTOCOL INSPECTOR") }
+            }
+        }
+    }
+}
+
+@Composable
+private fun PairStageChip(label: String, active: Boolean, modifier: Modifier = Modifier) {
+    Surface(
+        modifier = modifier,
+        shape = RoundedCornerShape(8.dp),
+        color = if (active) Color(0xFF173331) else Color(0xFF171B1D),
+        border = androidx.compose.foundation.BorderStroke(1.dp, if (active) AtomosCyan else Color(0xFF2B3032))
+    ) {
+        Text(label, color = if (active) AtomosCyan else Color(0xFF575D5F), fontSize = 8.sp, fontWeight = FontWeight.Bold, modifier = Modifier.padding(vertical = 7.dp), textAlign = androidx.compose.ui.text.style.TextAlign.Center)
+    }
+}
+
+@Composable
+private fun RemoteScreen(vm: AtomosViewModel) {
+    val selected by vm.selected.collectAsState()
+    val tcsPairing by vm.tcsPairingState.collectAsState()
+    val remote by vm.tcsRemoteState.collectAsState()
+    val commandStatus by vm.commandStatus.collectAsState()
+
+    val transportEnabled = tcsPairing.acceptWritten && remote.available
+
+    var scopeMode by remember { mutableStateOf(-1) }
+    var focusAssist by remember { mutableStateOf(false) }
+    var zebra by remember { mutableStateOf(false) }
+    var falseColor by remember { mutableStateOf(false) }
+    var blueOnly by remember { mutableStateOf(false) }
+    var zoomLevel by remember { mutableStateOf(0) }
+    var frameGuide by remember { mutableStateOf(0) }
+    var safeArea by remember { mutableStateOf(0) }
+    var anamorphic by remember { mutableStateOf(0) }
+    var monitorMode by remember { mutableStateOf(0) }
+    var gamma by remember { mutableStateOf(3) }
+    var gamut by remember { mutableStateOf(0) }
+
+    val connectionLabel = when {
+        !tcsPairing.acceptWritten -> "PAIRING"
+        remote.lastError != null -> "REMOTE ERROR"
+        remote.available -> "REMOTE ACTIVE"
+        else -> "OPENING REMOTE"
+    }
+
+    Column(Modifier.fillMaxSize().background(Color(0xFF080A0B))) {
+        AppHeader(
+            title = selected?.name ?: "Shogun Ultra",
+            subtitle = "18.9.3 macOS Remote Console",
+            onBack = { vm.go(AtomosViewModel.Screen.HOME) }
+        )
+
+        LazyColumn(
+            modifier = Modifier.fillMaxSize(),
+            contentPadding = PaddingValues(horizontal = 16.dp, vertical = 14.dp),
+            verticalArrangement = Arrangement.spacedBy(14.dp)
+        ) {
+            item {
+                Card(
+                    colors = CardDefaults.cardColors(containerColor = Color(0xFF0E1416)),
+                    shape = RoundedCornerShape(18.dp),
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Column(Modifier.padding(16.dp)) {
+                        Row(
+                            Modifier.fillMaxWidth(),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Box(
+                                Modifier
+                                    .size(10.dp)
+                                    .background(
+                                        if (transportEnabled) AtomosCyan else AtomosRed,
+                                        CircleShape
+                                    )
+                            )
+                            Spacer(Modifier.width(9.dp))
+                            Column(Modifier.weight(1f)) {
+                                Text(
+                                    connectionLabel,
+                                    color = if (transportEnabled) AtomosCyan else Color(0xFFFF9095),
+                                    fontSize = 12.sp,
+                                    fontWeight = FontWeight.Black
+                                )
+                                Text(
+                                    "Pair: ${tcsPairing.phase.uppercase()}  â€¢  PacketLink: ${remote.phase.uppercase()}",
+                                    color = Color(0xFF8A9497),
+                                    fontSize = 10.sp
+                                )
+                            }
+                            Text(
+                                "ATOMOS",
+                                color = Color.White,
+                                fontSize = 12.sp,
+                                fontWeight = FontWeight.Black
+                            )
+                        }
+
+                        remote.lastStatus?.let {
+                            Text(
+                                it,
+                                color = Color(0xFFB7BFC1),
+                                fontSize = 10.sp,
+                                lineHeight = 15.sp,
+                                modifier = Modifier.padding(top = 10.dp)
+                            )
+                        }
+                    }
+                }
+            }
+
+            remote.lastError?.let { err ->
+                item {
+                    Card(
+                        colors = CardDefaults.cardColors(containerColor = Color(0xFF271012)),
+                        shape = RoundedCornerShape(16.dp),
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
+                        Column(Modifier.padding(14.dp)) {
+                            Text(
+                                "REMOTE ERROR",
+                                color = AtomosRed,
+                                fontSize = 10.sp,
+                                fontWeight = FontWeight.Black
+                            )
+                            Text(
+                                err,
+                                color = Color(0xFFFFC4C7),
+                                fontSize = 11.sp,
+                                lineHeight = 16.sp,
+                                modifier = Modifier.padding(top = 6.dp)
+                            )
+                        }
+                    }
+                }
+            }
+
+            item {
+                RemoteConsoleSectionTitle("TRANSPORT", "Record and playback")
+
+                Row(
+                    Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(9.dp)
+                ) {
+                    Button(
+                        onClick = { vm.send("record-start") },
+                        enabled = transportEnabled,
+                        colors = ButtonDefaults.buttonColors(containerColor = AtomosRed),
+                        shape = RoundedCornerShape(14.dp),
+                        modifier = Modifier.weight(1f).height(58.dp)
+                    ) {
+                        Text("REC", fontWeight = FontWeight.Black, fontSize = 15.sp)
+                    }
+
+                    OutlinedButton(
+                        onClick = { vm.send("record-stop") },
+                        enabled = transportEnabled,
+                        shape = RoundedCornerShape(14.dp),
+                        modifier = Modifier.weight(1f).height(58.dp)
+                    ) {
+                        Text("STOP", fontWeight = FontWeight.Bold)
+                    }
+                }
+
+                Spacer(Modifier.height(9.dp))
+
+                Row(
+                    Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(9.dp)
+                ) {
+                    OutlinedButton(
+                        onClick = { vm.send("play") },
+                        enabled = transportEnabled,
+                        shape = RoundedCornerShape(14.dp),
+                        modifier = Modifier.weight(1f).height(50.dp)
+                    ) {
+                        Text("PLAY", fontWeight = FontWeight.Bold)
+                    }
+
+                    OutlinedButton(
+                        onClick = { vm.send("pause") },
+                        enabled = transportEnabled,
+                        shape = RoundedCornerShape(14.dp),
+                        modifier = Modifier.weight(1f).height(50.dp)
+                    ) {
+                        Text("PAUSE", fontWeight = FontWeight.Bold)
+                    }
+                }
+            }
+
+            item {
+                RemoteConsoleSectionTitle("SCOPES", "Waveform and vectorscope analysis")
+
+                Row(
+                    Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(7.dp)
+                ) {
+                    RemoteConsoleChoice(
+                        label = "LUMA",
+                        selected = scopeMode == 0,
+                        enabled = transportEnabled,
+                        modifier = Modifier.weight(1f)
+                    ) {
+                        if (vm.setScopeMode(0)) scopeMode = 0
+                    }
+                    RemoteConsoleChoice(
+                        label = "RGB",
+                        selected = scopeMode == 1,
+                        enabled = transportEnabled,
+                        modifier = Modifier.weight(1f)
+                    ) {
+                        if (vm.setScopeMode(1)) scopeMode = 1
+                    }
+                    RemoteConsoleChoice(
+                        label = "VECTOR",
+                        selected = scopeMode == 2,
+                        enabled = transportEnabled,
+                        modifier = Modifier.weight(1f)
+                    ) {
+                        if (vm.setScopeMode(2)) scopeMode = 2
+                    }
+                }
+
+                if (scopeMode >= 0) {
+                    TextButton(
+                        onClick = {
+                            if (vm.sendRemoteFeature("waveform-enable", 0)) scopeMode = -1
+                        },
+                        enabled = transportEnabled
+                    ) {
+                        Text("TURN SCOPES OFF", color = Color(0xFF8A9497), fontSize = 10.sp)
+                    }
+                }
+            }
+
+            item {
+                RemoteConsoleSectionTitle("MONITOR ASSIST", "Exposure, focus and inspection")
+
+                Row(
+                    Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    RemoteConsoleFeatureTile(
+                        title = "ZOOM",
+                        subtitle = if (zoomLevel == 0) "Off" else "2:1",
+                        active = zoomLevel != 0,
+                        enabled = transportEnabled,
+                        modifier = Modifier.weight(1f)
+                    ) {
+                        val next = if (zoomLevel == 0) 2 else 0
+                        if (vm.sendRemoteFeature("zoom-level", next)) zoomLevel = next
+                    }
+
+                    RemoteConsoleFeatureTile(
+                        title = "FOCUS",
+                        subtitle = "Focus Assist",
+                        active = focusAssist,
+                        enabled = transportEnabled,
+                        modifier = Modifier.weight(1f)
+                    ) {
+                        val next = !focusAssist
+                        if (vm.sendRemoteFeature("focus-assist", if (next) 1 else 0)) focusAssist = next
+                    }
+                }
+
+                Spacer(Modifier.height(8.dp))
+
+                Row(
+                    Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    RemoteConsoleFeatureTile(
+                        title = "ZEBRA",
+                        subtitle = "Exposure peaks",
+                        active = zebra,
+                        enabled = transportEnabled,
+                        modifier = Modifier.weight(1f)
+                    ) {
+                        val next = !zebra
+                        if (vm.sendRemoteFeature("zebra", if (next) 1 else 0)) zebra = next
+                    }
+
+                    RemoteConsoleFeatureTile(
+                        title = "FALSE COLOR",
+                        subtitle = "Exposure map",
+                        active = falseColor,
+                        enabled = transportEnabled,
+                        modifier = Modifier.weight(1f)
+                    ) {
+                        val next = !falseColor
+                        if (vm.sendRemoteFeature("false-color", if (next) 1 else 0)) falseColor = next
+                    }
+                }
+
+                Spacer(Modifier.height(8.dp))
+
+                RemoteConsoleFeatureTile(
+                    title = "BLUE ONLY",
+                    subtitle = "Blue channel inspection",
+                    active = blueOnly,
+                    enabled = transportEnabled,
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    val next = !blueOnly
+                    if (vm.sendRemoteFeature("blue-only", if (next) 1 else 0)) blueOnly = next
+                }
+            }
+
+            item {
+                RemoteConsoleSectionTitle("GUIDES", "Composition and delivery framing")
+
+                Text("FRAME GUIDE", color = Color(0xFF8A9497), fontSize = 9.sp, fontWeight = FontWeight.Bold)
+                Spacer(Modifier.height(5.dp))
+                Row(
+                    Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(6.dp)
+                ) {
+                    RemoteConsoleChoice("OFF", frameGuide == 0, transportEnabled, Modifier.weight(1f)) {
+                        if (vm.sendRemoteFeature("frame-guide-format", 0)) frameGuide = 0
+                    }
+                    RemoteConsoleChoice("16:9", frameGuide == 1, transportEnabled, Modifier.weight(1f)) {
+                        if (vm.sendRemoteFeature("frame-guide-format", 1)) frameGuide = 1
+                    }
+                    RemoteConsoleChoice("2.35", frameGuide == 3, transportEnabled, Modifier.weight(1f)) {
+                        if (vm.sendRemoteFeature("frame-guide-format", 3)) frameGuide = 3
+                    }
+                    RemoteConsoleChoice("9 GRID", frameGuide == 11, transportEnabled, Modifier.weight(1f)) {
+                        if (vm.sendRemoteFeature("frame-guide-format", 11)) frameGuide = 11
+                    }
+                }
+
+                Spacer(Modifier.height(12.dp))
+                Text("SAFE AREA", color = Color(0xFF8A9497), fontSize = 9.sp, fontWeight = FontWeight.Bold)
+                Spacer(Modifier.height(5.dp))
+                Row(
+                    Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(7.dp)
+                ) {
+                    RemoteConsoleChoice("ACTION", safeArea == 0, transportEnabled, Modifier.weight(1f)) {
+                        if (vm.sendRemoteFeature("safe-area-size", 0)) safeArea = 0
+                    }
+                    RemoteConsoleChoice("ACTION + TITLE", safeArea == 1, transportEnabled, Modifier.weight(1f)) {
+                        if (vm.sendRemoteFeature("safe-area-size", 1)) safeArea = 1
+                    }
+                }
+
+                Spacer(Modifier.height(12.dp))
+                Text("ANAMORPHIC DE-SQUEEZE", color = Color(0xFF8A9497), fontSize = 9.sp, fontWeight = FontWeight.Bold)
+                Spacer(Modifier.height(5.dp))
+
+                Row(
+                    Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(6.dp)
+                ) {
+                    RemoteConsoleChoice("OFF", anamorphic == 0, transportEnabled, Modifier.weight(1f)) {
+                        if (vm.sendRemoteFeature("anamorphic-mode", 0)) anamorphic = 0
+                    }
+                    RemoteConsoleChoice("1.33x", anamorphic == 4, transportEnabled, Modifier.weight(1f)) {
+                        if (vm.sendRemoteFeature("anamorphic-mode", 4)) anamorphic = 4
+                    }
+                    RemoteConsoleChoice("1.5x", anamorphic == 3, transportEnabled, Modifier.weight(1f)) {
+                        if (vm.sendRemoteFeature("anamorphic-mode", 3)) anamorphic = 3
+                    }
+                }
+
+                Spacer(Modifier.height(6.dp))
+
+                Row(
+                    Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(6.dp)
+                ) {
+                    RemoteConsoleChoice("1.8x", anamorphic == 5, transportEnabled, Modifier.weight(1f)) {
+                        if (vm.sendRemoteFeature("anamorphic-mode", 5)) anamorphic = 5
+                    }
+                    RemoteConsoleChoice("2.0x", anamorphic == 2, transportEnabled, Modifier.weight(1f)) {
+                        if (vm.sendRemoteFeature("anamorphic-mode", 2)) anamorphic = 2
+                    }
+                    RemoteConsoleChoice("2x 4:3", anamorphic == 1, transportEnabled, Modifier.weight(1f)) {
+                        if (vm.sendRemoteFeature("anamorphic-mode", 1)) anamorphic = 1
+                    }
+                }
+            }
+
+            item {
+                RemoteConsoleSectionTitle("MONITOR MODE", "Viewing color space")
+
+                Row(
+                    Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(7.dp)
+                ) {
+                    RemoteConsoleChoice("NATIVE", monitorMode == 0, transportEnabled, Modifier.weight(1f)) {
+                        if (vm.sendRemoteFeature("monitor-mode", 0)) monitorMode = 0
+                    }
+                    RemoteConsoleChoice("REC.709", monitorMode == 1, transportEnabled, Modifier.weight(1f)) {
+                        if (vm.sendRemoteFeature("monitor-mode", 1)) monitorMode = 1
+                    }
+                }
+            }
+
+            item {
+                RemoteConsoleSectionTitle("INPUT GAMMA", "Camera tonal curve")
+
+                Row(
+                    Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(6.dp)
+                ) {
+                    RemoteConsoleChoice("PQ", gamma == 0, transportEnabled, Modifier.weight(1f)) {
+                        if (vm.sendRemoteFeature("gamma", 0)) gamma = 0
+                    }
+                    RemoteConsoleChoice("S-LOG3", gamma == 3, transportEnabled, Modifier.weight(1f)) {
+                        if (vm.sendRemoteFeature("gamma", 3)) gamma = 3
+                    }
+                    RemoteConsoleChoice("C-LOG3", gamma == 6, transportEnabled, Modifier.weight(1f)) {
+                        if (vm.sendRemoteFeature("gamma", 6)) gamma = 6
+                    }
+                    RemoteConsoleChoice("V-LOG", gamma == 10, transportEnabled, Modifier.weight(1f)) {
+                        if (vm.sendRemoteFeature("gamma", 10)) gamma = 10
+                    }
+                }
+            }
+
+            item {
+                RemoteConsoleSectionTitle("INPUT GAMUT", "Camera color gamut")
+
+                Row(
+                    Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(6.dp)
+                ) {
+                    RemoteConsoleChoice("709", gamut == 0, transportEnabled, Modifier.weight(1f)) {
+                        if (vm.sendRemoteFeature("gamut", 0)) gamut = 0
+                    }
+                    RemoteConsoleChoice("2020", gamut == 1, transportEnabled, Modifier.weight(1f)) {
+                        if (vm.sendRemoteFeature("gamut", 1)) gamut = 1
+                    }
+                    RemoteConsoleChoice("P3", gamut == 2, transportEnabled, Modifier.weight(1f)) {
+                        if (vm.sendRemoteFeature("gamut", 2)) gamut = 2
+                    }
+                }
+
+                Spacer(Modifier.height(6.dp))
+
+                Row(
+                    Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(6.dp)
+                ) {
+                    RemoteConsoleChoice("S-GAMUT3.C", gamut == 7, transportEnabled, Modifier.weight(1f)) {
+                        if (vm.sendRemoteFeature("gamut", 7)) gamut = 7
+                    }
+                    RemoteConsoleChoice("V-GAMUT", gamut == 17, transportEnabled, Modifier.weight(1f)) {
+                        if (vm.sendRemoteFeature("gamut", 17)) gamut = 17
+                    }
+                    RemoteConsoleChoice("F-GAMUT", gamut == 22, transportEnabled, Modifier.weight(1f)) {
+                        if (vm.sendRemoteFeature("gamut", 22)) gamut = 22
+                    }
+                }
+            }
+
+            item {
+                RemoteConsoleSectionTitle("RECORDING", "Codec and live input format")
+
+                Card(
+                    colors = CardDefaults.cardColors(containerColor = Color(0xFF0E1113)),
+                    shape = RoundedCornerShape(15.dp),
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Column(Modifier.padding(14.dp)) {
+                        Text("CODEC", color = Color.White, fontWeight = FontWeight.Bold, fontSize = 12.sp)
+                        Text(
+                            "Device profile controlled",
+                            color = AtomosCyan,
+                            fontSize = 11.sp,
+                            modifier = Modifier.padding(top = 3.dp)
+                        )
+                        Text(
+                            "macOS CodecProfileSet 0x013A is mapped, but this build will not invent a codec/profile tuple. Existing recording setup stays safe.",
+                            color = Color(0xFF7D878A),
+                            fontSize = 9.sp,
+                            lineHeight = 14.sp,
+                            modifier = Modifier.padding(top = 6.dp)
+                        )
+                    }
+                }
+
+                Spacer(Modifier.height(8.dp))
+
+                Card(
+                    colors = CardDefaults.cardColors(containerColor = Color(0xFF0E1113)),
+                    shape = RoundedCornerShape(15.dp),
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Row(
+                        Modifier.fillMaxWidth().padding(14.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Column(Modifier.weight(1f)) {
+                            Text("FORMAT", color = Color.White, fontWeight = FontWeight.Bold, fontSize = 12.sp)
+                            Text(
+                                "Input resolution / frame-rate summary",
+                                color = Color(0xFF7D878A),
+                                fontSize = 9.sp,
+                                modifier = Modifier.padding(top = 3.dp)
+                            )
+                        }
+
+                        OutlinedButton(
+                            onClick = { vm.sendRemoteFeature("format-refresh", 0) },
+                            enabled = transportEnabled
+                        ) {
+                            Text("REFRESH", fontSize = 10.sp, fontWeight = FontWeight.Bold)
+                        }
+                    }
+                }
+            }
+
+            commandStatus?.let { status ->
+                item {
+                    Card(
+                        colors = CardDefaults.cardColors(containerColor = Color(0xFF0D1011)),
+                        shape = RoundedCornerShape(14.dp),
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
+                        Column(Modifier.padding(13.dp)) {
+                            Text("REMOTE STATUS", color = Color(0xFF778083), fontSize = 9.sp, fontWeight = FontWeight.Bold)
+                            Text(status, color = Color(0xFFC6CCCE), fontSize = 10.sp, lineHeight = 15.sp, modifier = Modifier.padding(top = 5.dp))
+                            remote.lastTxHex?.let { Text("TX  $it", color = Color(0xFF697174), fontSize = 8.sp, modifier = Modifier.padding(top = 6.dp)) }
+                            remote.lastRxHex?.let { Text("RX  $it", color = Color(0xFF697174), fontSize = 8.sp, modifier = Modifier.padding(top = 3.dp)) }
+                        }
+                    }
+                }
+            }
+
+            if (!transportEnabled) {
+                item {
+                    Button(
+                        onClick = { vm.startPairingDiscovery() },
+                        modifier = Modifier.fillMaxWidth().height(52.dp)
+                    ) {
+                        Text("OPEN REMOTE LINK", fontWeight = FontWeight.Bold)
+                    }
+                }
+            }
+
+            item {
+                Row(
+                    Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    OutlinedButton(
+                        onClick = { vm.go(AtomosViewModel.Screen.GATT) },
+                        modifier = Modifier.weight(1f)
+                    ) { Text("GATT") }
+
+                    OutlinedButton(
+                        onClick = { vm.go(AtomosViewModel.Screen.PAIR) },
+                        modifier = Modifier.weight(1f)
+                    ) { Text("PAIR") }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun RemoteConsoleSectionTitle(title: String, subtitle: String) {
+    Column(Modifier.fillMaxWidth()) {
+        Text(
+            title,
+            color = Color(0xFF97A0A3),
+            fontSize = 10.sp,
+            fontWeight = FontWeight.Black,
+            letterSpacing = 0.7.sp
+        )
+        Text(
+            subtitle,
+            color = Color(0xFF5F686B),
+            fontSize = 9.sp,
+            modifier = Modifier.padding(top = 2.dp, bottom = 7.dp)
+        )
+    }
+}
+
+@Composable
+private fun RemoteConsoleFeatureTile(
+    title: String,
+    subtitle: String,
+    active: Boolean,
+    enabled: Boolean,
+    modifier: Modifier = Modifier,
+    onClick: () -> Unit
+) {
+    OutlinedButton(
+        onClick = onClick,
+        enabled = enabled,
+        modifier = modifier.height(62.dp),
+        shape = RoundedCornerShape(14.dp),
+        border = androidx.compose.foundation.BorderStroke(
+            1.dp,
+            if (active) AtomosCyan else Color(0xFF293033)
+        ),
+        colors = ButtonDefaults.outlinedButtonColors(
+            contentColor = if (active) AtomosCyan else Color(0xFFC4CBCC)
+        ),
+        contentPadding = PaddingValues(horizontal = 10.dp, vertical = 8.dp)
+    ) {
+        Column(
+            horizontalAlignment = Alignment.Start,
+            modifier = Modifier.fillMaxWidth()
+        ) {
+            Text(title, fontSize = 11.sp, fontWeight = FontWeight.Black)
+            Text(
+                subtitle,
+                fontSize = 8.sp,
+                color = if (active) Color(0xFF8FE4DF) else Color(0xFF727B7E),
+                modifier = Modifier.padding(top = 3.dp)
+            )
+        }
+    }
+}
+
+@Composable
+private fun RemoteConsoleChoice(
+    label: String,
+    selected: Boolean,
+    enabled: Boolean,
+    modifier: Modifier = Modifier,
+    onClick: () -> Unit
+) {
+    OutlinedButton(
+        onClick = onClick,
+        enabled = enabled,
+        modifier = modifier.height(40.dp),
+        shape = RoundedCornerShape(11.dp),
+        border = androidx.compose.foundation.BorderStroke(
+            1.dp,
+            if (selected) AtomosCyan else Color(0xFF2B3133)
+        ),
+        colors = ButtonDefaults.outlinedButtonColors(
+            contentColor = if (selected) AtomosCyan else Color(0xFF9EA6A8)
+        ),
+        contentPadding = PaddingValues(horizontal = 4.dp)
+    ) {
+        Text(label, fontSize = 8.sp, fontWeight = FontWeight.Bold, maxLines = 1)
+    }
+}
+@Composable
+private fun RemoteToolChip(@Composable
+private fun RemoteToolChip(name: String, active: Boolean, enabled: Boolean, modifier: Modifier = Modifier, onChange: (Boolean) -> Unit) {
+    OutlinedButton(
+        onClick = { onChange(!active) },
+        enabled = enabled,
+        modifier = modifier.height(42.dp),
+        colors = ButtonDefaults.outlinedButtonColors(contentColor = if (active) AtomosCyan else Color(0xFFB7BFC1)),
+        border = androidx.compose.foundation.BorderStroke(1.dp, if (active) AtomosCyan else Color(0xFF2B3032)),
+        contentPadding = PaddingValues(horizontal = 4.dp)
+    ) {
+        Text(name, fontSize = 10.sp, fontWeight = FontWeight.Bold)
+    }
+}
+
+@Composable
+private fun StatusCard(label: String, value: String, modifier: Modifier = Modifier) {
+    Card(modifier) {
+        Column(Modifier.padding(14.dp)) {
+            Text(label, color = Color.Gray, fontSize = 10.sp)
+            Text(value, fontWeight = FontWeight.Bold, maxLines = 1, overflow = TextOverflow.Ellipsis)
+        }
+    }
+}
+
+@Composable
+private fun ToolToggle(name: String, checked: Boolean, enabled: Boolean, onChange: (Boolean) -> Unit) {
+    Row(Modifier.fillMaxWidth().padding(vertical = 3.dp), verticalAlignment = Alignment.CenterVertically) {
+        Text(name, Modifier.weight(1f))
+        Switch(checked = checked, onCheckedChange = onChange, enabled = enabled)
+    }
+}
+
+@Composable
+private fun GattScreen(vm: AtomosViewModel) {
+    val snapshot by vm.gattSnapshot.collectAsState()
+    val events by vm.gattEvents.collectAsState()
+    Column(Modifier.fillMaxSize()) {
+        AppHeader("Outgoing GATT Inspector", snapshot?.deviceAddress, onBack = { vm.go(AtomosViewModel.Screen.PAIR) })
+        LazyColumn(Modifier.fillMaxSize(), contentPadding = PaddingValues(12.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+            item {
+                Card(Modifier.fillMaxWidth()) {
+                    Column(Modifier.padding(14.dp)) {
+                        Text("Pairing ID: ${snapshot?.pairingId ?: "not detected"}", color = AtomosCyan)
+                        Text("${snapshot?.characteristics?.size ?: 0} characteristics discovered", color = Color.Gray)
+                        Text("17.3.1 keeps SHOGUN-initiated security inbound while inspecting the selected AG2 AirGlu service after code acceptance. This inspector shows the real same-session GATT link and captured UUIDs.", color = Color.Gray, fontSize = 10.sp, modifier = Modifier.padding(top = 6.dp))
+                    }
+                }
+            }
+            items(snapshot?.characteristics.orEmpty()) { c ->
+                Card(Modifier.fillMaxWidth()) {
+                    Column(Modifier.padding(12.dp)) {
+                        Text(c.characteristicUuid, fontSize = 12.sp, fontWeight = FontWeight.Bold)
+                        Text("Service ${c.serviceUuid}", fontSize = 10.sp, color = Color.Gray)
+                        Text("R:${c.readable}  W:${c.writable}  WNR:${c.writableNoResponse}  N:${c.notifiable}  I:${c.indicatable}", fontSize = 10.sp)
+                        c.lastValueHex?.let { Text("HEX $it", fontSize = 10.sp, color = Color.Gray) }
+                        c.lastValueAscii?.takeIf { it.isNotBlank() }?.let { Text("ASCII $it", fontSize = 10.sp, color = AtomosCyan) }
+                    }
+                }
+            }
+            item { Text("Recent notifications / reads", color = Color.Gray, modifier = Modifier.padding(top = 10.dp)) }
+            items(events.reversed().take(40)) { event -> Text(event, fontSize = 10.sp, color = Color.LightGray) }
+        }
+    }
+}
+
+@Composable
+private fun ProtocolScreen(vm: AtomosViewModel) {
+    val current by vm.protocol.collectAsState()
+    var json by remember { mutableStateOf(vm.protocolTemplate()) }
+    var message by remember { mutableStateOf<String?>(null) }
+    Column(Modifier.fillMaxSize()) {
+        AppHeader("Protocol Profile", current?.name ?: "No validated profile", onBack = { vm.go(AtomosViewModel.Screen.REMOTE) })
+        Column(Modifier.fillMaxSize().padding(16.dp)) {
+            Text("Load only UUIDs and command payloads validated from Atomos SDK/documentation or your own hardware capture. Random writes are blocked.", color = Color.LightGray, fontSize = 12.sp)
+            Spacer(Modifier.height(12.dp))
+            OutlinedTextField(value = json, onValueChange = { json = it }, modifier = Modifier.fillMaxWidth().weight(1f), label = { Text("Protocol JSON") })
+            Spacer(Modifier.height(10.dp))
+            Button(onClick = {
+                val r = vm.loadProtocolJson(json)
+                message = r.fold({ "Validated profile saved" }, { it.message ?: "Invalid profile" })
+            }, modifier = Modifier.fillMaxWidth()) { Text("VALIDATE + SAVE") }
+            message?.let { Text(it, color = if (it.startsWith("Validated")) AtomosCyan else MaterialTheme.colorScheme.error, modifier = Modifier.padding(top = 8.dp)) }
+        }
+    }
+}
+
+@Composable
+private fun CompatibilityScreen(vm: AtomosViewModel) {
+    Column(Modifier.fillMaxSize()) {
+        AppHeader("Device Compatibility", "Native Phase 09 + 10", onBack = { vm.go(AtomosViewModel.Screen.HOME) })
+        LazyColumn(Modifier.fillMaxSize(), contentPadding = PaddingValues(12.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
+            items(vm.profiles, key = { it.id }) { profile ->
+                Card(Modifier.fillMaxWidth()) {
+                    Column(Modifier.padding(14.dp)) {
+                        Text(profile.displayName, fontWeight = FontWeight.Bold, fontSize = 17.sp)
+                        Text(profile.family.name, color = AtomosCyan, fontSize = 11.sp)
+                        profile.accessoryNote?.let { Text(it, color = Color.LightGray, fontSize = 11.sp, modifier = Modifier.padding(top = 4.dp)) }
+                        profile.maxRaw?.let { Text("Maximum RAW tier: $it", color = Color.Gray, fontSize = 11.sp) }
+                        Spacer(Modifier.height(8.dp))
+                        profile.capabilities.forEach { (cap, status) -> CapabilityRow(cap, status) }
+                        Text(profile.notes, color = Color.Gray, fontSize = 11.sp, modifier = Modifier.padding(top = 8.dp))
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun CapabilityRow(capability: AtomosCapability, status: CapabilityStatus) {
+    val color = when (status) {
+        CapabilityStatus.BUILT_IN -> AtomosCyan
+        CapabilityStatus.REQUIRES_ACCESSORY -> Color(0xFFFFCC66)
+        CapabilityStatus.OPTIONAL_ACTIVATION -> Color(0xFF9DB7FF)
+        CapabilityStatus.VALIDATE -> Color.Gray
+        CapabilityStatus.NOT_AVAILABLE -> Color.DarkGray
+    }
+    Row(Modifier.fillMaxWidth().padding(vertical = 1.dp)) {
+        Text(capability.name.replace('_', ' '), Modifier.weight(1f), fontSize = 11.sp)
+        Text(status.name.replace('_', ' '), color = color, fontSize = 10.sp, fontWeight = FontWeight.Bold)
+    }
+}
+
+@Composable
+private fun NetworkScreen(vm: AtomosViewModel) {
+    val status by vm.networkStatus.collectAsState()
+    val services by vm.networkServices.collectAsState()
+    val lanDevices by vm.lanDevices.collectAsState()
+    val probes by vm.networkProbeResults.collectAsState()
+    var host by remember { mutableStateOf("") }
+    var ports by remember { mutableStateOf("80,443,5960") }
+
+    DisposableEffect(Unit) {
+        vm.startNetworkDiscovery()
+        onDispose { vm.stopNetworkDiscovery() }
+    }
+
+    Column(Modifier.fillMaxSize()) {
+        AppHeader("Network Discovery", "Wi-Fi / Ethernet / NDI services", onBack = { vm.go(AtomosViewModel.Screen.HOME) })
+        LazyColumn(Modifier.fillMaxSize(), contentPadding = PaddingValues(14.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
+            item {
+                Card(Modifier.fillMaxWidth(), colors = CardDefaults.cardColors(containerColor = AtomosSurface2)) {
+                    Column(Modifier.padding(14.dp)) {
+                        Text("${status.transport} • ${if (status.connected) "CONNECTED" else "OFFLINE"}", color = AtomosCyan, fontWeight = FontWeight.Bold)
+                        Text(status.localAddresses.joinToString().ifBlank { "No local address" }, color = Color.LightGray, fontSize = 11.sp)
+                        Text(status.message, color = Color.Gray, fontSize = 10.sp)
+                        Text("Discovery combines mDNS/DNS-SD, SSDP, neighbour-cache hints and a bounded same-subnet scan. Same Wi-Fi now identifies the Shogun and launches BLE pairing from the device card. ATOMOS documents AtomRemote control over Bluetooth LE; no public LAN remote-control API was found, so SSH/port 22 is never treated as a control interface.", color = Color.Gray, fontSize = 11.sp, modifier = Modifier.padding(top = 8.dp))
+                    }
+                }
+            }
+            item {
+                OutlinedTextField(value = host, onValueChange = { host = it }, modifier = Modifier.fillMaxWidth(), label = { Text("Recorder / device IP or hostname") }, singleLine = true)
+                Spacer(Modifier.height(6.dp))
+                OutlinedTextField(value = ports, onValueChange = { ports = it }, modifier = Modifier.fillMaxWidth(), label = { Text("TCP ports") }, singleLine = true)
+                Spacer(Modifier.height(8.dp))
+                Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Button(onClick = { vm.probeNetwork(host, ports) }, modifier = Modifier.weight(1f)) { Text("PROBE HOST") }
+                    OutlinedButton(onClick = { vm.stopNetworkDiscovery(); vm.startNetworkDiscovery() }, modifier = Modifier.weight(1f)) { Text("RESCAN") }
+                }
+            }
+            item { Text("SAME-LAN DEVICES (${lanDevices.size})", color = Color.Gray, fontSize = 11.sp, fontWeight = FontWeight.Bold, modifier = Modifier.padding(top = 8.dp)) }
+            if (lanDevices.isEmpty()) {
+                item { Text("Scanning the current Wi-Fi/Ethernet LAN...", color = Color.Gray) }
+            } else {
+                items(lanDevices, key = { it.host }) { device -> LanDeviceCard(device, onProbe = { vm.probeNetwork(device.host, "80,443,554,5960,22,8000,8080") }, onPairRemote = { vm.startWifiAssistedRemote(device) }) }
+            }
+
+            if (probes.isNotEmpty()) {
+                item { Text("PORT PROBE", color = Color.Gray, fontSize = 11.sp, fontWeight = FontWeight.Bold) }
+                items(probes) { p ->
+                    Text("${p.host}:${p.port}  ${if (p.reachable) "OPEN" else "NO RESPONSE"}  ${p.latencyMs}ms", color = if (p.reachable) AtomosCyan else Color.Gray, fontSize = 11.sp)
+                }
+            }
+            item { Text("DISCOVERED SERVICES (${services.size})", color = Color.Gray, fontSize = 11.sp, fontWeight = FontWeight.Bold, modifier = Modifier.padding(top = 8.dp)) }
+            if (services.isEmpty()) {
+                item { Text("No mDNS/DNS-SD services found yet", color = Color.Gray) }
+            } else {
+                items(services, key = { it.key }) { service -> NetworkServiceCard(service) }
+            }
+        }
+    }
+}
+
+@Composable
+private fun LanDeviceCard(device: LanDeviceCandidate, onProbe: () -> Unit, onPairRemote: () -> Unit) {
+    Card(Modifier.fillMaxWidth(), colors = CardDefaults.cardColors(containerColor = if (device.likelyAtomos) AtomosSurface2 else MaterialTheme.colorScheme.surface)) {
+        Column(Modifier.padding(12.dp)) {
+            Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                Column(Modifier.weight(1f)) {
+                    Text(
+                        if (device.likelyAtomos) "ATOMOS CANDIDATE • ${device.displayName}" else device.displayName,
+                        color = if (device.likelyAtomos) AtomosCyan else Color.White,
+                        fontWeight = FontWeight.Bold
+                    )
+                    Text(device.host, color = Color.LightGray, fontSize = 11.sp)
+                    Text("Seen via ${device.sources.joinToString().ifBlank { "LAN" }}", color = Color.Gray, fontSize = 10.sp)
+                    if (device.serviceTypes.isNotEmpty()) Text(device.serviceTypes.joinToString(), color = Color.Gray, fontSize = 9.sp)
+                    if (device.openPorts.isNotEmpty()) Text("Open ports: ${device.openPorts.sorted().joinToString()}", color = Color.Gray, fontSize = 9.sp)
+                    if (device.evidence.isNotBlank()) Text(device.evidence, color = Color.Gray, fontSize = 9.sp, maxLines = 2, overflow = TextOverflow.Ellipsis)
+                }
+                Column(horizontalAlignment = Alignment.End) {
+                    if (device.likelyAtomos) TextButton(onClick = onPairRemote) { Text("PAIR REMOTE") }
+                    TextButton(onClick = onProbe) { Text("PROBE") }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun NetworkServiceCard(service: NetworkServiceCandidate) {
+    Card(Modifier.fillMaxWidth()) {
+        Column(Modifier.padding(12.dp)) {
+            Text(service.serviceName, fontWeight = FontWeight.Bold)
+            Text(service.serviceType, color = if (service.serviceType.contains("ndi", true)) AtomosCyan else Color.Gray, fontSize = 11.sp)
+            Text("${service.host ?: "unresolved"}${service.port?.let { ":$it" } ?: ""}", color = Color.LightGray, fontSize = 11.sp)
+            if (service.attributes.isNotEmpty()) Text(service.attributes.entries.joinToString { "${it.key}=${it.value}" }, color = Color.Gray, fontSize = 9.sp)
+        }
+    }
+}
+
+@Composable
+private fun MultiDeviceScreen(vm: AtomosViewModel) {
+    val saved by vm.savedAll.collectAsState()
+    val sessions by vm.multiSessions.collectAsState()
+    val protocol by vm.protocol.collectAsState()
+    val commandStatus by vm.commandStatus.collectAsState()
+    val controlReady = protocol?.canTransmit == true
+
+    Column(Modifier.fillMaxSize()) {
+        AppHeader("Multi Device", "Connect All / Gang command workspace", onBack = { vm.go(AtomosViewModel.Screen.HOME) })
+        Column(Modifier.fillMaxSize().padding(14.dp)) {
+            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                Button(onClick = { vm.connectAllSaved() }, enabled = saved.isNotEmpty(), modifier = Modifier.weight(1f)) { Text("CONNECT ALL") }
+                OutlinedButton(onClick = { vm.disconnectAllSaved() }, modifier = Modifier.weight(1f)) { Text("DISCONNECT") }
+            }
+            Spacer(Modifier.height(10.dp))
+            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                Button(onClick = { vm.multiSend("record-start") }, enabled = controlReady && sessions.isNotEmpty(), colors = ButtonDefaults.buttonColors(containerColor = AtomosRed), modifier = Modifier.weight(1f)) { Text("RECORD ALL") }
+                OutlinedButton(onClick = { vm.multiSend("record-stop") }, enabled = controlReady && sessions.isNotEmpty(), modifier = Modifier.weight(1f)) { Text("STOP ALL") }
+            }
+            if (!controlReady) Text("Record All / Stop All stays locked until a validated Atomos BLE command profile is loaded.", color = Color.Gray, fontSize = 11.sp, modifier = Modifier.padding(top = 8.dp))
+            commandStatus?.let { Text(it, color = Color.Gray, fontSize = 11.sp, modifier = Modifier.padding(top = 6.dp)) }
+            Spacer(Modifier.height(12.dp))
+            Text("SAVED RECORDERS (${saved.size})", color = Color.Gray, fontSize = 11.sp, fontWeight = FontWeight.Bold)
+            LazyColumn(Modifier.fillMaxSize(), verticalArrangement = Arrangement.spacedBy(8.dp), contentPadding = PaddingValues(top = 8.dp)) {
+                items(saved, key = { it.address }) { d ->
+                    val session = sessions.firstOrNull { it.address == d.address }
+                    Card(Modifier.fillMaxWidth()) {
+                        Column(Modifier.padding(12.dp)) {
+                            Row(Modifier.fillMaxWidth()) {
+                                Column(Modifier.weight(1f)) {
+                                    Text(d.name, fontWeight = FontWeight.Bold)
+                                    Text(d.address, color = Color.Gray, fontSize = 10.sp)
+                                }
+                                Text(session?.state?.uppercase() ?: "SAVED", color = if (session?.state?.contains("ready") == true || session?.state == "connected") AtomosCyan else Color.Gray, fontSize = 10.sp)
+                            }
+                            session?.lastAction?.let { Text("Last action: $it", color = Color.Gray, fontSize = 10.sp) }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun AirGluScreen(vm: AtomosViewModel) {
+    val saved by vm.airGluConfig.collectAsState()
+    val commandStatus by vm.commandStatus.collectAsState()
+    var role by remember(saved) { mutableStateOf(saved.role) }
+    var channelText by remember(saved) { mutableStateOf(saved.rfChannel.toString()) }
+    var group by remember(saved) { mutableStateOf(saved.groupName) }
+    var gang by remember(saved) { mutableStateOf(saved.gangRecord) }
+    var timecode by remember(saved) { mutableStateOf(saved.timecodeSource) }
+    var version by remember(saved) { mutableStateOf(saved.deviceVersion ?: "AGu2s 2.31;TFP2s 1.6;8") }
+
+    Column(Modifier.fillMaxSize()) {
+        AppHeader("AirGlu Sync", "Native Phase 13 integration boundary", onBack = { vm.go(AtomosViewModel.Screen.HOME) })
+        Column(Modifier.fillMaxSize().padding(16.dp).verticalScroll(rememberScrollState())) {
+            Card(Modifier.fillMaxWidth(), colors = CardDefaults.cardColors(containerColor = AtomosSurface2)) {
+                Column(Modifier.padding(14.dp)) {
+                    Text(if (vm.airGluNativeAvailable) "NATIVE AIRGLU READY" else "AIRGLU RF BRIDGE LOCKED", color = AtomosCyan, fontWeight = FontWeight.Bold)
+                    Text(vm.airGluImplementationName, color = Color.LightGray, fontSize = 11.sp)
+                    Text("AirGlu RF is a separate wireless control/sync transport. This screen stores workflow settings but does not transmit guessed RF packets.", color = Color.Gray, fontSize = 11.sp, modifier = Modifier.padding(top = 6.dp))
+                }
+            }
+            Spacer(Modifier.height(14.dp))
+            Text("ROLE", color = Color.Gray, fontSize = 11.sp)
+            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                FilterChip(selected = role == AirGluRole.SERVER, onClick = { role = AirGluRole.SERVER }, label = { Text("SERVER") })
+                FilterChip(selected = role == AirGluRole.CLIENT, onClick = { role = AirGluRole.CLIENT }, label = { Text("CLIENT") })
+            }
+            OutlinedTextField(value = channelText, onValueChange = { channelText = it.filter { ch -> ch.isDigit() }.take(2) }, label = { Text("RF Channel (1-12)") }, modifier = Modifier.fillMaxWidth(), singleLine = true)
+            OutlinedTextField(value = group, onValueChange = { group = it }, label = { Text("Group name") }, modifier = Modifier.fillMaxWidth(), singleLine = true)
+            OutlinedTextField(value = timecode, onValueChange = { timecode = it }, label = { Text("Timecode source") }, modifier = Modifier.fillMaxWidth(), singleLine = true)
+            OutlinedTextField(value = version, onValueChange = { version = it }, label = { Text("Recorder AirGlu version") }, modifier = Modifier.fillMaxWidth(), singleLine = true)
+            Row(Modifier.fillMaxWidth().padding(vertical = 8.dp), verticalAlignment = Alignment.CenterVertically) {
+                Text("Gang Record", Modifier.weight(1f))
+                Switch(checked = gang, onCheckedChange = { gang = it })
+            }
+            Button(onClick = {
+                vm.saveAirGlu(role, channelText.toIntOrNull() ?: 1, group, gang, timecode, version)
+            }, modifier = Modifier.fillMaxWidth()) { Text("SAVE WORKFLOW") }
+            Spacer(Modifier.height(8.dp))
+            OutlinedButton(onClick = { vm.tryApplyAirGlu() }, modifier = Modifier.fillMaxWidth()) { Text("TEST NATIVE BRIDGE") }
+            commandStatus?.let { Text(it, color = Color.Gray, fontSize = 11.sp, modifier = Modifier.padding(top = 8.dp)) }
+        }
+    }
+}
+
+@Composable
+private fun NdiPreviewScreen(vm: AtomosViewModel) {
+    val services by vm.networkServices.collectAsState()
+    val previewState by vm.ndiPreviewState.collectAsState()
+    val sources = remember(services) { NdiSourceRegistry.fromNetwork(services) }
+
+    LaunchedEffect(Unit) {
+        vm.refreshNetworkStatus()
+        vm.startNetworkDiscovery()
+    }
+    DisposableEffect(Unit) {
+        onDispose {
+            vm.stopNdi()
+            vm.stopNetworkDiscovery()
+        }
+    }
+
+    Column(Modifier.fillMaxSize()) {
+        AppHeader("NDI / Network Preview", "Native Phase 14", onBack = { vm.go(AtomosViewModel.Screen.HOME) })
+        LazyColumn(
+            Modifier.fillMaxSize(),
+            contentPadding = PaddingValues(16.dp),
+            verticalArrangement = Arrangement.spacedBy(10.dp)
+        ) {
+            item {
+                Card(Modifier.fillMaxWidth(), colors = CardDefaults.cardColors(containerColor = AtomosSurface2)) {
+                    Column(Modifier.padding(14.dp)) {
+                        Text(
+                            if (vm.ndiNativeAvailable) "NATIVE NDI BRIDGE READY" else "NDI SOURCE DISCOVERY READY",
+                            color = AtomosCyan,
+                            fontWeight = FontWeight.Bold
+                        )
+                        Text(vm.ndiImplementationName, color = Color.LightGray, fontSize = 11.sp)
+                        Text(
+                            "mDNS can discover NDI-capable sources. Actual video decoding remains locked until the native NDI SDK is linked and licensed.",
+                            color = Color.Gray,
+                            fontSize = 11.sp,
+                            modifier = Modifier.padding(top = 6.dp)
+                        )
+                    }
+                }
+            }
+            item {
+                when (val state = previewState) {
+                    NdiPreviewState.Idle -> Text("No preview source selected", color = Color.Gray, fontSize = 11.sp)
+                    is NdiPreviewState.Ready -> Text("Ready: ${state.source.name}", color = AtomosCyan, fontSize = 11.sp)
+                    is NdiPreviewState.Unavailable -> Text(state.message, color = Color.Gray, fontSize = 11.sp)
+                }
+            }
+            item {
+                Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    OutlinedButton(onClick = { vm.stopNetworkDiscovery(); vm.startNetworkDiscovery() }, modifier = Modifier.weight(1f)) { Text("RESCAN") }
+                    OutlinedButton(onClick = { vm.stopNdi() }, modifier = Modifier.weight(1f)) { Text("STOP PREVIEW") }
+                }
+            }
+            item { Text("NDI SOURCES (${sources.size})", color = Color.Gray, fontSize = 11.sp, fontWeight = FontWeight.Bold) }
+            if (sources.isEmpty()) {
+                item { Text("No _ndi._tcp. services discovered on the current network.", color = Color.Gray) }
+            } else {
+                items(sources, key = { it.key }) { source ->
+                    Card(Modifier.fillMaxWidth()) {
+                        Column(Modifier.padding(12.dp)) {
+                            Text(source.name, fontWeight = FontWeight.Bold)
+                            Text("${source.host ?: "unresolved"}${source.port?.let { ":$it" } ?: ""}", color = Color.LightGray, fontSize = 11.sp)
+                            if (source.attributes.isNotEmpty()) {
+                                Text(source.attributes.entries.joinToString { "${it.key}=${it.value}" }, color = Color.Gray, fontSize = 9.sp)
+                            }
+                            Spacer(Modifier.height(8.dp))
+                            Button(onClick = { vm.prepareNdi(source) }, enabled = source.resolved, modifier = Modifier.fillMaxWidth()) {
+                                Text(if (vm.ndiNativeAvailable) "OPEN PREVIEW" else "PREPARE SOURCE")
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun PresetsScreen(vm: AtomosViewModel) {
+    val presets by vm.presets.collectAsState()
+    val protocol by vm.protocol.collectAsState()
+    val commandStatus by vm.commandStatus.collectAsState()
+    var name by remember { mutableStateOf("") }
+    var commands by remember { mutableStateOf("") }
+    var note by remember { mutableStateOf("") }
+    val availableKeys = protocol?.commands?.availableKeys().orEmpty().sorted()
+
+    Column(Modifier.fillMaxSize()) {
+        AppHeader("Recorder Presets", "Native Phase 14 advanced control", onBack = { vm.go(AtomosViewModel.Screen.HOME) })
+        LazyColumn(
+            Modifier.fillMaxSize(),
+            contentPadding = PaddingValues(16.dp),
+            verticalArrangement = Arrangement.spacedBy(10.dp)
+        ) {
+            item {
+                Card(Modifier.fillMaxWidth(), colors = CardDefaults.cardColors(containerColor = AtomosSurface2)) {
+                    Column(Modifier.padding(14.dp)) {
+                        Text("VALIDATED COMMAND PRESETS", color = AtomosCyan, fontWeight = FontWeight.Bold)
+                        Text(
+                            "A preset is only a sequence of command keys. The app transmits a step only when that key has a validated payload in the active protocol profile.",
+                            color = Color.Gray,
+                            fontSize = 11.sp
+                        )
+                        Text(
+                            "Available now: ${availableKeys.joinToString().ifBlank { "none" }}",
+                            color = Color.LightGray,
+                            fontSize = 10.sp,
+                            modifier = Modifier.padding(top = 6.dp)
+                        )
+                    }
+                }
+            }
+            item {
+                OutlinedTextField(name, { name = it }, label = { Text("Preset name") }, modifier = Modifier.fillMaxWidth(), singleLine = true)
+                Spacer(Modifier.height(6.dp))
+                OutlinedTextField(
+                    commands,
+                    { commands = it },
+                    label = { Text("Command keys, comma separated") },
+                    modifier = Modifier.fillMaxWidth(),
+                    supportingText = { Text("Example: waveform-on,peaking-on or validated custom keys from extraCommands") }
+                )
+                Spacer(Modifier.height(6.dp))
+                OutlinedTextField(note, { note = it }, label = { Text("Note") }, modifier = Modifier.fillMaxWidth())
+                Spacer(Modifier.height(8.dp))
+                Button(onClick = {
+                    vm.createPreset(name, commands, note)
+                    name = ""; commands = ""; note = ""
+                }, modifier = Modifier.fillMaxWidth()) { Text("SAVE PRESET") }
+            }
+            commandStatus?.let { status -> item { Text(status, color = Color.Gray, fontSize = 11.sp) } }
+            item { Text("PRESETS (${presets.size})", color = Color.Gray, fontSize = 11.sp, fontWeight = FontWeight.Bold) }
+            items(presets, key = { it.id }) { preset ->
+                Card(Modifier.fillMaxWidth()) {
+                    Column(Modifier.padding(12.dp)) {
+                        Text(preset.name, fontWeight = FontWeight.Bold)
+                        Text(preset.commandKeys.joinToString().ifBlank { "No commands" }, color = Color.LightGray, fontSize = 10.sp)
+                        if (preset.note.isNotBlank()) Text(preset.note, color = Color.Gray, fontSize = 10.sp)
+                        Row(Modifier.fillMaxWidth().padding(top = 8.dp), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                            Button(onClick = { vm.applyPreset(preset) }, enabled = protocol?.canTransmit == true, modifier = Modifier.weight(1f)) { Text("APPLY") }
+                            OutlinedButton(onClick = { vm.removePreset(preset.id) }, modifier = Modifier.weight(1f)) { Text("REMOVE") }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun CaptureScreen(vm: AtomosViewModel) {
+    val context = LocalContext.current
+    val snapshot by vm.gattSnapshot.collectAsState()
+    val events by vm.gattEvents.collectAsState()
+    var message by remember { mutableStateOf<String?>(null) }
+
+    Column(Modifier.fillMaxSize()) {
+        AppHeader("Protocol Capture", "GATT capture + export", onBack = { vm.go(AtomosViewModel.Screen.HOME) })
+        Column(Modifier.fillMaxSize().padding(16.dp).verticalScroll(rememberScrollState())) {
+            Card(Modifier.fillMaxWidth(), colors = CardDefaults.cardColors(containerColor = AtomosSurface2)) {
+                Column(Modifier.padding(14.dp)) {
+                    Text("SAFE CAPTURE MODE", color = AtomosCyan, fontWeight = FontWeight.Bold)
+                    Text("Exports discovered services/characteristics and recent read/notify events. It does not generate or transmit guessed Atomos command packets.", color = Color.Gray, fontSize = 11.sp)
+                }
+            }
+            Spacer(Modifier.height(14.dp))
+            StatusCard("DEVICE", snapshot?.deviceAddress ?: "Not connected", Modifier.fillMaxWidth())
+            Spacer(Modifier.height(8.dp))
+            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                StatusCard("GATT", "${snapshot?.characteristics?.size ?: 0} chars", Modifier.weight(1f))
+                StatusCard("EVENTS", events.size.toString(), Modifier.weight(1f))
+            }
+            Spacer(Modifier.height(14.dp))
+            Button(
+                onClick = {
+                    vm.exportProtocolCapture().fold(
+                        onSuccess = { result ->
+                            message = "Exported: ${result.summary}"
+                            val share = Intent(Intent.ACTION_SEND).apply {
+                                type = "application/json"
+                                putExtra(Intent.EXTRA_STREAM, result.uri)
+                                addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                            }
+                            context.startActivity(Intent.createChooser(share, "Share ATOMOS GATT capture"))
+                        },
+                        onFailure = { message = it.message ?: "Capture export failed" }
+                    )
+                },
+                enabled = snapshot != null,
+                modifier = Modifier.fillMaxWidth()
+            ) { Text("EXPORT + SHARE JSON") }
+            Spacer(Modifier.height(8.dp))
+            OutlinedButton(onClick = { vm.go(AtomosViewModel.Screen.GATT) }, modifier = Modifier.fillMaxWidth()) { Text("OPEN GATT INSPECTOR") }
+            message?.let { Text(it, color = Color.Gray, fontSize = 11.sp, modifier = Modifier.padding(top = 10.dp)) }
+        }
+    }
+}
+
+@Composable
+private fun FinalQaScreen(vm: AtomosViewModel) {
+    val report by vm.qaReport.collectAsState()
+    LaunchedEffect(Unit) { vm.runFinalQa() }
+
+    Column(Modifier.fillMaxSize()) {
+        AppHeader("Final QA", "Native Phase 15 release readiness", onBack = { vm.go(AtomosViewModel.Screen.HOME) })
+        LazyColumn(
+            Modifier.fillMaxSize(),
+            contentPadding = PaddingValues(16.dp),
+            verticalArrangement = Arrangement.spacedBy(8.dp)
+        ) {
+            item {
+                Card(Modifier.fillMaxWidth(), colors = CardDefaults.cardColors(containerColor = AtomosSurface2)) {
+                    Column(Modifier.padding(14.dp)) {
+                        Text("RELEASE READINESS", color = AtomosCyan, fontWeight = FontWeight.Bold)
+                        Text(
+                            report?.let { "${it.passed}/${it.total} checks passing • ${it.blockers} blocker(s)" } ?: "Running checks...",
+                            color = Color.LightGray,
+                            fontSize = 12.sp
+                        )
+                    }
+                }
+            }
+            item { OutlinedButton(onClick = { vm.runFinalQa() }, modifier = Modifier.fillMaxWidth()) { Text("RUN QA AGAIN") } }
+            items(report?.checks.orEmpty(), key = { it.id }) { check ->
+                Card(Modifier.fillMaxWidth()) {
+                    Row(Modifier.fillMaxWidth().padding(12.dp), verticalAlignment = Alignment.Top) {
+                        Text(if (check.passed) "PASS" else if (check.blocking) "BLOCK" else "INFO", color = if (check.passed) AtomosCyan else if (check.blocking) AtomosRed else Color.Gray, fontSize = 10.sp, fontWeight = FontWeight.Bold, modifier = Modifier.width(48.dp))
+                        Column(Modifier.weight(1f)) {
+                            Text(check.label, fontWeight = FontWeight.Bold)
+                            Text(check.detail, color = Color.Gray, fontSize = 10.sp)
+                        }
+                    }
+                }
+            }
+            item {
+                Text(
+                    "A passing application QA does not unlock proprietary recorder commands. Record/monitor writes still require an explicitly validated Atomos protocol profile.",
+                    color = Color.Gray,
+                    fontSize = 10.sp,
+                    modifier = Modifier.padding(top = 8.dp)
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun AdvancedControlsScreen(vm: AtomosViewModel) {
+    val protocol by vm.protocol.collectAsState()
+    val commandStatus by vm.commandStatus.collectAsState()
+    val available = protocol?.commands?.availableKeys().orEmpty()
+    val sections = AdvancedControlCatalog.actions.groupBy { it.section }
+
+    Column(Modifier.fillMaxSize()) {
+        AppHeader("Advanced Recorder", "Validated AtomRemote-style controls", onBack = { vm.go(AtomosViewModel.Screen.REMOTE) })
+        LazyColumn(
+            Modifier.fillMaxSize(),
+            contentPadding = PaddingValues(16.dp),
+            verticalArrangement = Arrangement.spacedBy(8.dp)
+        ) {
+            item {
+                Card(Modifier.fillMaxWidth(), colors = CardDefaults.cardColors(containerColor = AtomosSurface2)) {
+                    Column(Modifier.padding(14.dp)) {
+                        Text("PROFILE-GATED CONTROL", color = AtomosCyan, fontWeight = FontWeight.Bold)
+                        Text(
+                            "Buttons are enabled only when the active validated protocol profile contains the matching command key in extraCommands.",
+                            color = Color.Gray,
+                            fontSize = 11.sp
+                        )
+                    }
+                }
+            }
+            sections.forEach { (section, actions) ->
+                item { Text(section, color = Color.Gray, fontSize = 11.sp, fontWeight = FontWeight.Bold, modifier = Modifier.padding(top = 8.dp)) }
+                items(actions, key = { it.commandKey }) { action ->
+                    Card(Modifier.fillMaxWidth()) {
+                        Row(Modifier.fillMaxWidth().padding(12.dp), verticalAlignment = Alignment.CenterVertically) {
+                            Column(Modifier.weight(1f)) {
+                                Text(action.label, fontWeight = FontWeight.Bold)
+                                Text(action.description, color = Color.Gray, fontSize = 10.sp)
+                                Text(action.commandKey, color = Color.DarkGray, fontSize = 9.sp)
+                            }
+                            Button(
+                                onClick = { vm.send(action.commandKey) },
+                                enabled = protocol?.canTransmit == true && available.contains(action.commandKey)
+                            ) { Text("SET") }
+                        }
+                    }
+                }
+            }
+            commandStatus?.let { item { Text(it, color = Color.Gray, fontSize = 11.sp) } }
+        }
+    }
+}
