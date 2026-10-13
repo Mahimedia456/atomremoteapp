@@ -1,0 +1,17 @@
+{
+  "app_name": "Atom Remote",
+  "updated_in_this_version": [
+    "branding/logo",
+    "branding/wordmark",
+    "branding/splash",
+    "branding/app_assets/expo",
+    "branding/app_assets/android_launcher",
+    "branding/app_assets/android_adaptive",
+    "branding/app_assets/ios_appiconset"
+  ],
+  "preserved_as_is": [
+    "ui/screens",
+    "icons/core",
+    "icons/extra"
+  ]
+}

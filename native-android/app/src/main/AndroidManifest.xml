@@ -8,19 +8,24 @@
     <uses-permission android:name="android.permission.BLUETOOTH_SCAN" />
     <uses-permission android:name="android.permission.BLUETOOTH_CONNECT" />
     <uses-permission android:name="android.permission.BLUETOOTH_ADVERTISE" />
+    <!-- Android 8/9 and some OEM scanners check a location permission. -->
+    <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION" />
+    <!-- Keep fine location declared on 12+ without neverForLocation, so
+         platform beacon filtering does not reduce broad recorder discovery. -->
     <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />
 
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
     <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
     <uses-permission android:name="android.permission.CHANGE_WIFI_MULTICAST_STATE" />
-
+    <uses-permission android:name="android.permission.ACCESS_LOCAL_NETWORK" />
     <application
         android:allowBackup="true"
-        android:icon="@drawable/atomos_logo"
-        android:label="ATOMOS Remote Backend"
+        android:icon="@mipmap/ic_launcher"
+        android:roundIcon="@mipmap/ic_launcher_round"
+        android:label="Remote"
         android:supportsRtl="true"
-        android:theme="@style/Theme.AtomosRemote"
+        android:theme="@style/Theme.AtomosRemote.Starting"
         android:usesCleartextTraffic="true">
         <activity
             android:name=".MainActivity"
@@ -41,5 +46,10 @@
                 android:name="android.support.FILE_PROVIDER_PATHS"
                 android:resource="@xml/file_paths" />
         </provider>
+            <activity android:name="com.atomosremote.nativeapp.ndi06.Ndi06LabActivity" android:exported="true" android:label="NDI Lab (Diagnostic)" />
     </application>
 </manifest>
+
+
+
+

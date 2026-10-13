@@ -245,35 +245,6 @@ class GattClient(context: Context) {
     // confirmation. This mirror changes only from CodecProfileGet readback.
     private val _codecHardwareProfile = MutableStateFlow<Pair<Int, Int>?>(null)
     val codecHardwareProfile: StateFlow<Pair<Int, Int>?> = _codecHardwareProfile
-    // R16.2 recorder-authoritative codec capabilities. The fresh macOS Record
-    // controller asks CodecProfileListGet (0x013D) for the selected bit-depth
-    // and AppPolling RecordPage also carries codec_list / codec_bitdepth_list.
-    private val _codecSupportedProfiles = MutableStateFlow<List<Int>>(emptyList())
-    val codecSupportedProfiles: StateFlow<List<Int>> = _codecSupportedProfiles
-    private val _codecSupportedBitDepths = MutableStateFlow<List<Int>>(emptyList())
-    val codecSupportedBitDepths: StateFlow<List<Int>> = _codecSupportedBitDepths
-    private var codecPageWireFromSummary: Int? = null
-    private var codecPageBitDepth: Int? = null
-
-    // R16.3 codec-current state machine. The fresh macOS binary shows that
-    // CodecProfileGet(0x013A) is a tuple verifier, not a parameterless
-    // "what codec are you using now?" getter. Recorder-authoritative current
-    // state is assembled from AppPolling InputOutputSummaryGet (0x0648, codec)
-    // plus RecordPageGet (0x0643, codecBitdepth). Keep this isolated from the
-    // frozen MAC13 bootstrap and from all non-codec paths.
-    private var codecCurrentSyncGeneration = 0
-    private var codecCurrentSyncStage = 0 // 0 idle, 1 summary, 2 record page
-    private var codecCurrentSyncSource: String? = null
-    private var codecCurrentSyncExpected: Pair<Int, Int>? = null
-    private var codecCurrentSyncBusyRetries = 0
-    private var codecCurrentSyncPageRetries = 0
-    private var codecCurrentSyncTimeout: Runnable? = null
-    // R16.8 macOS-style current-state drain. CommandManager sends RecordPage and
-    // InputOutputSummary as independent non-local commands and does not wait for
-    // an E0 transport turn to become the semantic response. Keep page receipt
-    // state separately and finish only after both typed state pages arrive.
-    private var codecCurrentSawRecordPage = false
-    private var codecCurrentSawSummary = false
 
 
     // Phase 09 Input / Format is deliberately read-only. The macOS app polls
@@ -297,6 +268,28 @@ class GattClient(context: Context) {
     val outputHdrTypeId: StateFlow<Int?> = _outputHdrTypeId
     private val _outputGamutId = MutableStateFlow<Int?>(null)
     val outputGamutId: StateFlow<Int?> = _outputGamutId
+
+    // OUTPUT R17: these values are NULL until independently correlated,
+    // local-route, typed recorder GET responses are observed.
+    private val _outputDownscaleRawId = MutableStateFlow<Int?>(null)
+    val outputDownscaleRawId: StateFlow<Int?> = _outputDownscaleRawId
+    // OUTPUT R19: strictly typed raw page, NOT interpreted as Output settings.
+    // Null until recorder actually returns AppPolling.OutputPageGet.
+    private val _outputPageRawR19 = MutableStateFlow<String?>(null)
+    val outputPageRawR19: StateFlow<String?> = _outputPageRawR19
+    // R23 increments on EACH fully typed OutputPage response, even if
+    // the same 54-byte payload repeats after refresh.
+    private val _outputPageRxGenerationR23 = MutableStateFlow(0)
+    val outputPageRxGenerationR23: StateFlow<Int> = _outputPageRxGenerationR23
+    private val _outputDciCropRawId = MutableStateFlow<Int?>(null)
+    val outputDciCropRawId: StateFlow<Int?> = _outputDciCropRawId
+    private val _outputHdmiTimecodeEnabled = MutableStateFlow<Boolean?>(null)
+    val outputHdmiTimecodeEnabled: StateFlow<Boolean?> = _outputHdmiTimecodeEnabled
+
+    // OUTPUT06: Hardware-only HDR Out state. Null means unverified/unsupported.
+    // Never substitute the macOS UI's default Rec.709/Off for an AG2 readback.
+    private val _outputHdrEnabled = MutableStateFlow<Boolean?>(null)
+    val outputHdrEnabled: StateFlow<Boolean?> = _outputHdrEnabled
     private val _inputOutputRawHex = MutableStateFlow<String?>(null)
     val inputOutputRawHex: StateFlow<String?> = _inputOutputRawHex
 
@@ -333,6 +326,8 @@ class GattClient(context: Context) {
     private var inputCollectorGeneration = 0
     private var inputCollectorRunning = false
     private var inputCollectorRefreshPending = false
+    // INPUT05C.2: guarded Source GET-only readback, reuses existing collector parser.
+    private var inputSourceOnlyReadback = false
     // AGENT7 20.03.4.2 POST-READY AUTO INPUT
     // One automatic Input 3/3 collector is allowed after each successful
     // macOS-parity Remote bootstrap reaches its real LINKED settle point.
@@ -359,9 +354,6 @@ class GattClient(context: Context) {
     private var pendingCodecReadbackExpected: Pair<Int, Int>? = null
     private var pendingCodecReadbackSource: String? = null
     private var codecReadbackTimeout: Runnable? = null
-    private var codecCapabilityReadbackBitDepth: Int? = null
-    private var frameGuideExpectedFormat: Int? = null
-    private var frameGuideReadbackGeneration: Int = 0
 
 
     // 19.12.9 full connected-state backbone. Official AtomRemote exposes the
@@ -375,6 +367,8 @@ class GattClient(context: Context) {
     // AtomMessage payload arrives, otherwise valid page data is seen but the
     // UI remains STATE 0/10.
     private val stateSyncPacketToPage = mutableMapOf<Int, Int>()
+    // INPUT06A BOOTSTRAP RX: exact request packet correlation, cleared on disconnect.
+    private val input06aBootstrapPending = mutableMapOf<Int, Pair<Int, String>>()
     // 19.12.10.2: binary-confirmed macOS AppPolling parity.
     // AppPolling AtomMessage objects finish with m_isLocal=false. CommandManager packet IDs
     // are retained as a sequence so this test covers the exact combination not yet tested.
@@ -410,6 +404,9 @@ class GattClient(context: Context) {
         val mode: Int
     )
     private var pendingFrameGridSet: PendingFrameGridSet? = null
+    // R16.2 Frame Guide readback target. Restored from the previously proven implementation.
+    private var frameGuideExpectedFormat: Int? = null
+    private var frameGuideReadbackGeneration: Int = 0
 
     // Legacy mirrors retained for UI/debug compatibility. 18.8 transport truth is
     // TcsPacketLinkTransport below. Official DidConnect starts first=1/credit=0,
@@ -526,6 +523,12 @@ class GattClient(context: Context) {
     // 18.8: direct port of the official macOS TCSPacketLink READY/WRITING/READING
     // state machine. Pairing remains completely separate from this transport.
     private val packetLink18 = TcsPacketLinkTransport()
+    // OUTPUT R21: BLE MTU is a connection-scoped ATT capability, not an
+    // AtomRemote pairing/PacketLink command. The negotiated value is used
+    // only to assess whether a full 0x8644 page can physically fit in one read.
+    private var outputR21MtuRequested = false
+    private var outputR21MtuBytes = 23  // default ATT MTU until callback proves otherwise
+    private var outputR21MtuResult = "not-requested"
     // TCS19.12.17.10 LOW LEVEL PLINK EPOCH GUARD
     // One low-level PacketLink DidConnect is allowed per actual GATT connection.
     // Reset only when Android reports a new GATT connected epoch.
@@ -540,6 +543,9 @@ class GattClient(context: Context) {
     private var address: String = ""
 
     private sealed interface PendingOp {
+        // R21: serialized with existing ATT ops. Never request MTU while a
+        // PacketLink read/write or TCS pairing transaction is in flight.
+        data class OutputR21Mtu(val mtu: Int = 185) : PendingOp
         data class Read(
             val characteristic: BluetoothGattCharacteristic,
             val purpose: String? = null
@@ -569,6 +575,12 @@ class GattClient(context: Context) {
 
     @SuppressLint("MissingPermission")
     fun connect(device: BluetoothDevice) {
+        outputR21MtuRequested = false
+        outputR21MtuBytes = 23
+        outputR21MtuResult = "not-requested"
+        audioR26RunId += 1
+        audioR26Active = null
+        _audioR26Live.value = com.atomosremote.nativeapp.audio.AudioR26LiveSnapshot()
         targetDevice = device
         address = device.address
         retryCount = 0
@@ -611,6 +623,18 @@ class GattClient(context: Context) {
         _monitorGuideState.value = MonitorGuideState()
         _monitorAnamorphicState.value = MonitorAnamorphicState()
         _monitorLutState.value = MonitorLutState()
+        _outputHdrEnabled.value = null
+        _outputHdrTypeId.value = null // R13: never show a previous recorder's cached Output value
+        _outputGamutId.value = null
+        _outputDownscaleRawId.value = null
+        _outputDciCropRawId.value = null
+        _outputHdmiTimecodeEnabled.value = null
+        outputR17ProbeKind = null
+        outputR17ProbeExpiresAt = 0L
+        outputR17ProbeExpectedResponse = -1
+        outputR13ProbeKind = null
+        outputR13ProbeExpiresAt = 0L
+        outputR13ProbeExpectedResponse = -1
         _monitorDisplayState.value = MonitorDisplayState()
         lutRefreshStage = 0
         lutExpectedSlot = null
@@ -807,6 +831,7 @@ class GattClient(context: Context) {
         cancelConnectionTimeout()
         cancelRemoteResponseTimeout()
         cancelRemoteBootstrapSettle()
+        cancelWl32NetworkReadback()
         cancelConnectedSyncTimeout()
         connectedLifecycleArmed = false
         connectedFrameCountCccdReady = false
@@ -820,6 +845,9 @@ class GattClient(context: Context) {
         stopPacketLinkProcessLoop()
         pendingRemotePacket = null
         pendingRemoteFrameWritten = false
+        audioR26RunId += 1
+        audioR26Active = null
+        _audioR26Live.value = com.atomosremote.nativeapp.audio.AudioR26LiveSnapshot()
         activeOp = null
         operationInFlight = false
         val current = gatt
@@ -1437,6 +1465,18 @@ class GattClient(context: Context) {
                 !operationInFlight
 
             if (idle) {
+                // INPUT06C: MAC13 typed values are the source of truth. Do not duplicate
+                // a fully populated bootstrap snapshot with a second collector.
+                val confirmedKeys = listOf("source", "hdrState", "deviceName")
+                if (confirmedKeys.all { key ->
+                        inputCollectorValues[key]?.let { it.isNotBlank() &&
+                            !it.startsWith("NO_RESPONSE") && !it.startsWith("REJECT") } == true
+                    }) {
+                    postReadyInputAutoTriggered = true
+                    appendEvent("INPUT06C PRIMED REUSE confirmed=3/3; no duplicate GET")
+                    publishInputCodecCollector(running = false, source = "input06c-bootstrap-ready")
+                    return@Runnable
+                }
                 postReadyInputAutoTriggered = true
                 appendEvent("TCS20.03.4.3 PRIMED INPUT FALLBACK fire checks=$checks")
                 val started = refreshGranularInputState()
@@ -2838,9 +2878,9 @@ class GattClient(context: Context) {
         pendingRemoteFrameWritten = false
         appendEvent(
             "TCS20.05 FOCUS GET label=$label cmd=0x${commandId.toString(16)} " +
-                "expected=0x${expectedResponse.toString(16)} packetId=CommandManager m_isLocal=1"
+                "expected=0x${expectedResponse.toString(16)} packetId=0 m_isLocal=1"
         )
-        return queueRemotePacket18_8(packet, local = true)
+        return queueRemotePacket18_8(packet, local = false)
     }
 
     private fun focusTypeLabel(type: Int): String = when (type) {
@@ -3014,7 +3054,7 @@ class GattClient(context: Context) {
         // 20.04.9 exact macOS parity:
         // ZoomLevelListGet, ZoomLevelGet and ZoomBoxGet constructors in the
         // uploaded ATOMOS Remote binary all call AtomMessage(baseLocal = true).
-        // Match existing local RemoteApi one-shot framing with packetId=CommandManager.
+        // Match existing local RemoteApi one-shot framing with packetId=0.
         val packetId = 0
         val body = buildOfficialAtomMessageBody(packetId, commandId)
         val packet = PendingRemotePacket(
@@ -3033,7 +3073,7 @@ class GattClient(context: Context) {
         )
         appendEvent(
             "TCS20.04.9 ZOOM GET MAC-PARITY label=$label cmd=0x${commandId.toString(16)} " +
-                "expected=0x${expectedResponseId.toString(16)} packetId=$packetId m_isLocal=1"
+                "expected=0x${expectedResponseId.toString(16)} packetId=$packetId m_isLocal=0"
         )
         return queueRemotePacket18_8(packet, local = true)
     }
@@ -3282,7 +3322,7 @@ class GattClient(context: Context) {
             }
 
             val queued = if (key == "source" || key == "hdrState") {
-                refreshGranularInputState()
+                refreshGranularInputState(sourceOnly = key == "source")
             } else {
                 refreshExtendedInputState()
             }
@@ -3407,7 +3447,7 @@ class GattClient(context: Context) {
             )
         ) {
             appendEvent(
-                "TCS20.03.6.10 EXT INPUT blocked real-owner " +
+                "INPUT22 EXTENDED WAIT REAL OWNER " +
                     "coreInput=$inputCollectorRunning bootstrap=$remoteBootstrapActive " +
                     "pending=${pendingRemotePacket?.label}"
             )
@@ -3557,7 +3597,7 @@ class GattClient(context: Context) {
             inputExtendedVariant = 1
             inputExtendedActive = null
             publishExtendedInput(true, false, "Reading Input details...")
-            mainHandler.postDelayed({ queueExtendedInputProbe() }, 180L)
+            mainHandler.postDelayed({ queueExtendedInputProbe() }, 25L)
         }
         inputExtendedTimeout = task
         mainHandler.postDelayed(task, 1600L)
@@ -3586,7 +3626,7 @@ class GattClient(context: Context) {
             inputExtendedVariant = 1
             inputExtendedActive = null
             publishExtendedInput(true, false, "Reading Input details...")
-            mainHandler.postDelayed({ queueExtendedInputProbe() }, 180L)
+            mainHandler.postDelayed({ queueExtendedInputProbe() }, 25L)
             return true
         }
 
@@ -3613,11 +3653,11 @@ class GattClient(context: Context) {
         inputExtendedVariant = 1
         inputExtendedActive = null
         publishExtendedInput(true, false, "Reading Input details...")
-        mainHandler.postDelayed({ queueExtendedInputProbe() }, 180L)
+        mainHandler.postDelayed({ queueExtendedInputProbe() }, 25L)
         return true
     }
 
-    fun refreshGranularInputState(): Boolean {
+    fun refreshGranularInputState(sourceOnly: Boolean = false): Boolean {
         if (!_tcsPairingState.value.acceptWritten || !_tcsRemoteState.value.available || !packetLink18Primed) {
             appendEvent("TCS19.12.10 COLLECTOR BLOCKED accept=${_tcsPairingState.value.acceptWritten} available=${_tcsRemoteState.value.available} primed=$packetLink18Primed")
             return false
@@ -3649,25 +3689,28 @@ class GattClient(context: Context) {
                     }
 
                     readyGateChecks += 1
+                    // INPUT23: E0 credit/read heartbeat may keep ATT activity non-idle.
+                    // Arm core ownership after the REAL RemoteApi/bootstrap owner has
+                    // finished; queueCurrentInputProbe() still serializes every GATT
+                    // operation and waits for an actual free transmission slot.
                     val packetLinkReadyForInput =
+                        packetLink18Primed &&
                         !remoteBootstrapActive &&
-                        pendingRemotePacket == null &&
-                        pendingOps.isEmpty() &&
-                        !operationInFlight
+                        pendingRemotePacket == null
 
                     if (packetLinkReadyForInput) {
                         inputCollectorRefreshPending = false
                         appendEvent(
-                            "TCS20.03.4.1 INPUT READY-GATE open checks=$readyGateChecks"
+                            "INPUT23 CORE ARMED after bootstrap checks=$readyGateChecks attBusy=$operationInFlight attQueue=${pendingOps.size}"
                         )
-                        refreshGranularInputState()
-                    } else if (readyGateChecks < 40) {
+                        refreshGranularInputState(sourceOnly = sourceOnly)
+                    } else if (readyGateChecks < 400) {
                         appendEvent(
-                            "TCS20.03.4.1 INPUT READY-GATE wait checks=$readyGateChecks " +
+                            "INPUT22 CORE READY-GATE wait checks=$readyGateChecks " +
                                 "bootstrap=$remoteBootstrapActive pending=${pendingRemotePacket?.label} " +
                                 "attBusy=$operationInFlight queue=${pendingOps.size}"
                         )
-                        mainHandler.postDelayed(readyGateRunnable, 300L)
+                        mainHandler.postDelayed(readyGateRunnable, 50L)
                     } else {
                         inputCollectorRefreshPending = false
                         appendEvent(
@@ -3677,7 +3720,7 @@ class GattClient(context: Context) {
                         )
                     }
                 }
-                mainHandler.postDelayed(readyGateRunnable, 300L)
+                mainHandler.postDelayed(readyGateRunnable, 50L)
             } else {
                 appendEvent(
                     "TCS20.03.4.1 INPUT READY-GATE already-armed " +
@@ -3694,6 +3737,8 @@ class GattClient(context: Context) {
             )
         }
         inputCollectorRefreshPending = false
+        inputSourceOnlyReadback = sourceOnly
+        if (sourceOnly) appendEvent("INPUT05C.2 SOURCE-ONLY GET starting with verified existing route/parser")
         inputCollectorGeneration += 1
         appendEvent("TCS20.12.3 INPUT REFRESH RETAIN previousValues=${inputCollectorValues.size}")
         inputProbeIndex = 0
@@ -3712,17 +3757,32 @@ class GattClient(context: Context) {
     @SuppressLint("MissingPermission")
     private fun queueCurrentInputProbe(): Boolean {
         if (!inputCollectorRunning) return false
-        if (inputProbeIndex >= inputGranularProbePlan.size) {
+        if (inputProbeIndex >= (if (inputSourceOnlyReadback) 1 else inputGranularProbePlan.size)) {
             finishInputCollector()
             return true
         }
         if (pendingRemotePacket != null || operationInFlight || pendingOps.isNotEmpty()) {
-            mainHandler.postDelayed({ queueCurrentInputProbe() }, 120L)
+            // INPUT23: do not add 120ms per probe just to revisit a busy ATT slot.
+            // No concurrent write is issued: the same owner checks remain mandatory.
+            mainHandler.postDelayed({ queueCurrentInputProbe() }, 25L)
             return true
         }
 
-        val probe = inputGranularProbePlan[inputProbeIndex]
-        val requestVariant = inputProbeVariant
+        val probe = if (inputSourceOnlyReadback) {
+            inputGranularProbePlan.first { it.key == "source" }
+        } else {
+            inputGranularProbePlan[inputProbeIndex]
+        }
+        // INPUT16: Latest AG2 hardware trace confirmed local+empty route 2
+        // for Source, HDR and Device Name. inputProbeVariant remains the
+        // ATTEMPT index (0..3) so all timeout/reject fallbacks stay intact.
+        // On those three keys try actual route 2, then 0, 1, 3.
+        // Other Input probes retain the original routing sequence.
+        val input16Core = probe.key == "source" || probe.key == "hdrState" || probe.key == "deviceName"
+        val requestVariant = if (input16Core) intArrayOf(2, 0, 1, 3)[inputProbeVariant] else inputProbeVariant
+        if (input16Core) {
+            appendEvent("INPUT16 CORE ROUTE attempt=$inputProbeVariant wireVariant=$requestVariant key=${probe.key}")
+        }
         val localRoute = requestVariant >= 2
         val protoTrue = requestVariant == 1 || requestVariant == 3
 
@@ -3779,7 +3839,9 @@ class GattClient(context: Context) {
             return true
         }
 
-        armInputProbeSemanticTimeout(probe, requestVariant)
+        // INPUT06F: start semantic timeout only after real PacketLink delivery,
+        // not when this read-only GET is merely queued behind other requests.
+        appendEvent("INPUT06F GET QUEUED key=${probe.key} route=$requestVariant awaiting-transport")
         return true
     }
 
@@ -3792,7 +3854,7 @@ class GattClient(context: Context) {
             appendEvent(
                 "TCS19.12.19 INPUT ROUTE TIMEOUT label=${probe.label} " +
                     "cmd=0x${probe.commandId.toString(16).uppercase()} " +
-                    "expected=0x${probe.expectedResponseId.toString(16).uppercase()} variant=$variant"
+                    "expected=0x${probe.expectedResponseId.toString(16).uppercase()} route=$variant"
             )
 
             if (variant < 3) {
@@ -3822,7 +3884,41 @@ class GattClient(context: Context) {
         }
 
         inputProbeTimeout = task
-        mainHandler.postDelayed(task, INPUT_GRANULAR_RESPONSE_TIMEOUT_MS)
+        // Allow the serialized ATT queue time to drain before treating a
+        // missing typed RemoteApi reply as a failed route. E0 is only transport ACK.
+        mainHandler.postDelayed(task, 1800L)
+    }
+
+    // INPUT06A BOOTSTRAP RX: passive state reuse; no extra commands and no guessed state.
+    // Accept only a typed reply matching the command, packet ID, and expected response type.
+    private fun input06aCaptureBootstrapResponse(packetId: Int, messageType: Int, body: ByteArray) {
+        val expected = input06aBootstrapPending[packetId] ?: return
+        if ((messageType and 0x7FFF) != expected.first || body.isEmpty()) return
+        input06aBootstrapPending.remove(packetId)
+        val field = protoVarintField(body, 1)
+        val printable = printableProtoText(body)
+        val key = when (expected.second) {
+            "Input.SourceGet" -> "source"
+            "Input.HdrStateGet" -> "hdrState"
+            "Input.DeviceNameGet" -> "deviceName"
+            else -> return
+        }
+        // Only actual recorder responses. Never count requests, E0 transport turns or cache guesses.
+        val description = buildString {
+            append("bootstrap type 0x")
+            append((messageType and 0x7FFF).toString(16).uppercase())
+            if (field != null) append(" ID $field")
+            if (!printable.isNullOrBlank()) append(" ").append(printable.take(72))
+            append(" raw ").append(body.toHex())
+        }
+        inputCollectorValues[key] = description
+        when (key) {
+            "source" -> if (field != null) _inputFormatInfo.value = "Input Source ID $field"
+            "hdrState" -> if (field != null) _inputGammaId.value = field
+            "deviceName" -> if (!printable.isNullOrBlank()) _connectedRecorderName.value = printable.take(64)
+        }
+        appendEvent("INPUT06A BOOTSTRAP RX key=$key packetId=$packetId response=0x${messageType.toString(16).uppercase()} bytes=${body.size}")
+        publishInputCodecCollector(running = inputCollectorRunning, source = "bootstrap-typed-$key")
     }
 
     private fun handleInputGranularPayload(messageType: Int, body: ByteArray, local: Boolean): Boolean {
@@ -3883,17 +3979,17 @@ class GattClient(context: Context) {
             append(messageType.toString(16).uppercase())
 
             if (value != null) {
-                append(" Ã‚Â· ID ")
+                append(" Ãƒâ€šÃ‚Â· ID ")
                 append(value)
             }
 
             if (!printable.isNullOrBlank()) {
-                append(" Ã‚Â· ")
+                append(" Ãƒâ€šÃ‚Â· ")
                 append(printable.take(72))
             }
 
             if (body.isNotEmpty()) {
-                append(" Ã‚Â· raw ")
+                append(" Ãƒâ€šÃ‚Â· raw ")
                 append(body.toHex())
             }
         }
@@ -3946,6 +4042,9 @@ class GattClient(context: Context) {
         inputProbeTimeout = null
         activeInputProbe = null
         inputCollectorRunning = false
+        val wasSourceOnly = inputSourceOnlyReadback
+        inputSourceOnlyReadback = false
+        if (wasSourceOnly) appendEvent("INPUT05C.2 SOURCE-ONLY GET completed")
         val responses = inputCollectorValues.values.count { !it.startsWith("NO_RESPONSE") && !it.startsWith("REJECT") }
         _tcsRemoteState.value = _tcsRemoteState.value.copy(
             phase = if (remoteApiVerified) "linked" else "transport-ready",
@@ -4017,6 +4116,693 @@ class GattClient(context: Context) {
      * already issues AppPolling.InputOutputSummaryGet (0x0648) during startup.
      * This explicit refresh uses the same proven GET and never changes recorder
      * Input, Gamma, Gamut, Trigger or Output settings. */
+    @SuppressLint("MissingPermission")
+    fun refreshOfficialOutputHdrReadback(): Boolean {
+        // R9 uses the existing 0x00DD -> 0x00DC contract, now as a guarded
+        // local=true OUTPUT-only read probe. No SET commands are emitted.
+        appendEvent("OUTPUT0614 HDR GET REQUEST id=0x00DD expected=0x00DC")
+        return queueOfficialLutGetter(
+            commandId = 0x00DD,
+            expectedResponseId = 0x00DC,
+            proto = byteArrayOf(),
+            purpose = "remote-output-hdr-enable-get",
+            label = "HDR Out Readback"
+        )
+    }
+
+    // R26.11.2: Audio-only deferred GET after the EXISTING post-pair MTU transaction.
+    // Do not change global PacketLink framing, ACK handling, or any other tab.
+    private var r26AudioGetWaitingForMtu: Boolean = false
+
+    private fun dispatchR26AudioGetAfterMtu(attemptsLeft: Int) {
+        if (!r26AudioGetWaitingForMtu) return
+        if (_audioR26Live.value.running) {
+            r26AudioGetWaitingForMtu = false
+            android.util.Log.i("AtomRemoteAudioR2615", "AUTO_METERS_YIELD_TO_COLLECTOR avoids-duplicate-get")
+            return
+        }
+        if (gatt == null || !_tcsPairingState.value.acceptWritten || !_tcsRemoteState.value.available) {
+            r26AudioGetWaitingForMtu = false
+            android.util.Log.i("AtomRemoteAudioR26Fix", "AUTO_GET_CANCELLED session-not-ready")
+            return
+        }
+        if (outputR21MtuBytes < 61) {
+            r26AudioGetWaitingForMtu = false
+            android.util.Log.i("AtomRemoteAudioR26Fix", "AUTO_GET_CANCELLED mtu=$outputR21MtuBytes below61")
+            return
+        }
+        // Respect the existing exclusive ATT/PacketLink owner and Input collector.
+        // Never cancel, replace, or preempt a frozen-feature request.
+        if (pendingRemotePacket != null || packetLink18.bufferedPacketSize() != 0 ||
+            packetLink18.state().toString() != "READY" ||
+            operationInFlight || pendingOps.isNotEmpty() || remoteBootstrapActive ||
+            inputCollectorRunning || inputExtendedRunning
+        ) {
+            if (attemptsLeft > 0) {
+                mainHandler.postDelayed({ dispatchR26AudioGetAfterMtu(attemptsLeft - 1) }, 700L)
+            } else {
+                r26AudioGetWaitingForMtu = false
+                android.util.Log.i("AtomRemoteAudioR26Fix",
+                    "AUTO_GET_DEFER_EXPIRED mtu=$outputR21MtuBytes reason=owner-busy; use manual Refresh")
+            }
+            return
+        }
+        r26AudioGetWaitingForMtu = false
+        android.util.Log.i("AtomRemoteAudioR26Fix",
+            "AUTO_GET_DISPATCH mtu=$outputR21MtuBytes transport=READY bodyExpected>=39")
+        val accepted = probeR26AudioMetersPage()
+        android.util.Log.i("AtomRemoteAudioR26Fix", "AUTO_GET_RESULT accepted=$accepted")
+    }
+
+
+    // R26.13: isolated Audio GET collector. No SETs, no guessed message IDs,
+    // no changes to official TCS pairing, Input owner, or PacketLink serializer.
+    private val _audioR26Live = MutableStateFlow(com.atomosremote.nativeapp.audio.AudioR26LiveSnapshot())
+    val audioR26Live: StateFlow<com.atomosremote.nativeapp.audio.AudioR26LiveSnapshot> = _audioR26Live
+    private var audioR26RunId = 0
+    private var audioR26Position = 0
+    private var audioR26BusyTicks = 0
+    private var audioR26Active: com.atomosremote.nativeapp.audio.AudioR26GetDefinition? = null
+    private var audioR26ActiveStartedMs = 0L
+    // R26.17 AUDIO-only passive lifecycle evidence. Buffer acceptance is NOT a BLE write.
+    private var audioR26PhysicalWriteMs = 0L
+    private var audioR26TransportCompleteMs = 0L
+    private val audioR26BufferedMaxWaitMs = 20_000L
+    private val audioR26PhysicalMaxWaitMs = 15_000L
+    private val audioR26TypedRxMaxWaitMs = 10_000L
+    // GET scheduler: only the known AG2 AudioMeters response is source+hardware
+    // verified. Do NOT treat macOS getter names as argument-free requests.
+    // R26.15: the ONLY getter proven by a typed AG2 hardware RX is 0x0647.
+    // Put it first, after requesting the mandatory MTU at collector start.
+    private val audioR26Schedule = listOf(
+        com.atomosremote.nativeapp.audio.AudioR26GetDefinition("AudioMetersPageGet", 0x0647, false, "AG2_TYPED_RX_VERIFIED")
+    ) + com.atomosremote.nativeapp.audio.AudioR26RecoveredMap.auditCandidates
+    private var audioR26QueueRefusals = 0
+    // R26.14.1: the Input/Output owner may be busy for minutes; do not claim
+    // recorder incompatibility or consume an Audio key solely because ATT is busy.
+    private var audioR26AuditStartedMs = 0L
+    private var audioR26BusySinceMs = 0L
+    private var audioR26LastWaitLogMs = 0L
+    private val audioR26AuditWindowMs = 240_000L
+    // Session-only: a genuine recorder reject remains visible, and is not hammered on each refresh.
+    private val audioR26SessionRejected = mutableSetOf<Int>()
+    // RX from the verified aggregate AudioMeters page, scoped to THIS collector run.
+    private var audioR26VerifiedPageHex = ""
+
+    fun cancelAudioR26RecoveredCollector() {
+        audioR26RunId += 1
+        audioR26Active = null
+        _audioR26Live.value = _audioR26Live.value.copy(running = false, activeMethod = null,
+            status = "Collector stopped (Audio screen closed)")
+    }
+
+    fun startAudioR26RecoveredCollector(): Boolean {
+        if (_audioR26Live.value.running) {
+            android.util.Log.i("AtomRemoteAudioR2614", "ALREADY_RUNNING generation=$audioR26RunId pos=$audioR26Position total=${audioR26Schedule.size}; no reset")
+            return true
+        }
+        if (!_tcsPairingState.value.acceptWritten || !_tcsRemoteState.value.available) {
+            android.util.Log.i("AtomRemoteAudioR2613", "COLLECTOR_SKIP reason=not-paired")
+            return false
+        }
+        audioR26RunId += 1
+        val generation = audioR26RunId
+        audioR26Position = 0
+        audioR26BusyTicks = 0
+        audioR26QueueRefusals = 0
+        audioR26AuditStartedMs = android.os.SystemClock.elapsedRealtime()
+        audioR26BusySinceMs = 0L
+        audioR26LastWaitLogMs = 0L
+        audioR26Active = null
+        audioR26PhysicalWriteMs = 0L
+        audioR26TransportCompleteMs = 0L
+        audioR26VerifiedPageHex = ""
+        // Request the standard Android ATT MTU *before* the Audio collector.
+        // This only queues PendingOp.OutputR21Mtu via the original exclusive ATT
+        // serializer and NEVER transmits an ATOMOS RemoteApi SET.
+        val mtuReadyOrQueued = if (outputR21MtuBytes < 61) requestR21OutputPageMtu() else true
+        android.util.Log.i("AtomRemoteAudioR2615Fix",
+            "START_MTU_PREPARE current=$outputR21MtuBytes queued=$mtuReadyOrQueued " +
+            "state=$outputR21MtuResult attInFlight=$operationInFlight attQueue=${pendingOps.size} " +
+            "remoteOwner=${pendingRemotePacket?.purpose ?: "none"}")
+        _audioR26Live.value = com.atomosremote.nativeapp.audio.AudioR26LiveSnapshot(
+            generation = generation, running = true,
+            status = "Preparing live Audio readback (MTU=${outputR21MtuBytes})")
+        mainHandler.post { audioR26Step(generation) }
+        return true
+    }
+
+    private fun audioR26Step(generation: Int) {
+        if (generation != audioR26RunId) return
+        if (!_tcsPairingState.value.acceptWritten || !_tcsRemoteState.value.available || gatt == null) {
+            audioR26RunId += 1
+            _audioR26Live.value = com.atomosremote.nativeapp.audio.AudioR26LiveSnapshot(
+                generation = generation, status = "Disconnected; current values invalid")
+            return
+        }
+        if (audioR26Position >= audioR26Schedule.size) {
+            val items = _audioR26Live.value.values.values
+            val rx = items.count { it.status == "TYPED_RX" }
+            val rejected = items.count { it.status.startsWith("RECORDER_REJECT") }
+            val skipped = items.count { it.status.startsWith("SKIPPED_") }
+            _audioR26Live.value = _audioR26Live.value.copy(running = false,
+                activeMethod = null, status = "Audit complete: $rx RX, $rejected rejected, $skipped skipped, ${items.size}/${audioR26Schedule.size} checked")
+            android.util.Log.i("AtomRemoteAudioR2614", "COLLECTOR_COMPLETE checked=${items.size} total=${audioR26Schedule.size} typed=$rx rejected=$rejected skipped=$skipped noSet=true")
+            return
+        }
+        val upcoming = audioR26Schedule[audioR26Position]
+        // Only four already-recognized GETs have single-varint CANDIDATES
+        // derived from the same session's strictly typed 0x8647 page RX.
+        // A candidate is NOT a confirmed hardware Audio mapping.
+        // R26.19: no speculative per-setting payload is constructed or transmitted.
+        val audioProtoCandidate: ByteArray? = null
+        // Screen every official macOS method. Never send SETs, support predicates,
+        // inferred/unverified IDs, or parameterized GETs with guessed empty bodies.
+        val skipReason = when {
+            upcoming.command in audioR26SessionRejected -> "PREVIOUS_RECORDER_REJECT_IN_SESSION"
+            // R26.19 macOS metadata + AG2 capture: these four hand-seeded
+            // first-field varints delivered on GATT but yielded no typed RX
+            // across R26.16-R26.18. DO NOT auto-repeat speculative requests.
+            upcoming.method in setOf("MonitorGet", "PhonesLevelGet", "OrientationGet", "AnalogEmbedGet") ->
+                "UNVERIFIED_REQUEST_SCHEMA_DISABLED_USE_8647_PAGE"
+            upcoming.evidence == "NOT_A_GET" -> "NOT_A_GET_OPERATION"
+            upcoming.command < 0 -> "NO_PROVEN_OPCODE"
+            upcoming.requiresArguments -> "ARGUMENT_SCHEMA_MISSING"
+            // R26.16 only evaluates four read-only scalar GET hypotheses
+            // after an actual paired AG2 page RX. The other three empty probes
+            // from R26.14.1 remain BLOCKED (7/7 had 0xFFFF responses).
+            upcoming.command != 0x0647 && audioProtoCandidate == null &&
+                com.atomosremote.nativeapp.audio.AudioR26RecoveredMap.isWireEligible(upcoming) ->
+                "MACOS_ARGUMENT_PAYLOAD_UNVERIFIED"
+            upcoming.evidence != "AG2_TYPED_RX_VERIFIED" &&
+                !com.atomosremote.nativeapp.audio.AudioR26RecoveredMap.isWireEligible(upcoming) -> "OPCODE_NOT_DIRECTLY_VERIFIED"
+            else -> null
+        }
+        if (skipReason != null) {
+            val message = "SKIPPED_$skipReason"
+            _audioR26Live.value = _audioR26Live.value.copy(
+                values = _audioR26Live.value.values + (upcoming.method to
+                    com.atomosremote.nativeapp.audio.AudioR26LiveValue(upcoming.method, upcoming.command, message)),
+                status = "Checked ${audioR26Position + 1}/${audioR26Schedule.size}: ${upcoming.method} $message")
+            android.util.Log.i("AtomRemoteAudioR2614", "KEY_SKIPPED method=${upcoming.method} opcode=${upcoming.command} reason=$skipReason")
+            audioR26Advance(generation)
+            return
+        }
+        if (upcoming.command == 0x0647 && outputR21MtuBytes < 61) {
+            val elapsed = android.os.SystemClock.elapsedRealtime() - audioR26AuditStartedMs
+            if (elapsed >= audioR26AuditWindowMs) {
+                _audioR26Live.value = _audioR26Live.value.copy(
+                    running = false, activeMethod = null,
+                    values = _audioR26Live.value.values + (upcoming.method to
+                        com.atomosremote.nativeapp.audio.AudioR26LiveValue(
+                            upcoming.method, upcoming.command, "DEFERRED_MTU_NOT_NEGOTIATED")),
+                    status = "Audio readback paused: ATT MTU not negotiated; ${outputR21MtuResult}. " +
+                        "Audio values are unavailable, not zero. Reopen Audio to retry.")
+                android.util.Log.i("AtomRemoteAudioR2615", "COLLECTOR_PAUSED_MTU method=${upcoming.method} mtu=$outputR21MtuBytes")
+                return
+            }
+            audioR26BusyTicks += 1
+            if (audioR26BusyTicks == 1 || audioR26BusyTicks % 8 == 0) requestR21OutputPageMtu()
+            if (audioR26BusyTicks == 1 || audioR26BusyTicks % 5 == 0)
+                android.util.Log.i("AtomRemoteAudioR2615Fix", "KEY_WAIT_MTU method=${upcoming.method} " +
+                    "mtu=$outputR21MtuBytes elapsedMs=$elapsed state=$outputR21MtuResult " +
+                    "requested=$outputR21MtuRequested activeOp=${activeOp?.javaClass?.simpleName ?: "none"} " +
+                    "attBusy=$operationInFlight attQueue=${pendingOps.size} " +
+                    "pending=${pendingRemotePacket?.purpose ?: "none"}")
+            _audioR26Live.value = _audioR26Live.value.copy(
+                status = "Waiting for Audio meter BLE MTU; ${audioR26Position}/${audioR26Schedule.size} checked",
+                activeMethod = null)
+            mainHandler.postDelayed({ audioR26Step(generation) }, 1000L)
+            return
+        }
+        // PacketLink.sendPacket buffers a message; its existing 10ms process
+        // tick performs the actual serialized ATT transfer. An E0 heartbeat in
+        // WRITING/READING or an unrelated in-flight ATT operation is not by
+        // itself a reason to permanently skip an Audio GET. We must still
+        // respect the real PacketLink buffer/pending owner and Input/bootstrap.
+        val realOwnerBusy = pendingRemotePacket != null ||
+            packetLink18.bufferedPacketSize() != 0 || remoteBootstrapActive ||
+            inputCollectorRunning || inputExtendedRunning
+        if (realOwnerBusy) {
+            val now = android.os.SystemClock.elapsedRealtime()
+            if (audioR26BusySinceMs == 0L) audioR26BusySinceMs = now
+            val elapsed = now - audioR26AuditStartedMs
+            if (elapsed >= audioR26AuditWindowMs) {
+                _audioR26Live.value = _audioR26Live.value.copy(
+                    running = false, activeMethod = null,
+                    values = _audioR26Live.value.values + (upcoming.method to
+                        com.atomosremote.nativeapp.audio.AudioR26LiveValue(
+                            upcoming.method, upcoming.command, "DEFERRED_REAL_OWNER_BUSY")),
+                    status = "Audit paused: Input/other owner busy for 4 min. " +
+                        "Only actual typed RX proves support. Tap Audio Refresh to retry.")
+                android.util.Log.i("AtomRemoteAudioR2615", "COLLECTOR_PAUSED_BUSY key=${upcoming.method} " +
+                    "checked=${audioR26Position}/${audioR26Schedule.size} " +
+                    "pending=${pendingRemotePacket?.purpose ?: "none"} input=$inputCollectorRunning extended=$inputExtendedRunning bootstrap=$remoteBootstrapActive")
+                return
+            }
+            if (now - audioR26LastWaitLogMs >= 5000L) {
+                audioR26LastWaitLogMs = now
+                android.util.Log.i("AtomRemoteAudioR2615", "KEY_WAIT_OWNER method=${upcoming.method} " +
+                    "elapsedMs=$elapsed pending=${pendingRemotePacket?.purpose ?: "none"} " +
+                    "input=$inputCollectorRunning extended=$inputExtendedRunning bootstrap=$remoteBootstrapActive " +
+                    "attBusy=$operationInFlight attQueue=${pendingOps.size} plink=${packetLink18.state()}")
+            }
+            _audioR26Live.value = _audioR26Live.value.copy(
+                activeMethod = null,
+                status = "Waiting for Input/Output transport owner (${elapsed / 1000}s); " +
+                    "${audioR26Position}/${audioR26Schedule.size} checked; none falsely skipped")
+            mainHandler.postDelayed({ audioR26Step(generation) }, 200L)
+            return
+        }
+        val spec = audioR26Schedule[audioR26Position]
+        audioR26BusySinceMs = 0L
+        audioR26BusyTicks = 0
+        audioR26Active = spec
+        audioR26ActiveStartedMs = android.os.SystemClock.elapsedRealtime()
+        audioR26PhysicalWriteMs = 0L
+        audioR26TransportCompleteMs = 0L
+        val purpose = "remote-audio-r26-recovered-get:${spec.method}"
+        val payload = if (spec.command == 0x0647) byteArrayOf() else audioProtoCandidate
+            ?: byteArrayOf() // This cannot dispatch except verified 0x0647 (guard above).
+        if (spec.command != 0x0647) {
+            android.util.Log.i("AtomRemoteAudioR2616", "GET_PROTO_CANDIDATE method=${spec.method} " +
+                "source=page_8647 field1_varint payload=${payload.toHex()} " +
+                "CAUTION=FIELD_NUMBER_AND_FIELD_MEANING_AWAIT_AG2_VALIDATION")
+        }
+        val packet = PendingRemotePacket(
+            body = buildOfficialAtomMessageBodyWithProtoPayload(0, spec.command, payload),
+            purpose = purpose, label = "Audio ${spec.method} read-only",
+            commandId = spec.command, packetId = 0, expectedResponseId = spec.command)
+        val queued = queueRemotePacket18_8(packet, local = true)
+        if (!queued) {
+            audioR26Active = null
+            audioR26QueueRefusals += 1
+            // Rejection by an already-buffered PacketLink turn is a temporary
+            // transport state, NOT evidence that the Audio opcode failed.
+            if (android.os.SystemClock.elapsedRealtime() - audioR26AuditStartedMs >= audioR26AuditWindowMs) {
+                _audioR26Live.value = _audioR26Live.value.copy(
+                    running = false, activeMethod = null,
+                    values = _audioR26Live.value.values + (spec.method to
+                        com.atomosremote.nativeapp.audio.AudioR26LiveValue(
+                            spec.method, spec.command, "DEFERRED_QUEUE_NOT_ACCEPTED")),
+                    status = "Audit paused: PacketLink buffer occupied; tap Refresh to retry")
+                android.util.Log.i("AtomRemoteAudioR2615", "COLLECTOR_PAUSED_QUEUE method=${spec.method} retries=$audioR26QueueRefusals")
+            } else {
+                if (audioR26QueueRefusals == 1 || audioR26QueueRefusals % 10 == 0)
+                    android.util.Log.i("AtomRemoteAudioR2615", "KEY_WAIT_BUFFER method=${spec.method} retries=$audioR26QueueRefusals")
+                mainHandler.postDelayed({ audioR26Step(generation) }, 650L)
+            }
+            return
+        }
+        _audioR26Live.value = _audioR26Live.value.copy(
+            activeMethod = spec.method, status = "Reading ${spec.method}",
+            values = _audioR26Live.value.values +
+                (spec.method to com.atomosremote.nativeapp.audio.AudioR26LiveValue(
+                    spec.method, spec.command, "WAITING_TYPED_RX")))
+        // R26.17: a successful queueRemotePacket18_8 only proves BUFFER ACCEPTED.
+        // The PacketLink process tick and actual GATT write callback are separate.
+        android.util.Log.i("AtomRemoteAudioR2617", "GET_BUFFERED method=${spec.method} cmd=0x${spec.command.toString(16)} local=true packetId=0 payloadLen=${payload.size} physicalWrite=false")
+        android.util.Log.i("AtomRemoteAudioR2614", "KEY_TX method=${spec.method} command=0x${spec.command.toString(16)} checked=${audioR26Position + 1}/${audioR26Schedule.size} queuedOnly=true")
+        mainHandler.postDelayed({ audioR26ObserveTimeout(generation, spec.method) }, 400L)
+    }
+
+    /** Read-only Audio scheduler watchdog; never drops another feature's pending owner. */
+    private fun audioR26ObserveTimeout(generation: Int, method: String) {
+        if (generation != audioR26RunId || audioR26Active?.method != method) return
+        val active = audioR26Active ?: return
+        val now = android.os.SystemClock.elapsedRealtime()
+        val queuedMs = now - audioR26ActiveStartedMs
+        val writeMs = audioR26PhysicalWriteMs
+        val deliveredMs = audioR26TransportCompleteMs
+        val reason = when {
+            writeMs == 0L && queuedMs >= audioR26BufferedMaxWaitMs -> "DEFERRED_NOT_GATT_WRITTEN"
+            writeMs != 0L && deliveredMs == 0L &&
+                now - writeMs >= audioR26PhysicalMaxWaitMs -> "DEFERRED_TRANSPORT_INCOMPLETE"
+            deliveredMs != 0L && now - deliveredMs >= audioR26TypedRxMaxWaitMs -> "NO_TYPED_RX_AFTER_DELIVERY"
+            else -> null
+        }
+        if (reason != null) {
+            _audioR26Live.value = _audioR26Live.value.copy(
+                values = _audioR26Live.value.values +
+                    (method to com.atomosremote.nativeapp.audio.AudioR26LiveValue(
+                        method, active.command, reason)))
+            android.util.Log.i("AtomRemoteAudioR2617", "GET_LIFECYCLE_TIMEOUT method=$method reason=$reason " +
+                "bufferedMs=$queuedMs physicalWritten=${writeMs != 0L} transportDelivered=${deliveredMs != 0L} " +
+                "pending=${pendingRemotePacket?.purpose ?: "none"} plink=${packetLink18.state()}")
+            // Do not advance to a NEW command while the current queued/physical
+            // packet still owns PacketLink. This avoids misattributed later RX.
+            if (reason != "NO_TYPED_RX_AFTER_DELIVERY" &&
+                pendingRemotePacket?.purpose == "remote-audio-r26-recovered-get:$method") {
+                _audioR26Live.value = _audioR26Live.value.copy(
+                    running = false, activeMethod = null,
+                    status = "Audio GET deferred: $reason; leave transport owner untouched")
+                android.util.Log.i("AtomRemoteAudioR2617", "COLLECTOR_PAUSED method=$method reason=$reason")
+                audioR26RunId += 1
+                audioR26Active = null
+                return
+            }
+            audioR26Advance(generation)
+            return
+        }
+        mainHandler.postDelayed({ audioR26ObserveTimeout(generation, method) }, 400L)
+    }
+
+    /** Passive callbacks from existing PacketLink without changing its queue/state machine. */
+    private fun audioR26OnGATTWritten() {
+        val active = audioR26Active ?: return
+        if (pendingRemotePacket?.purpose != "remote-audio-r26-recovered-get:${active.method}" ||
+            audioR26PhysicalWriteMs != 0L) return
+        audioR26PhysicalWriteMs = android.os.SystemClock.elapsedRealtime()
+        android.util.Log.i("AtomRemoteAudioR2617", "GET_GATT_TX_OK method=${active.method} " +
+            "cmd=0x${active.command.toString(16)} bufferedMs=${audioR26PhysicalWriteMs - audioR26ActiveStartedMs}")
+    }
+
+    private fun audioR26OnTransportComplete(sent: PendingRemotePacket?) {
+        val active = audioR26Active ?: return
+        if (sent?.purpose != "remote-audio-r26-recovered-get:${active.method}" ||
+            audioR26TransportCompleteMs != 0L) return
+        audioR26TransportCompleteMs = android.os.SystemClock.elapsedRealtime()
+        android.util.Log.i("AtomRemoteAudioR2617", "GET_TRANSPORT_COMPLETE method=${active.method} " +
+            "written=${audioR26PhysicalWriteMs != 0L} packetOwnerCleared=true " +
+            "ageMs=${audioR26TransportCompleteMs - audioR26ActiveStartedMs}")
+    }
+
+    private fun audioR26Advance(generation: Int) {
+        if (generation != audioR26RunId) return
+        audioR26Active = null
+        audioR26PhysicalWriteMs = 0L
+        audioR26TransportCompleteMs = 0L
+        audioR26Position += 1
+        audioR26BusyTicks = 0
+        audioR26QueueRefusals = 0
+        _audioR26Live.value = _audioR26Live.value.copy(
+            activeMethod = null,
+            status = "Audio GET audit: ${_audioR26Live.value.values.size}/${audioR26Schedule.size} checked")
+        mainHandler.postDelayed({ audioR26Step(generation) }, 320L)
+    }
+
+    /** RX observation only AFTER strict AtomMessage length/PacketLink demux. */
+    private fun audioR26ObserveTypedRx(
+        pending: PendingRemotePacket?, messageType: Int, body: ByteArray, local: Boolean
+    ) {
+        val active = audioR26Active ?: return
+        // R26.18: pendingRemotePacket is a *transport* owner, not a reply token.
+        // It is cleared at the successful PacketLink read turn, potentially
+        // before the recorder's standalone typed RemoteApi reply is received.
+        // Observe that narrow post-delivery interval WITHOUT assigning a
+        // response to Audio (the app can have other GETs concurrently).
+        if (pending?.purpose != "remote-audio-r26-recovered-get:${active.method}" || !local) {
+            val now = android.os.SystemClock.elapsedRealtime()
+            val afterDelivery = audioR26PhysicalWriteMs != 0L &&
+                audioR26TransportCompleteMs != 0L &&
+                now >= audioR26TransportCompleteMs &&
+                now - audioR26TransportCompleteMs <= audioR26TypedRxMaxWaitMs
+            if (afterDelivery && local && pending == null) {
+                val normalizedType = messageType and 0x7FFF
+                val opcodeProximity = normalizedType in (active.command - 4)..(active.command + 1)
+                android.util.Log.i("AtomRemoteAudioR2618", "POST_DELIVERY_RX_WINDOW method=${active.method} " +
+                    "type=0x${messageType.toString(16)} normalized=0x${normalizedType.toString(16)} " +
+                    "nearCommand=$opcodeProximity bytes=${body.size} " +
+                    "ageAfterDeliveryMs=${now - audioR26TransportCompleteMs} " +
+                    "pending=none notAcceptedAsTyped=true payload=${body.toHex().take(120)}")
+            } else if (local && (messageType and 0x8000) != 0 &&
+                (messageType and 0x7FFF) in (active.command - 4)..(active.command + 1)) {
+                android.util.Log.i("AtomRemoteAudioR2618", "RX_UNCORRELATED_AUDIO_WINDOW method=${active.method} " +
+                    "type=0x${messageType.toString(16)} pending=${pending?.purpose ?: "none"} " +
+                    "delivered=$afterDelivery notAcceptedAsTyped=true")
+            }
+            return
+        }
+        val gen = audioR26RunId
+        val normalized = messageType and 0x7FFF
+        // The macOS binary establishes request IDs, but response-class IDs
+        // can differ (Input GET 0x70 -> response 0x6c). Keep raw RX explicit.
+        if (messageType == 0xFFFF || messageType == 0xFFFE) {
+            audioR26SessionRejected += active.command
+            _audioR26Live.value = _audioR26Live.value.copy(values = _audioR26Live.value.values +
+                (active.method to com.atomosremote.nativeapp.audio.AudioR26LiveValue(
+                    active.method, active.command, "RECORDER_REJECT_0x${messageType.toString(16)}", messageType)))
+            android.util.Log.i("AtomRemoteAudioR2613", "GET_REJECT method=${active.method} response=0x${messageType.toString(16)}")
+            audioR26Advance(gen)
+        } else if ((messageType and 0x8000) != 0 &&
+            (normalized in (active.command - 4)..(active.command + 1) ||
+                (active.command == 0x0647 && normalized == 0x0647)) &&
+            // R26.18: match the delivery-aware timeout, not the obsolete 4.2s
+            // queue-time clock. Never accept after the collector watchdog ends.
+            (audioR26PhysicalWriteMs == 0L ||
+                android.os.SystemClock.elapsedRealtime() - audioR26PhysicalWriteMs <=
+                audioR26PhysicalMaxWaitMs + audioR26TypedRxMaxWaitMs)) {
+            val raw = body.toHex()
+            if (active.command == 0x0647 && messageType == 0x8647 &&
+                com.atomosremote.nativeapp.audio.AudioR26ProtoCandidates.parsePage(raw) != null) {
+                audioR26VerifiedPageHex = raw
+                android.util.Log.i("AtomRemoteAudioR2616", "AG2_PAGE_SEED_VERIFIED bytes=${body.size} " +
+                    "candidateKeys=MonitorGet,PhonesLevelGet,OrientationGet,AnalogEmbedGet")
+            }
+            val rawField1 = protoVarintField(body, 1)
+            val status = if (body.isNotEmpty()) "TYPED_RX" else "TYPED_EMPTY_RX"
+            _audioR26Live.value = _audioR26Live.value.copy(values = _audioR26Live.value.values +
+                (active.method to com.atomosremote.nativeapp.audio.AudioR26LiveValue(
+                    active.method, active.command, status, messageType, raw, rawField1)))
+            android.util.Log.i("AtomRemoteAudioR2613", "GET_RX method=${active.method} command=0x${active.command.toString(16)} response=0x${messageType.toString(16)} " +
+                "local=$local bodyBytes=${body.size} field1Raw=$rawField1 raw=$raw currentRawOnly=true")
+            audioR26Advance(gen)
+        }
+    }
+
+    // AUDIO R26: read-only AppPolling.AudioMetersPageGet, source-mapped 0x0647.
+    // This is NOT an AG2-confirmed field map. No Audio SET is enabled here.
+    // Existing PacketLink serializer and raw state page capture remain unchanged.
+    @SuppressLint("MissingPermission")
+    fun probeR26AudioMetersPage(): Boolean {
+        val ready = _tcsPairingState.value.acceptWritten && _tcsRemoteState.value.available
+        if (!ready) {
+            android.util.Log.i("AtomRemoteAudioR26", "METERS_GET_SKIPPED not-linked")
+            return false
+        }
+        android.util.Log.i("AtomRemoteAudioR26", "QUEUE_BEFORE route=LOCAL pending=${pendingRemotePacket?.purpose ?: "none"} " +
+            "frameWritten=$pendingRemoteFrameWritten plinkState=${packetLink18.state()} " +
+            "bufferedBytes=${packetLink18.bufferedPacketSize()}")
+        // AG2 declared 39 Audio protobuf bytes on 2026-10-11, but a default
+        // MTU=23 yielded just 16. Existing OutputR21 safely negotiates MTU=185
+        // AFTER accept, via the serialized ATT queue. Reuse it: no new GATT
+        // primitive, no pairing changes, no Output setting action.
+        if (outputR21MtuBytes < 61) {
+            r26AudioGetWaitingForMtu = requestR21OutputPageMtu()
+            android.util.Log.i("AtomRemoteAudioR26Fix",
+                "AUDIO_MTU_PREPARE current=$outputR21MtuBytes desired=185 " +
+                    "queued=$r26AudioGetWaitingForMtu GET_NOT_SENT")
+            return false
+        }
+        val accepted = queueOfficialLutGetter(
+            commandId = REMOTE_APP_POLLING_AUDIO_METERS_PAGE_GET,
+            expectedResponseId = REMOTE_APP_POLLING_AUDIO_METERS_PAGE_GET,
+            proto = byteArrayOf(),
+            purpose = "remote-audio-r26-meters-page-get",
+            label = "AudioMetersPageGet R26 read-only"
+        )
+        android.util.Log.i("AtomRemoteAudioR26", "METERS_GET_REQUEST id=0x0647 payload=EMPTY local=existing-GET-route queued=$accepted")
+        return accepted
+    }
+
+    /**
+     * AUDIO PART2 R26.06-11: explicit one-shot READ-ONLY AppPolling
+     * non-local A/B probe. R26.01 used local=true/packetId=0 but the
+     * user's 2026-10-11 capture proved ONLY queuing, NOT a typed reply.
+     * The non-local route preserves existing 1..255 command sequencing;
+     * it never changes the global serializer or dispatch logic. This is
+     * manually triggered, not periodic and never sends an Audio SET.
+     */
+    @SuppressLint("MissingPermission")
+    fun probeR26AudioMetersPageNonlocalOnce(): Boolean {
+        val ready = _tcsPairingState.value.acceptWritten && _tcsRemoteState.value.available
+        if (!ready) {
+            android.util.Log.i("AtomRemoteAudioR26P2", "NONLOCAL_SKIP disconnected")
+            return false
+        }
+        // Unlike remote-audio-r26-meters-page-get, this PURPOSE is NOT in
+        // queueOfficialLutGetter's local=true allowlist; therefore local=false
+        // is selected by existing exact code. No other route is changed.
+        android.util.Log.i("AtomRemoteAudioR26P2", "QUEUE_BEFORE route=NONLOCAL pending=${pendingRemotePacket?.purpose ?: "none"} " +
+            "frameWritten=$pendingRemoteFrameWritten plinkState=${packetLink18.state()} " +
+            "bufferedBytes=${packetLink18.bufferedPacketSize()}")
+        val accepted = queueOfficialLutGetter(
+            commandId = REMOTE_APP_POLLING_AUDIO_METERS_PAGE_GET,
+            expectedResponseId = REMOTE_APP_POLLING_AUDIO_METERS_PAGE_GET,
+            proto = byteArrayOf(),
+            purpose = "remote-audio-r26-part2-nonlocal-read-only",
+            label = "AudioMetersPageGet R26 nonlocal READ ONLY"
+        )
+        android.util.Log.i("AtomRemoteAudioR26P2",
+            "NONLOCAL_0647_REQUEST queued=$accepted local=false command=0x0647 " +
+                "expected=0x0647 payloadBytes=0 write=false RESULT_NOT_YET_PROVEN")
+        return accepted
+    }
+
+    // OUTPUT R19: one official AppPolling.OutputPageGet request (0x0644).
+    // This is a documented GET class and Android-sourced opcode, but its AG2
+    // response is NOT verified. Non-local 1..255 packetId follows existing
+    // AppPolling convention; no state-changing message is sent here.
+    @SuppressLint("MissingPermission")
+    fun probeR19OutputPageGet(): Boolean {
+        val accepted = queueOfficialLutGetter(
+            commandId = REMOTE_APP_POLLING_OUTPUT_PAGE_GET,
+            expectedResponseId = REMOTE_APP_POLLING_OUTPUT_PAGE_GET,
+            proto = byteArrayOf(),
+            purpose = "remote-output-r19-output-page-get",
+            label = "OutputPageGet R19 read-only"
+        )
+        android.util.Log.i("AtomRemoteOutputR19",
+            "PAGE_GET_REQUEST cmd=0x0644 expected=0x0644 local=false " +
+                "payload=EMPTY queued=$accepted evidence=official-macos-class+Android-constant")
+        return accepted
+    }
+
+    /**
+     * OUTPUT R21: one guarded post-accept MTU negotiation per BLE connection.
+     * R20 observed 0x8644 declaring a 54-byte payload while a PacketLink
+     * final read exposed only 16 body bytes. Since final=1, reassembling
+     * unrelated E0 turns would corrupt the protocol. MTU must be observed.
+     * This method issues NO recorder RemoteApi command and NO pairing write.
+     */
+    @SuppressLint("MissingPermission")
+    fun requestR21OutputPageMtu(): Boolean {
+        val live = gatt ?: return false
+        // R22: queue eligibility is connection-scoped. R21 incorrectly required
+        // a momentary READY/empty-remote-packet state which background polling
+        // practically never exposed. The existing ATT queue serializes MTU
+        // exchange with physical reads/writes; pairing must already be complete.
+        val pairingReady = _tcsPairingState.value.acceptWritten
+        val linked = _tcsRemoteState.value.available && packetLink18Primed
+        if (!pairingReady || !linked) {
+            android.util.Log.i("AtomRemoteOutputR22",
+                "MTU_DEFERRED paired=$pairingReady linked=$linked state=${packetLink18.state()}")
+            return false
+        }
+        if (outputR21MtuBytes >= 61) {
+            android.util.Log.i("AtomRemoteOutputR22",
+                "MTU_ALREADY_SUFFICIENT negotiated=$outputR21MtuBytes")
+            return true
+        }
+        if (outputR21MtuRequested) return true
+        outputR21MtuRequested = true
+        outputR21MtuResult = "queued"
+        // Do not touch PacketLink framing. The single existing ATT owner will
+        // run this after any in-flight operation callback, never concurrently.
+        pendingOps.addFirst(PendingOp.OutputR21Mtu())
+        android.util.Log.i("AtomRemoteOutputR22",
+            "MTU_QUEUED requested=185 paired=$pairingReady linked=$linked " +
+                "plinkState=${packetLink18.state()} pendingRemote=${pendingRemotePacket != null} " +
+                "bootstrap=$remoteBootstrapActive inFlight=$operationInFlight " +
+                "pendingAttOps=${pendingOps.size}")
+        if (!operationInFlight) processNext(live)
+        return true
+    }
+
+    // OUTPUT R20: read-only A/B probe for official OutputPageGet 0x0644.
+    // Used only when the existing non-local R19 probe returned no typed page.
+    // Exact GET opcode unchanged; no SET and no unrelated AppPolling changes.
+    @SuppressLint("MissingPermission")
+    fun probeR20OutputPageGetLocal(): Boolean {
+        val accepted = queueOfficialLutGetter(
+            commandId = REMOTE_APP_POLLING_OUTPUT_PAGE_GET,
+            expectedResponseId = REMOTE_APP_POLLING_OUTPUT_PAGE_GET,
+            proto = byteArrayOf(),
+            purpose = "remote-output-r20-output-page-local-get",
+            label = "OutputPageGet R20 local read-only"
+        )
+        android.util.Log.i("AtomRemoteOutputR20",
+            "PAGE_LOCAL_GET cmd=0x0644 local=true empty=true accepted=$accepted")
+        return accepted
+    }
+
+    // OUTPUT R17: macOS Output.Get constructor disassembly correlates its
+    // immediates (D3/D5/D7) with the proven GET = immediate-1, RX = immediate-2
+    // pattern (DE/DD/DC, E0/DF/DE, E2/E1/E0). These wire IDs are CANDIDATES
+    // and are intentionally NOT trusted as hardware-proven until typed RX.
+    // Only empty-payload, local=true GET calls are permitted. NO SET, NO lists.
+    private var outputR17ProbeKind: String? = null
+    private var outputR17ProbeExpiresAt: Long = 0L
+    private var outputR17ProbeExpectedResponse: Int = -1
+
+    @SuppressLint("MissingPermission")
+    fun probeR17OutputOptionGet(kind: String): Boolean {
+        val spec = when (kind) {
+            "downscale" -> Pair(0x00D2, 0x00D1)
+            "dci-crop" -> Pair(0x00D4, 0x00D3)
+            "hdmi-timecode" -> Pair(0x00D6, 0x00D5)
+            else -> return false
+        }
+        val now = android.os.SystemClock.elapsedRealtime()
+        if (outputR17ProbeKind != null && now < outputR17ProbeExpiresAt) {
+            android.util.Log.i("AtomRemoteOutputR17", "PROBE_BUSY kind=$kind active=$outputR17ProbeKind")
+            return false
+        }
+        val purpose = "remote-output-r17-get-$kind"
+        val queued = queueOfficialLutGetter(
+            commandId = spec.first,
+            expectedResponseId = spec.second,
+            proto = byteArrayOf(),
+            purpose = purpose,
+            label = "R17 Output $kind read-only candidate"
+        )
+        if (queued) {
+            outputR17ProbeKind = kind
+            outputR17ProbeExpiresAt = android.os.SystemClock.elapsedRealtime() + 5000L
+            outputR17ProbeExpectedResponse = spec.second
+        }
+        android.util.Log.i("AtomRemoteOutputR17",
+            "PROBE_TX kind=$kind cmd=0x${spec.first.toString(16)} " +
+                "expected=0x${spec.second.toString(16)} local=true payload=EMPTY " +
+                "queued=$queued evidence=macOS-Get-class-immediate-pattern")
+        return queued
+    }
+
+    // OUTPUT R13: Two *candidate*, read-only, local=true Output GET probes.
+    // Command IDs are derived from the adjacent macOS RemoteApi.Output class
+    // ordering anchored by hardware-verified 0x00DD and 0x00E3. These two IDs
+    // ARE NOT hardware-proven until a correlated AG2 response is observed.
+    // Absolutely no SET or speculative option-list requests originate here.
+    private var outputR13ProbeKind: String? = null
+    private var outputR13ProbeExpiresAt: Long = 0L
+    private var outputR13ProbeExpectedResponse: Int = -1
+
+    @SuppressLint("MissingPermission")
+    fun probeR13OutputScalarGet(kind: String): Boolean {
+        val spec = when (kind) {
+            "hdr-type" -> Pair(0x00DF, 0x00DE)
+            "gamut" -> Pair(0x00E1, 0x00E0)
+            else -> return false
+        }
+        val now = android.os.SystemClock.elapsedRealtime()
+        if (outputR13ProbeKind != null && now < outputR13ProbeExpiresAt) {
+            android.util.Log.i("AtomRemoteOutputR13", "GET_BUSY kind=$kind active=$outputR13ProbeKind")
+            return false
+        }
+        // Only one probe is outstanding, and only the exact expected type can
+        // become a UI value. No opportunistic parser guesses or default enums.
+        val purpose = "remote-output-r13-candidate-$kind"
+        val queued = queueOfficialLutGetter(
+            commandId = spec.first,
+            expectedResponseId = spec.second,
+            proto = byteArrayOf(),
+            purpose = purpose,
+            label = "R13 Output $kind GET candidate"
+        )
+        if (queued) {
+            outputR13ProbeKind = kind
+            outputR13ProbeExpiresAt = android.os.SystemClock.elapsedRealtime() + 4500L
+            outputR13ProbeExpectedResponse = spec.second
+        }
+        android.util.Log.i(
+            "AtomRemoteOutputR13",
+            "GET_CANDIDATE kind=$kind cmd=0x${spec.first.toString(16)} " +
+                "expected=0x${spec.second.toString(16)} local=true packetId=0 queued=$queued " +
+                "status=${if (queued) "awaiting-hardware-proof" else "transport-busy"}"
+        )
+        return queued
+    }
+
     @SuppressLint("MissingPermission")
     fun refreshOfficialInputOutputSummary(): Boolean {
         if (!canQueueOfficialMonitorCommand("input-output-summary")) return false
@@ -4135,7 +4921,7 @@ class GattClient(context: Context) {
         pendingRemoteFrameWritten = false
         appendEvent(
             "TCS20.06 SCOPE GET label=$label cmd=0x${commandId.toString(16)} " +
-                "expected=0x${expectedResponse.toString(16)} packetId=CommandManager m_isLocal=1"
+                "expected=0x${expectedResponse.toString(16)} packetId=0 m_isLocal=1"
         )
         return queueRemotePacket18_8(packet, local = true)
     }
@@ -4301,19 +5087,11 @@ class GattClient(context: Context) {
         )
         pendingRemotePacket = packet
         pendingRemoteFrameWritten = false
-        val beforeRefresh = _monitorGuideState.value
-        val preservedMutation = beforeRefresh.pendingKey?.takeIf {
-            it == "frame-guide" || it == "format"
-        }
-        _monitorGuideState.value = beforeRefresh.copy(
-            pendingKey = preservedMutation ?: "refresh",
-            status = if (preservedMutation != null) {
-                beforeRefresh.status
-            } else {
-                "Reading Frame Guide / 9-Grid state"
-            }
+        _monitorGuideState.value = _monitorGuideState.value.copy(
+            pendingKey = "refresh",
+            status = "Reading Frame Guide / 9-Grid state"
         )
-        appendEvent("TCS20.13.2 GUIDE FORMAT GET cmd=0x0276 expected=0x0267 packetId=CommandManager m_isLocal=1")
+        appendEvent("TCS20.13.2 GUIDE FORMAT GET cmd=0x0276 expected=0x0267 packetId=0 m_isLocal=1")
         val queued = queueRemotePacket18_8(packet, local = true)
         if (queued) scheduleMonitorAssistSummaryFallback("guides-refresh", 360L)
         return queued
@@ -4353,16 +5131,6 @@ class GattClient(context: Context) {
         write(0x20); writeUnsignedVarint(customRatio.coerceAtLeast(0))
     }.toByteArray()
 
-    /**
-     * R16.1 exact macOS main Monitor UI parity.
-     *
-     * The x86_64 call sites at 0x10006462A / 0x1000646C3 invoke the
-     * FrameGuideFormatSet constructor with (format, grid, 2, 13). Direct
-     * constructor disassembly shows the latter values are Optional sentinels,
-     * not literal protobuf values. Therefore the ordinary main-UI toggle/ratio
-     * path serializes only the format and 3x3 fields. Keep the proven 9-Grid
-     * sender unchanged; this helper is used only by Frame Guide itself.
-     */
     private fun buildMacMainUiFrameGuideProto(format: Int, grid: Boolean): ByteArray =
         ByteArrayOutputStream().apply {
             if (format != 0) {
@@ -4432,7 +5200,7 @@ class GattClient(context: Context) {
         pendingRemotePacket = packet
         pendingRemoteFrameWritten = false
         appendEvent(
-            "TCS20.13.2R15 FRAME GUIDE GET cmd=0x44F expected=0x44E reason=$reason packetId=CommandManager m_isLocal=0"
+            "TCS20.13.2R15 FRAME GUIDE GET cmd=0x44F expected=0x44E reason=$reason packetId=0 m_isLocal=0"
         )
         return queueRemotePacket18_8(packet, local = false)
     }
@@ -4574,7 +5342,7 @@ class GattClient(context: Context) {
         )
         appendEvent(
             "TCS20.07.2 GRID GET cmd=0x${REMOTE_MONITOR_FRAME_GUIDE_FORMAT_GET.toString(16)} " +
-                "target=${if (enabled) 1 else 0} packetId=CommandManager m_isLocal=1 body=${body.toHex()}"
+                "target=${if (enabled) 1 else 0} packetId=0 m_isLocal=1 body=${body.toHex()}"
         )
         return queueRemotePacket18_8(packet, local = true)
     }
@@ -4676,7 +5444,7 @@ class GattClient(context: Context) {
         pendingRemotePacket = packet
         pendingRemoteFrameWritten = false
         appendEvent(
-            "TCS20.07.3 SAFE AREA GET cmd=0x278 expected=0x268 packetId=CommandManager m_isLocal=1"
+            "TCS20.07.3 SAFE AREA GET cmd=0x278 expected=0x268 packetId=0 m_isLocal=1"
         )
         return queueRemotePacket18_8(packet, local = true)
     }
@@ -4694,10 +5462,32 @@ class GattClient(context: Context) {
         val service = current.getService(UUID.fromString(AIRGLU_SHOGUN_SERVICE_UUID)) ?: return false
         service.getCharacteristic(UUID.fromString(TCS_PACKET_WRITE_UUID)) ?: return false
 
-        // macOS CommandManager parity: LUT controller GETs are non-local.
-        // Non-local RemoteApi uses the shared 1..255 command packet sequence.
-        tcsCommandSequence = if (tcsCommandSequence >= 255) 1 else tcsCommandSequence + 1
-        val packetId = tcsCommandSequence
+        // OUTPUT R9 guarded route experiment: OUTPUT-only read-only getters.
+        // R8 sent 0x00DD / 0x00E7 / 0x00E3 as local=false without typed output
+        // confirmation. Other Input/Monitor/LUT GETs remain on their original
+        // routes. This is a TEST, not proof of the macOS constructor locality.
+        val outputR9LocalGetProbe = purpose == "remote-output-hdr-enable-get" ||
+            purpose == "remote-lut-output-available-get" ||
+            purpose == "remote-lut-output-get" ||
+            purpose == "remote-lut-output-verify" ||
+            purpose == "remote-output-r13-candidate-hdr-type" ||
+            purpose == "remote-output-r13-candidate-gamut" ||
+            // OUTPUT R18: R17's three read-only candidate GETs were accidentally
+            // omitted here, silently turning requested local=true into local=false.
+            purpose == "remote-output-r17-get-downscale" ||
+            purpose == "remote-output-r17-get-dci-crop" ||
+            purpose == "remote-output-r17-get-hdmi-timecode" ||
+            // Isolated R20 OutputPageGet local=true comparison after nonlocal failure.
+            purpose == "remote-output-r20-output-page-local-get" ||
+            // AUDIO R26: a single isolated local=true audio-meter page GET;
+            // Output R24 established this page-family route, not field mapping.
+            purpose == "remote-audio-r26-meters-page-get"
+        // Local RemoteApi one-shots use packetId=0. Non-local GETs keep their
+        // existing shared 1..255 sequence; never change bootstrap/AppPolling.
+        if (!outputR9LocalGetProbe) {
+            tcsCommandSequence = if (tcsCommandSequence >= 255) 1 else tcsCommandSequence + 1
+        }
+        val packetId = if (outputR9LocalGetProbe) 0 else tcsCommandSequence
         val body = buildOfficialAtomMessageBodyWithProtoPayload(packetId, commandId, proto)
         val packet = PendingRemotePacket(
             body = body,
@@ -4711,9 +5501,24 @@ class GattClient(context: Context) {
         pendingRemoteFrameWritten = false
         appendEvent(
             "TCS20.09 LUT GET label=$label cmd=0x${commandId.toString(16).uppercase()} " +
-                "expected=0x${expectedResponseId.toString(16).uppercase()} packetId=$packetId m_isLocal=0 proto=${proto.toHex()}"
+                "expected=0x${expectedResponseId.toString(16).uppercase()} packetId=$packetId " +
+                "m_isLocal=${if (outputR9LocalGetProbe) 1 else 0} proto=${proto.toHex()}"
         )
-        return queueRemotePacket18_8(packet, local = false)
+        if (outputR9LocalGetProbe) {
+            outputR7Trace(
+                "R9_OUTPUT_LOCAL_TRUE_GET cmd=0x${commandId.toString(16).uppercase()} " +
+                    "expected=0x${expectedResponseId.toString(16).uppercase()} packetId=$packetId " +
+                    "purpose=$purpose payloadLen=${proto.size} write=false"
+            )
+        }
+        // OUTPUT R18: report the REAL PacketLink locality, not the caller's
+        // requested route.  A buffered GET is not a GATT write or typed RX.
+        if (purpose.startsWith("remote-output-r17-get-")) {
+            android.util.Log.i("AtomRemoteOutputR18",
+                "GET_ROUTE purpose=$purpose cmd=0x${commandId.toString(16)} " +
+                    "local=$outputR9LocalGetProbe packetId=$packetId proto=${proto.toHex()}")
+        }
+        return queueRemotePacket18_8(packet, local = outputR9LocalGetProbe)
     }
 
     private fun scheduleLutStageFallback(expectedStage: Int, delayMs: Long = 700L) {
@@ -4960,13 +5765,8 @@ class GattClient(context: Context) {
         // LUT setters are AtomMessage local one-shots. The same AtomMessage
         // locality byte used by proven Record.Start=true is set for:
         // LutSlotSet, LutPreviewEnableSet, Record.LutBurnInEnableSet,
-        // Output.LutOutputEnableSet. Local one-shots use packetId=CommandManager.
-        // R16.7: Codec commands are created with packetID at its default in the
-        // RemoteApi constructor, then submitted through macOS CommandManager.
-        // CommandManager owns m_lastPacketID and assigns the live AtomMessage
-        // packet ID. Do the same here instead of hard-forcing packetId=CommandManager.
-        tcsCommandSequence = if (tcsCommandSequence >= 255) 1 else tcsCommandSequence + 1
-        val packetId = tcsCommandSequence
+        // Output.LutOutputEnableSet. Local one-shots use packetId=0.
+        val packetId = 0
         val body = buildOfficialAtomMessageBodyWithProtoPayload(packetId, commandId, proto)
         val packet = PendingRemotePacket(
             body = body,
@@ -5179,7 +5979,7 @@ class GattClient(context: Context) {
             !zoomRefreshActive
 
     // 20.10.0-20.10.5 Display family recovered from the supplied macOS RemoteApi binary.
-    // Setters use packetId=CommandManager/m_isLocal=true. GETs use the same non-local sequence style
+    // Setters use packetId=0/m_isLocal=true. GETs use the same non-local sequence style
     // as the macOS Display controller and only typed responses update confirmed values.
     @SuppressLint("MissingPermission")
     fun refreshOfficialDisplayState(): Boolean {
@@ -5481,7 +6281,7 @@ class GattClient(context: Context) {
         _monitorAnamorphicState.value = _monitorAnamorphicState.value.copy(
             status = "Reading Anamorphic mode from recorder"
         )
-        appendEvent("TCS20.08.0 ANAMORPHIC GET cmd=0x27A expected=0x269 packetId=CommandManager m_isLocal=1")
+        appendEvent("TCS20.08.0 ANAMORPHIC GET cmd=0x27A expected=0x269 packetId=0 m_isLocal=1")
         return queueRemotePacket18_8(packet, local = true)
     }
 
@@ -5520,7 +6320,7 @@ class GattClient(context: Context) {
 
         // 20.04.9 exact macOS parity:
         // uploaded ATOMOS Remote binary constructs MonitorModeGet with
-        // AtomMessage(baseLocal = true). Local RemoteApi one-shots use packetId=CommandManager.
+        // AtomMessage(baseLocal = true). Local RemoteApi one-shots use packetId=0.
         val packetId = 0
         val body = buildOfficialAtomMessageBody(packetId, REMOTE_MONITOR_MODE_GET)
         val packet = PendingRemotePacket(
@@ -5792,8 +6592,6 @@ class GattClient(context: Context) {
      * SwiftProtobuf omits scalar enum value zero, so bitDepth=0 is represented by
      * an absent field #2. Hardware state is updated only by 0x013A readback.
      */
-    // R16.7: exact Record.Codec enum order recovered from Contents.zip.
-    // There is no standard ProRes RAW enum between CinemaDNG and ProResRawHQ.
     private fun codecRemoteWireValue(codec: Int): Int? = when (codec) {
         in 1..10 -> codec - 1
         12 -> 10
@@ -5808,72 +6606,6 @@ class GattClient(context: Context) {
         else -> null
     }
 
-    // RecordTabController in the official macOS app does NOT pass CodecBitDepth=0
-    // for the fixed/recorder-managed codec group. Its picker path explicitly
-    // substitutes enum sentinel 3 whenever the raw codec enum is <= 12, and only
-    // uses the selected 0/1/2 depth for raw codec enums > 12.
-    private fun officialCodecBitDepthForWire(wireCodec: Int, requestedBitDepth: Int): Int =
-        if (wireCodec <= 12) 3 else requestedBitDepth
-
-    private fun publishCodecHardwareFromPageSources(source: String) {
-        val wire = codecPageWireFromSummary ?: return
-        val depth = codecPageBitDepth ?: return
-        val logical = codecLogicalFromWire(wire) ?: return
-        if (depth !in 0..2) return
-        _codecHardwareProfile.value = logical to depth
-        appendEvent(
-            "TCS20.15R16.2 CODEC PAGE AUTHORITATIVE source=$source wire=$wire logical=$logical bitDepth=$depth"
-        )
-    }
-
-    /**
-     * R16.4 macOS codec AtomMessage parity.
-     *
-     * Fresh Contents.zip constructor evidence keeps CodecProfileGet/ListGet/Set
-     * and NonRebootCodecProfileSet non-local (m_isLocal=false), but their
-     * RemoteApi AtomMessage packetId is zero. R16.2/R16.3 incorrectly promoted
-     * codec requests onto the CommandManager 1..255 sequence. Hardware logs then
-     * showed transport E0 completion without recorder codec action/readback.
-     *
-     * Keep packetId=CommandManager isolated to the 0x013A/0x013B/0x013D/0x013F codec family.
-     * AppPolling/MAC13 commands retain their existing sequence rules.
-     */
-    @SuppressLint("MissingPermission")
-    private fun enqueueOfficialCodecProto(
-        commandId: Int,
-        proto: ByteArray,
-        purpose: String,
-        label: String,
-        expectedResponseId: Int = commandId
-    ): Boolean {
-        val current = gatt ?: return false
-        val service = current.getService(UUID.fromString(AIRGLU_SHOGUN_SERVICE_UUID)) ?: return false
-        service.getCharacteristic(UUID.fromString(TCS_PACKET_WRITE_UUID)) ?: return false
-        // R16.7: Codec commands are created with packetID at its default in the
-        // RemoteApi constructor, then submitted through macOS CommandManager.
-        // CommandManager owns m_lastPacketID and assigns the live AtomMessage
-        // packet ID. Do the same here instead of hard-forcing packetId=CommandManager.
-        tcsCommandSequence = if (tcsCommandSequence >= 255) 1 else tcsCommandSequence + 1
-        val packetId = tcsCommandSequence
-        val body = buildOfficialAtomMessageBodyWithProtoPayload(packetId, commandId, proto)
-        val packet = PendingRemotePacket(
-            body = body, purpose = purpose, label = label, commandId = commandId,
-            packetId = packetId, expectedResponseId = expectedResponseId
-        )
-        pendingRemotePacket = packet
-        pendingRemoteFrameWritten = false
-        _tcsRemoteState.value = _tcsRemoteState.value.copy(
-            phase = if (tcsPacketRemoteCredit) "sending" else "requesting-credit",
-            available = true, lastCommand = label, lastCommandId = commandId,
-            lastTxHex = null, lastStatus = "Sending $label", lastError = null
-        )
-        appendEvent(
-            "TCS20.15R16.7 CODEC QUEUE label=$label cmd=0x${commandId.toString(16).uppercase()} " +
-                "packetId=$packetId m_isLocal=0 payloadLen=${proto.size} proto=${proto.toHex()} body=${body.toHex()}"
-        )
-        return queueRemotePacket18_8(packet, local = false)
-    }
-
     @SuppressLint("MissingPermission")
     fun sendOfficialCodecProfile(codec: Int, bitDepth: Int): Boolean {
         if (codecRemoteWireValue(codec) == null) {
@@ -5884,22 +6616,20 @@ class GattClient(context: Context) {
             appendEvent("TCS19.11.9 CODEC unsupported bitDepth=$bitDepth")
             return false
         }
+        if (!canQueueOfficialCodecCommand(codec, bitDepth)) return false
         val wireCodec = codecRemoteWireValue(codec) ?: return false
-        // Exact macOS RecordTabController path: raw codec <= 12 is sent with
-        // CodecBitDepth sentinel 3 (recorder-managed/not-applicable), not 0.
-        val effectiveBitDepth = officialCodecBitDepthForWire(wireCodec, bitDepth)
-        if (!canQueueOfficialCodecCommand(codec, effectiveBitDepth)) return false
-        val proto = buildRecordCodecProfileProto(wireCodec, effectiveBitDepth)
+        val proto = buildRecordCodecProfileProto(wireCodec, bitDepth)
         val label = "Codec ${codecProfileLabel(codec)}"
         appendEvent(
-            "TCS20.15R16.2 CODEC NONREBOOT SET cmd=0x${REMOTE_RECORD_NON_REBOOT_CODEC_PROFILE_SET.toString(16)} " +
-                "m_isLocal=0 logical=$codec wire=$wireCodec requestedBitDepth=$bitDepth effectiveBitDepth=$effectiveBitDepth proto=${proto.toHex()}"
+            "TCS20.15R15 CODEC NONREBOOT SET cmd=0x${REMOTE_RECORD_NON_REBOOT_CODEC_PROFILE_SET.toString(16)} " +
+                "packetId=0 m_isLocal=0 logical=$codec wire=$wireCodec bitDepth=$bitDepth proto=${proto.toHex()}"
         )
-        return enqueueOfficialCodecProto(
+        return enqueueOfficialRemoteCommandProtoPayload(
             commandId = REMOTE_RECORD_NON_REBOOT_CODEC_PROFILE_SET,
             proto = proto,
-            purpose = "remote-codec-profile-set:$codec:$effectiveBitDepth",
-            label = label
+            purpose = "remote-codec-profile-set:$codec:$bitDepth",
+            label = label,
+            local = false
         )
     }
 
@@ -5914,20 +6644,20 @@ class GattClient(context: Context) {
             appendEvent("TCS20.15R15 CODEC RESTART SET invalid profile=$codec bitDepth=$bitDepth")
             return false
         }
+        if (!canQueueOfficialCodecCommand(codec, bitDepth)) return false
         val wireCodec = codecRemoteWireValue(codec) ?: return false
-        val effectiveBitDepth = officialCodecBitDepthForWire(wireCodec, bitDepth)
-        if (!canQueueOfficialCodecCommand(codec, effectiveBitDepth)) return false
-        val proto = buildRecordCodecProfileProto(wireCodec, effectiveBitDepth)
+        val proto = buildRecordCodecProfileProto(wireCodec, bitDepth)
         val label = "Restart codec ${codecProfileLabel(codec)}"
         appendEvent(
-            "TCS20.15R16.2 CODEC RESTART SET cmd=0x${REMOTE_RECORD_CODEC_PROFILE_SET.toString(16)} " +
-                "m_isLocal=0 logical=$codec wire=$wireCodec requestedBitDepth=$bitDepth effectiveBitDepth=$effectiveBitDepth proto=${proto.toHex()}"
+            "TCS20.15R15 CODEC RESTART SET cmd=0x${REMOTE_RECORD_CODEC_PROFILE_SET.toString(16)} " +
+                "packetId=0 m_isLocal=0 logical=$codec wire=$wireCodec bitDepth=$bitDepth proto=${proto.toHex()}"
         )
-        return enqueueOfficialCodecProto(
+        return enqueueOfficialRemoteCommandProtoPayload(
             commandId = REMOTE_RECORD_CODEC_PROFILE_SET,
             proto = proto,
-            purpose = "remote-codec-profile-activate:$codec:$effectiveBitDepth",
-            label = label
+            purpose = "remote-codec-profile-activate:$codec:$bitDepth",
+            label = label,
+            local = false
         )
     }
 
@@ -5940,27 +6670,41 @@ class GattClient(context: Context) {
     @SuppressLint("MissingPermission")
     private fun queueOfficialCodecProfileGet(codec: Int, bitDepth: Int, source: String): Boolean {
         val wireCodec = codecRemoteWireValue(codec) ?: return false
-        if (bitDepth !in 0..3) return false
+        if (bitDepth !in 0..2) return false
         if (!canQueueOfficialCodecCommand(codec, bitDepth)) return false
 
-        // Fresh macOS constructor parity: CodecProfileGet(0x013A) carries
-        // codec + codecBitdepth and is m_isLocal=false. R16.2 therefore lets the
-        // CommandManager-style non-local sequence own packetId instead of using
-        // the packetId=CommandManager rule reserved for local one-shot setters.
+        // binary-confirmed macOS constructor parity:
+        // CodecProfileGet(0x013A) is NOT an empty GET. The official controller
+        // passes codec + codecBitdepth into RecordCodecProfileMsg, uses packetId 0,
+        // and sends it as a non-local RemoteApi AtomMessage.
         val proto = buildRecordCodecProfileProto(wireCodec, bitDepth)
-        pendingCodecReadbackExpected = codec to bitDepth
-        pendingCodecReadbackSource = source
-        appendEvent(
-            "TCS20.15R16.2 CODEC READBACK TX typed=1 cmd=0x${REMOTE_RECORD_CODEC_PROFILE_GET.toString(16)} " +
-                "source=$source expected=$codec/$bitDepth payloadLen=${proto.size} proto=${proto.toHex()} m_isLocal=0"
-        )
-        val queued = enqueueOfficialCodecProto(
-            commandId = REMOTE_RECORD_CODEC_PROFILE_GET,
-            proto = proto,
+        val packetId = 0
+        val body = buildOfficialAtomMessageBodyWithProtoPayload(packetId, REMOTE_RECORD_CODEC_PROFILE_GET, proto)
+        val packet = PendingRemotePacket(
+            body = body,
             purpose = "remote-codec-profile-get:$codec:$bitDepth:$source",
             label = "Codec readback",
+            commandId = REMOTE_RECORD_CODEC_PROFILE_GET,
+            packetId = packetId,
             expectedResponseId = REMOTE_RECORD_CODEC_PROFILE_GET
         )
+        pendingCodecReadbackExpected = codec to bitDepth
+        pendingCodecReadbackSource = source
+        pendingRemotePacket = packet
+        pendingRemoteFrameWritten = false
+        _tcsRemoteState.value = _tcsRemoteState.value.copy(
+            phase = if (tcsPacketRemoteCredit) "sending" else "requesting-credit",
+            available = true,
+            lastCommand = packet.label,
+            lastCommandId = packet.commandId,
+            lastStatus = "Checking recorder codec state",
+            lastError = null
+        )
+        appendEvent(
+            "TCS20.15R15 CODEC READBACK TX typed=1 cmd=0x${REMOTE_RECORD_CODEC_PROFILE_GET.toString(16)} " +
+                "source=$source expected=$codec/$bitDepth packetId=0 payloadLen=${proto.size} proto=${proto.toHex()} m_isLocal=0 body=${body.toHex()}"
+        )
+        val queued = queueRemotePacket18_8(packet, local = false)
         if (!queued) {
             pendingCodecReadbackExpected = null
             pendingCodecReadbackSource = null
@@ -5977,272 +6721,6 @@ class GattClient(context: Context) {
         codecReadbackTimeout = task
         mainHandler.postDelayed(task, CODEC_GRANULAR_RESPONSE_TIMEOUT_MS)
         return true
-    }
-
-    /**
-     * Fresh Contents.zip proves CodecProfileListGet = 0x013D and the Record UI
-     * passes selectedSegmentIndex 0/1/2 (CodecBitDepth) into it. The response is
-     * RecordCodecProfileListMsg with repeated codecList.
-     */
-    @SuppressLint("MissingPermission")
-    private fun queueOfficialCodecProfileListGet(bitDepth: Int, source: String): Boolean {
-        if (bitDepth !in 0..2) return false
-        if (!canQueueOfficialCodecCommand(1, bitDepth)) return false
-        val proto = ByteArrayOutputStream().apply {
-            if (bitDepth != 0) { write(0x08); writeUnsignedVarint(bitDepth) }
-        }.toByteArray()
-        codecCapabilityReadbackBitDepth = bitDepth
-        appendEvent("TCS20.15R16.2 CODEC LIST GET cmd=0x13D bitDepth=$bitDepth source=$source m_isLocal=0 proto=${proto.toHex()}")
-        return enqueueOfficialCodecProto(
-            commandId = REMOTE_RECORD_CODEC_PROFILE_LIST_GET,
-            proto = proto,
-            purpose = "remote-codec-profile-list:$bitDepth:$source",
-            label = "Codec supported profiles",
-            expectedResponseId = REMOTE_RECORD_CODEC_PROFILE_LIST_GET
-        )
-    }
-
-    /**
-     * R16.3 recorder-authoritative CURRENT codec sync used by both Codec cards.
-     *
-     * macOS evidence: 0x013A is constructed with codec+bitDepth and is used as
-     * a tuple query/verifier. It cannot discover the current tuple from an empty
-     * UI state. The current Record UI state comes from AppPolling pages instead:
-     *   0x0648 InputOutputSummaryGet -> current codec wire enum
-     *   0x0643 RecordPageGet         -> current bitDepth + supported lists
-     *
-     * Sequence is deliberately strict: summary -> record page -> optional 0x013D
-     * capability refresh. It never starts the full MAC13 bootstrap.
-     */
-    /**
-     * R16.8 CURRENT-FIRST codec sync.
-     *
-     * Fresh Contents.zip evidence:
-     * - RecordTabController viewDidLoad submits AppPolling.RecordPageGet 0x0643
-     *   through CommandManager (m_isLocal=false).
-     * - AppPolling.InputOutputSummaryGet 0x0648 carries the current codec enum
-     *   and is submitted through CommandManager with policy byte +0x58 = 1.
-     * - CommandManager policy 1 replaces/discards an older pending command with
-     *   the same command ID. It does NOT change the AtomMessage wire payload.
-     * - RecordPage carries codec_list + current codec_bitdepth, while
-     *   InputOutputSummary carries the current codec enum.
-     *
-     * Therefore SYNC must collect 0x0643 + 0x0648 typed pages. 0x013D is only a
-     * capability-list getter and is never a substitute for current state.
-     */
-    fun syncOfficialCodecState(bitDepthHint: Int): Boolean {
-        if (!_tcsPairingState.value.acceptWritten || !_tcsRemoteState.value.available || !packetLink18Primed) {
-            appendEvent("TCS20.15R16.8 CODEC SYNC blocked accept=${_tcsPairingState.value.acceptWritten} available=${_tcsRemoteState.value.available} primed=$packetLink18Primed")
-            return false
-        }
-        return startCodecCurrentStateSync("manual-sync", null)
-    }
-
-    @SuppressLint("MissingPermission")
-    private fun enqueueCodecCurrentStatePage(commandId: Int, label: String, replaceSameCommand: Boolean): Boolean {
-        if (pendingRemotePacket != null || operationInFlight || pendingOps.isNotEmpty()) return false
-        val current = gatt ?: return false
-        val service = current.getService(UUID.fromString(AIRGLU_SHOGUN_SERVICE_UUID)) ?: return false
-        service.getCharacteristic(UUID.fromString(TCS_PACKET_WRITE_UUID)) ?: return false
-
-        // Official CommandManager owns packet IDs for these non-local queries.
-        tcsCommandSequence = if (tcsCommandSequence >= 255) 1 else tcsCommandSequence + 1
-        val packetId = tcsCommandSequence
-        stateSyncPacketToPage[packetId] = commandId
-        val body = buildOfficialAtomMessageBody(packetId, commandId)
-        val packet = PendingRemotePacket(
-            body = body,
-            purpose = "remote-codec-current-page:${commandId.toString(16)}",
-            label = label,
-            commandId = commandId,
-            packetId = packetId,
-            expectedResponseId = commandId
-        )
-        pendingRemotePacket = packet
-        pendingRemoteFrameWritten = false
-        _tcsRemoteState.value = _tcsRemoteState.value.copy(
-            phase = if (tcsPacketRemoteCredit) "sending" else "requesting-credit",
-            available = true,
-            lastCommand = label,
-            lastCommandId = commandId,
-            lastTxHex = null,
-            lastStatus = "Reading $label from recorder",
-            lastError = null
-        )
-        appendEvent(
-            "TCS20.15R16.8 CODEC STATE QUEUE label=$label cmd=0x${commandId.toString(16).uppercase()} " +
-                "packetId=$packetId m_isLocal=0 managerPolicy=${if (replaceSameCommand) 1 else 0} body=${body.toHex()}"
-        )
-        return queueRemotePacket18_8(packet, local = false)
-    }
-
-    private fun startCodecCurrentStateSync(source: String, expected: Pair<Int, Int>?): Boolean {
-        if (!_tcsPairingState.value.acceptWritten || !_tcsRemoteState.value.available || !packetLink18Primed) {
-            appendEvent("TCS20.15R16.8 CODEC CURRENT SYNC blocked source=$source accept=${_tcsPairingState.value.acceptWritten} available=${_tcsRemoteState.value.available} primed=$packetLink18Primed")
-            return false
-        }
-        codecCurrentSyncGeneration += 1
-        codecCurrentSyncStage = 1 // 1 RecordPage TX, 2 Summary TX, 3 typed-page drain
-        codecCurrentSyncSource = source
-        codecCurrentSyncExpected = expected
-        codecCurrentSyncBusyRetries = 0
-        codecCurrentSyncPageRetries = 0
-        codecCurrentSawRecordPage = false
-        codecCurrentSawSummary = false
-        codecPageWireFromSummary = null
-        codecPageBitDepth = null
-        _codecHardwareProfile.value = null
-        codecCurrentSyncTimeout?.let { mainHandler.removeCallbacks(it) }
-        codecCurrentSyncTimeout = null
-        _tcsRemoteState.value = _tcsRemoteState.value.copy(
-            lastStatus = "Reading current codec from recorder",
-            lastError = null
-        )
-        appendEvent(
-            "TCS20.15R16.8 CODEC CURRENT SYNC START gen=$codecCurrentSyncGeneration source=$source " +
-                "expected=${expected?.first ?: -1}/${expected?.second ?: -1} order=0643,0648 drain=typed"
-        )
-        pumpCodecCurrentStateSync(codecCurrentSyncGeneration, 0L)
-        return true
-    }
-
-    private fun pumpCodecCurrentStateSync(gen: Int, delayMs: Long) {
-        mainHandler.postDelayed({
-            if (gen != codecCurrentSyncGeneration || codecCurrentSyncStage == 0) return@postDelayed
-
-            if (codecCurrentSyncStage == 3) {
-                if (codecCurrentSawRecordPage && codecCurrentSawSummary && _codecHardwareProfile.value != null) {
-                    finishCodecCurrentStateSync(true, null)
-                    return@postDelayed
-                }
-                codecCurrentSyncTimeout?.let { mainHandler.removeCallbacks(it) }
-                val timeout = Runnable {
-                    if (gen != codecCurrentSyncGeneration || codecCurrentSyncStage != 3) return@Runnable
-                    if (codecCurrentSawRecordPage && codecCurrentSawSummary && _codecHardwareProfile.value != null) {
-                        finishCodecCurrentStateSync(true, null)
-                        return@Runnable
-                    }
-                    if (codecCurrentSyncPageRetries < 3) {
-                        codecCurrentSyncPageRetries += 1
-                        appendEvent(
-                            "TCS20.15R16.8 CODEC STATE DRAIN retry=$codecCurrentSyncPageRetries gen=$gen " +
-                                "record=${if (codecCurrentSawRecordPage) 1 else 0} summary=${if (codecCurrentSawSummary) 1 else 0}"
-                        )
-                        // CommandManager policy 1 for 0x0648 means a refresh replaces
-                        // an older same-ID pending request. Reissue only missing typed
-                        // pages, while preserving already received state.
-                        codecCurrentSyncStage = when {
-                            !codecCurrentSawRecordPage -> 1
-                            !codecCurrentSawSummary -> 2
-                            else -> 3
-                        }
-                        pumpCodecCurrentStateSync(gen, 120L)
-                    } else {
-                        finishCodecCurrentStateSync(
-                            false,
-                            "Recorder did not return typed codec state pages (RecordPage=${if (codecCurrentSawRecordPage) "yes" else "no"}, InputOutputSummary=${if (codecCurrentSawSummary) "yes" else "no"})"
-                        )
-                    }
-                }
-                codecCurrentSyncTimeout = timeout
-                mainHandler.postDelayed(timeout, 3200L)
-                return@postDelayed
-            }
-
-            if (pendingRemotePacket != null || operationInFlight || pendingOps.isNotEmpty()) {
-                if (codecCurrentSyncBusyRetries < 50) {
-                    codecCurrentSyncBusyRetries += 1
-                    if (codecCurrentSyncBusyRetries == 1 || codecCurrentSyncBusyRetries % 10 == 0) {
-                        appendEvent("TCS20.15R16.8 CODEC STATE waiting-slot stage=$codecCurrentSyncStage retry=$codecCurrentSyncBusyRetries gen=$gen")
-                    }
-                    pumpCodecCurrentStateSync(gen, 120L)
-                } else {
-                    finishCodecCurrentStateSync(false, "PacketLink stayed busy before codec state query")
-                }
-                return@postDelayed
-            }
-
-            val stageAtSend = codecCurrentSyncStage
-            val commandId = if (stageAtSend == 1) REMOTE_APP_POLLING_RECORD_PAGE_GET else REMOTE_APP_POLLING_INPUT_OUTPUT_SUMMARY_GET
-            val label = if (stageAtSend == 1) "Codec RecordPage" else "Codec InputOutputSummary"
-            val replaceSameCommand = stageAtSend == 2
-            val queued = enqueueCodecCurrentStatePage(commandId, label, replaceSameCommand)
-            appendEvent(
-                "TCS20.15R16.8 CODEC STATE TX stage=$stageAtSend cmd=0x${commandId.toString(16).uppercase()} " +
-                    "queued=$queued gen=$gen"
-            )
-            if (!queued) {
-                codecCurrentSyncBusyRetries += 1
-                pumpCodecCurrentStateSync(gen, 140L)
-                return@postDelayed
-            }
-
-            codecCurrentSyncBusyRetries = 0
-            // Match macOS CommandManager behavior: dispatch both independent
-            // state requests based on transport availability, not semantic reply.
-            codecCurrentSyncStage = if (stageAtSend == 1) 2 else 3
-            pumpCodecCurrentStateSync(gen, if (stageAtSend == 1) 140L else 120L)
-        }, delayMs)
-    }
-
-    private fun onCodecCurrentPageReceived(commandId: Int) {
-        if (codecCurrentSyncStage == 0) return
-        when (commandId) {
-            REMOTE_APP_POLLING_RECORD_PAGE_GET -> {
-                codecCurrentSawRecordPage = true
-                appendEvent(
-                    "TCS20.15R16.8 CODEC RECORD PAGE RX bitDepth=${codecPageBitDepth ?: -1} " +
-                        "summaryWire=${codecPageWireFromSummary ?: -1} gen=$codecCurrentSyncGeneration"
-                )
-            }
-            REMOTE_APP_POLLING_INPUT_OUTPUT_SUMMARY_GET -> {
-                codecCurrentSawSummary = true
-                appendEvent(
-                    "TCS20.15R16.8 CODEC SUMMARY RX wire=${codecPageWireFromSummary ?: -1} " +
-                        "bitDepth=${codecPageBitDepth ?: -1} gen=$codecCurrentSyncGeneration"
-                )
-            }
-        }
-        if (codecCurrentSawRecordPage && codecCurrentSawSummary && _codecHardwareProfile.value != null) {
-            finishCodecCurrentStateSync(true, null)
-        }
-    }
-
-    private fun finishCodecCurrentStateSync(success: Boolean, error: String?) {
-        codecCurrentSyncTimeout?.let { mainHandler.removeCallbacks(it) }
-        codecCurrentSyncTimeout = null
-        val actual = _codecHardwareProfile.value
-        val expected = codecCurrentSyncExpected
-        val source = codecCurrentSyncSource ?: "sync"
-        val matched = expected == null || actual == expected
-        val recordSeen = codecCurrentSawRecordPage
-        val summarySeen = codecCurrentSawSummary
-        codecCurrentSyncStage = 0
-        codecCurrentSyncSource = null
-        codecCurrentSyncExpected = null
-        codecCurrentSyncBusyRetries = 0
-        codecCurrentSyncPageRetries = 0
-        _tcsRemoteState.value = _tcsRemoteState.value.copy(
-            lastStatus = when {
-                success && actual != null && expected == null -> "Current codec synchronized: ${codecProfileLabel(actual.first)}"
-                success && actual != null && matched -> "${codecProfileLabel(actual.first)} confirmed after Apply"
-                success && actual != null -> "Recorder reports ${codecProfileLabel(actual.first)}"
-                else -> "Codec current-state sync failed"
-            },
-            lastError = if (success) null else error
-        )
-        appendEvent(
-            "TCS20.15R16.8 CODEC CURRENT SYNC END success=$success actual=${actual?.first ?: -1}/${actual?.second ?: -1} " +
-                "record=${if (recordSeen) 1 else 0} summary=${if (summarySeen) 1 else 0} " +
-                "expected=${expected?.first ?: -1}/${expected?.second ?: -1} match=${if (matched) 1 else 0} source=$source error=${error ?: "none"}"
-        )
-        if (success && actual != null) {
-            val depth = actual.second
-            mainHandler.postDelayed({
-                if (pendingRemotePacket == null) queueOfficialCodecProfileListGet(depth, "current-$source")
-            }, 180L)
-        }
-        publishInputCodecCollector(source = if (success) "codec-current-$source" else "codec-current-failed")
     }
 
     private fun scheduleOfficialCodecReadback(
@@ -6620,7 +7098,9 @@ class GattClient(context: Context) {
             RemoteBootstrapQuery(0x00DD, 0x00DC, "Output.HdrStateGet", local = false),
             RemoteBootstrapQuery(0x013C, 0x013C, "Record.PulldownFormatGet", local = false),
             RemoteBootstrapQuery(0x0070, 0x006C, "Input.DeviceNameGet", local = false),
-            RemoteBootstrapQuery(0x02BF, 0x02BD, "LutSlotGet", local = false)
+            RemoteBootstrapQuery(0x02BF, 0x02BD, "LutSlotGet", local = false),
+            // INPUT14: skip unverified bulk page probes on normal startup.
+            // Keep the proven MAC13 command sequence intact.
         ).forEach { remoteBootstrapQueue.addLast(it) }
 
         remoteBootstrapTotal = remoteBootstrapQueue.size
@@ -6642,12 +7122,12 @@ class GattClient(context: Context) {
             phase = "bootstrapping",
                     available = true,
                     linked = _tcsRemoteState.value.linked,
-            lastStatus = "Syncing official 13-command macOS Remote startup",
+            lastStatus = "Syncing Remote state and Input pages",
             lastError = null
         )
 
         appendEvent(
-            "TCS20.04.9 MAC13 START count=$remoteBootstrapTotal " +
+            "INPUT12 MAC13+PAGES START count=$remoteBootstrapTotal " +
                 "monitorModeLocal=1 inputCore=0648,0064,0071,0070"
         )
 
@@ -6684,6 +7164,9 @@ class GattClient(context: Context) {
         tcsCommandSequence = if (tcsCommandSequence >= 255) 1 else tcsCommandSequence + 1
         val packetId = tcsCommandSequence
 
+        if (query.label == "Input.SourceGet" || query.label == "Input.HdrStateGet" || query.label == "Input.DeviceNameGet") {
+            input06aBootstrapPending[packetId] = Pair(query.expectedResponseId, query.label)
+        }
         if (appPollingStateQuery) {
             stateSyncPacketToPage[packetId] = query.commandId
         }
@@ -6818,12 +7301,7 @@ class GattClient(context: Context) {
         val current = gatt ?: return false
         val service = current.getService(UUID.fromString(AIRGLU_SHOGUN_SERVICE_UUID)) ?: return false
         service.getCharacteristic(UUID.fromString(TCS_PACKET_WRITE_UUID)) ?: return false
-        // R16.7: Codec commands are created with packetID at its default in the
-        // RemoteApi constructor, then submitted through macOS CommandManager.
-        // CommandManager owns m_lastPacketID and assigns the live AtomMessage
-        // packet ID. Do the same here instead of hard-forcing packetId=CommandManager.
-        tcsCommandSequence = if (tcsCommandSequence >= 255) 1 else tcsCommandSequence + 1
-        val packetId = tcsCommandSequence
+        val packetId = 0
         val body = buildOfficialAtomMessageBodyWithProtoPayload(packetId, commandId, proto)
         val packet = PendingRemotePacket(body, purpose, label, commandId, packetId)
         pendingRemotePacket = packet
@@ -6975,6 +7453,9 @@ class GattClient(context: Context) {
             appendEvent("TCS18.8 PLINK BUFFER BUSY label=${packet.label} state=${packetLink18.state()} buffered=${packetLink18.bufferedPacketSize()}")
             return false
         }
+        if (outputR7IsTrackedPurpose(packet.purpose)) {
+            outputR7Trace("BUFFER_ACCEPTED purpose=${packet.purpose} cmd=0x${packet.commandId.toString(16)} packetId=${packet.packetId} local=$local")
+        }
         pendingRemotePacket = packet
         pendingRemoteFrameWritten = false
         _tcsRemoteState.value = _tcsRemoteState.value.copy(
@@ -7044,6 +7525,10 @@ class GattClient(context: Context) {
                 PLINK18_WRITE_PURPOSE
             )
         )
+        if (subpacket.includesPacketPayload && outputR7IsTrackedPurpose(pendingRemotePacket?.purpose)) {
+            outputR7Trace("PLINK18_DATA_TX_ENQUEUED purpose=${pendingRemotePacket?.purpose} " +
+                "packetId=${pendingRemotePacket?.packetId} bytes=${subpacket.bytes.toHex()}")
+        }
         _tcsRemoteState.value = _tcsRemoteState.value.copy(
             lastTxHex = subpacket.bytes.toHex(),
             lastStatus = when {
@@ -7091,6 +7576,14 @@ class GattClient(context: Context) {
             appendEvent("TCS18.8 PLINK WRITE FAIL status=$status; returning transport to READY")
             return true
         }
+        // R26.17: Audio-only confirmation of a physical ATT packet write; passive.
+        if (op.value.size > 1) audioR26OnGATTWritten()
+        // OUTPUT R8: successful ATT callback for the *active* PLINK18 route.
+        // The previous GATT_WRITE_OK marker was installed on the legacy remote-data path.
+        if (op.value.size > 1 && outputR7IsTrackedPurpose(pendingRemotePacket?.purpose)) {
+            outputR7Trace("PLINK18_GATT_DATA_WRITE_OK purpose=${pendingRemotePacket?.purpose} " +
+                "packetId=${pendingRemotePacket?.packetId} bytes=${op.value.toHex()}")
+        }
 
         when (packetLink18.onWriteComplete()) {
             TcsPacketLinkTransport.WriteCompleteAction.Read -> {
@@ -7124,6 +7617,17 @@ class GattClient(context: Context) {
 
         val result = packetLink18.onReadSubpacket(value)
         tcsPacketRemoteCredit = result.peerCredit
+        if (outputR7IsTrackedPurpose(pendingRemotePacket?.purpose)) {
+            val completedPayload = result.packet
+            if (completedPayload != null) {
+                outputR7Trace("PLINK18_PAYLOAD_RX purpose=${pendingRemotePacket?.purpose} " +
+                    "bytes=${completedPayload.size} local=${result.packetLocal} " +
+                    "frame=${value.toHex().take(160)}")
+            } else if (value.size == 1 && (value[0].toInt() and 0xFF) == 0xE0) {
+                outputR7Trace("PLINK18_E0_FLOW_ONLY purpose=${pendingRemotePacket?.purpose} " +
+                    "packetId=${pendingRemotePacket?.packetId}")
+            }
+        }
         appendEvent(
             "TCS18.8 PLINK RX state=${packetLink18.state()} frame=${value.toHex()} final=${!result.needAnotherRead} peerCredit=${result.peerCredit} local=${result.packetLocal} payloadBytes=${result.packet?.size ?: 0}"
         )
@@ -7152,10 +7656,18 @@ class GattClient(context: Context) {
 
         if (result.txPacketCompletedThisTurn) {
             val sent = pendingRemotePacket
+            audioR26OnTransportComplete(sent)
             pendingRemotePacket = null
             pendingRemoteFrameWritten = false
             if (sent != null) {
                 appendEvent("TCS18.9.1 TRANSPORT DELIVERED label=${sent.label} cmd=${sent.commandId}; PacketLink transport complete; recorder action unconfirmed")
+                // INPUT06F: This is the transport-completion boundary for a
+                // read-only Input core GET. Do not affect other commands.
+                if (sent.purpose.startsWith("remote-input-route-matrix:") &&
+                    inputCollectorRunning && activeInputProbe?.commandId == sent.commandId) {
+                    appendEvent("INPUT16 GET DELIVERED label=${sent.label} attempt=$inputProbeVariant purpose=${sent.purpose}; waiting-typed-RX")
+                    armInputProbeSemanticTimeout(activeInputProbe!!, inputProbeVariant)
+                }
                 if (sent.bootstrap) {
                     enqueueNextMacRemoteBootstrapQuery()
                 } else {
@@ -7250,9 +7762,9 @@ class GattClient(context: Context) {
                     }
                 }
 
-                // 9-Grid stays on its frozen R12/R13 readback path. Frame Guide
-                // itself uses the R16.2 bounded readback pump below so duplicate
-                // 95/140 ms GETs cannot fight for the single PacketLink slot.
+                // 9-Grid remains on its frozen readback path. Frame Guide uses the
+                // physically-proven R16.2 bounded 0x0276 readback pump so competing
+                // 95/140ms reads cannot fight for the one PacketLink slot.
                 if (sent.purpose.startsWith("remote-guide-grid-set:")) {
                     appendEvent("TCS20.13.R10 GRID TRANSPORT COMPLETE purpose=${sent.purpose}; scheduling frozen format readback")
                     mainHandler.postDelayed({
@@ -7318,17 +7830,12 @@ class GattClient(context: Context) {
                     val requestedCodec = parts.getOrNull(1)?.toIntOrNull()
                     val requestedBitDepth = parts.getOrNull(2)?.toIntOrNull()
                     val source = if (sent.purpose.startsWith("remote-codec-profile-activate:")) "restart-set" else "non-reboot"
-                    val delayMs = if (source == "restart-set") 1500L else 650L
+                    val delayMs = if (source == "restart-set") 1200L else 450L
                     if (requestedCodec != null && requestedBitDepth != null) {
                         appendEvent(
-                            "TCS20.15R16.4 CODEC POST-APPLY TYPED VERIFY schedule source=$source expected=$requestedCodec/$requestedBitDepth delayMs=$delayMs packetId=CommandManager"
+                            "TCS19.12.1 CODEC VERIFY SCHEDULE source=$source expected=$requestedCodec/$requestedBitDepth delayMs=$delayMs"
                         )
-                        scheduleOfficialCodecReadback(
-                            codec = requestedCodec,
-                            bitDepth = requestedBitDepth,
-                            source = source,
-                            delayMs = delayMs
-                        )
+                        scheduleOfficialCodecReadback(requestedCodec, requestedBitDepth, source, delayMs)
                     }
                 }
 
@@ -7423,6 +7930,22 @@ class GattClient(context: Context) {
                 (payloadLen == payload.size + 1 || payloadLen == payload.size + 2)
 
         if (declaredTotal != payload.size && !zoomBoxFrameLengthCompat) {
+            // AUDIO R26.11.2: complete-body acceptance still uses the
+            // existing strict demux. Never treat a partial Audio page as typed.
+            if (local && normalizedHeaderMessageType == REMOTE_APP_POLLING_AUDIO_METERS_PAGE_GET) {
+                android.util.Log.i("AtomRemoteAudioR26Fix",
+                    "AUDIO_PAGE_TRUNCATED msg=0x${messageType.toString(16)} " +
+                        "declared=$payloadLen actual=${(payload.size - 5).coerceAtLeast(0)} " +
+                        "mtu=$outputR21MtuBytes action=DROP_INCOMPLETE")
+            }
+            if (local && normalizedHeaderMessageType == REMOTE_APP_POLLING_OUTPUT_PAGE_GET) {
+                android.util.Log.i("AtomRemoteOutputR21",
+                    "PAGE_TRUNCATED_RX type=0x${messageType.toString(16)} " +
+                        "packetId=$packetId declaredPayload=$payloadLen actualPayload=${(payload.size - 5).coerceAtLeast(0)} " +
+                        "totalNeeded=$declaredTotal totalReceived=${payload.size} " +
+                        "negotiatedMtu=$outputR21MtuBytes mtuState=$outputR21MtuResult " +
+                        "finalPacketLink=true action=DROP_INCOMPLETE")
+            }
             val asciiLike = payload.all { byte ->
                 val value = byte.toInt() and 0xFF
                 value == 0x09 || value == 0x0A || value == 0x0D || value in 0x20..0x7E
@@ -7463,7 +7986,50 @@ class GattClient(context: Context) {
         )
         appendEvent("TCS18.8 REMOTE PAYLOAD local=$local packetId=$packetId payloadLen=$payloadLen messageType=$messageType data=${body.toHex()}")
 
+        if (WlConnectPrototype.isPotentialConnectResponse(messageType)) {
+            appendEvent(
+                "WLP3 RAW CONNECT RX packetId=$packetId " +
+                    "messageType=0x${messageType.toString(16).uppercase()} " +
+                    "normalized=0x${(messageType and 0x7FFF).toString(16).uppercase()} " +
+                    "local=${if (local) 1 else 0} payloadLen=$payloadLen bytes=${body.size} " +
+                    "raw=${body.toHex()} ascii=${wl32AsciiPreview(body)}"
+            )
+
+            val pendingLiveMode = wl32PendingByPacketId[packetId]
+            if (pendingLiveMode != null &&
+                (pendingLiveMode.getter.commandId == 0x02FF || pendingLiveMode.getter.commandId == 0x0300)
+            ) {
+                appendEvent(
+                    "WLP5 LIVEMODE RESPONSE CANDIDATE request=${pendingLiveMode.getter.label} " +
+                        "requestCmd=0x${pendingLiveMode.getter.commandId.toString(16).uppercase()} " +
+                        "packetId=$packetId responseType=0x${messageType.toString(16).uppercase()} " +
+                        "payloadLen=$payloadLen raw=${body.toHex()}"
+                )
+            }
+        }
+
         val pending = pendingRemotePacket
+
+        val wl32Correlated = wl32PendingByPacketId.remove(packetId)
+        if (wl32Correlated != null) {
+            val getter = wl32Correlated.getter
+            appendEvent(
+                "WL35 RX label=${getter.label} " +
+                    "cmd=0x${getter.commandId.toString(16).uppercase()} " +
+                    "variant=${wl32Correlated.variant} requestLocal=${if (wl32Correlated.localRoute) 1 else 0} " +
+                    "requestPayload=${if (wl32Correlated.protoTrue) "0801" else "EMPTY"} " +
+                    "packetId=$packetId response=0x${messageType.toString(16).uppercase()} " +
+                    "responseLocal=${if (local) 1 else 0} bytes=${body.size} raw=${body.toHex()} " +
+                    "ascii=${wl32AsciiPreview(body)}"
+            )
+        } else if (messageType in 0x02E0..0x0311 || messageType == 0xFFFE || messageType == 0xFFFF) {
+            appendEvent(
+                "WL35 RX UNCORRELATED packetId=$packetId " +
+                    "response=0x${messageType.toString(16).uppercase()} " +
+                    "local=${if (local) 1 else 0} bytes=${body.size} raw=${body.toHex()} " +
+                    "ascii=${wl32AsciiPreview(body)}"
+            )
+        }
 
         // Phase 09 recorder-state decoding. These are GET responses already
         // present in the recovered macOS startup polling sequence. Field order
@@ -7472,11 +8038,128 @@ class GattClient(context: Context) {
         // rather than inventing enum names that have not yet been recovered.
         val normalizedMessageType = messageType and 0x7FFF
 
+        // AUDIO R26.13: RX only, preserving all existing PacketLink handlers.
+        audioR26ObserveTypedRx(pending, messageType, body, local)
+
+        // OUTPUT R20: passive receive evidence. A GATT ACK, E0 or unrelated
+        // payload is NOT a verified OutputPage response.
+        val r20PendingPage = pending?.purpose == "remote-output-r19-output-page-get" ||
+            pending?.purpose == "remote-output-r20-output-page-local-get"
+        if (r20PendingPage || normalizedMessageType == REMOTE_APP_POLLING_OUTPUT_PAGE_GET) {
+            android.util.Log.i("AtomRemoteOutputR20",
+                "PAGE_RX type=0x${messageType.toString(16)} " +
+                    "normalized=0x${normalizedMessageType.toString(16)} " +
+                    "local=$local packetId=$packetId pending=${pending?.purpose ?: "none"} " +
+                    "typed=${normalizedMessageType == REMOTE_APP_POLLING_OUTPUT_PAGE_GET && body.isNotEmpty()} " +
+                    "body=${body.toHex().take(256)}")
+        }
+
+        // OUTPUT R17: strictly-correlated scalar response proof. E0, write
+        // callbacks, unrelated AtomMessages and malformed payloads NEVER set UI.
+        val r17Kind = outputR17ProbeKind
+        if (r17Kind != null) {
+            val r17Active = android.os.SystemClock.elapsedRealtime() <= outputR17ProbeExpiresAt
+            val r17Expected = outputR17ProbeExpectedResponse
+            val r17Matching = local && r17Active && normalizedMessageType == r17Expected
+            if (r17Matching || ((messageType == 0xFFFE || messageType == 0xFFFF) &&
+                    pending?.purpose == "remote-output-r17-get-$r17Kind")) {
+                android.util.Log.i("AtomRemoteOutputR17",
+                    "PROBE_RX kind=$r17Kind type=0x${messageType.toString(16)} " +
+                    "expected=0x${r17Expected.toString(16)} local=$local active=$r17Active " +
+                    "packetId=$packetId raw=${body.toHex()}")
+            }
+            if (r17Matching) {
+                val value = protoVarintField(body, 1)
+                if (value != null && value in 0..255 &&
+                    (r17Kind != "hdmi-timecode" || value in 0..1)) {
+                    when (r17Kind) {
+                        "downscale" -> _outputDownscaleRawId.value = value
+                        "dci-crop" -> _outputDciCropRawId.value = value
+                        "hdmi-timecode" -> _outputHdmiTimecodeEnabled.value = value == 1
+                    }
+                    android.util.Log.i("AtomRemoteOutputR17",
+                        "PROBE_CONFIRMED kind=$r17Kind value=$value " +
+                        "type=0x${messageType.toString(16)} raw=${body.toHex()}")
+                    outputR17ProbeKind = null
+                    outputR17ProbeExpectedResponse = -1
+                    outputR17ProbeExpiresAt = 0L
+                } else {
+                    android.util.Log.i("AtomRemoteOutputR17",
+                        "PROBE_INVALID kind=$r17Kind raw=${body.toHex()}")
+                }
+            } else if (r17Active && (messageType == 0xFFFF || messageType == 0xFFFE) &&
+                pending?.purpose == "remote-output-r17-get-$r17Kind") {
+                android.util.Log.i("AtomRemoteOutputR17",
+                    "PROBE_REJECT kind=$r17Kind type=0x${messageType.toString(16)}")
+                outputR17ProbeKind = null
+                outputR17ProbeExpectedResponse = -1
+                outputR17ProbeExpiresAt = 0L
+            }
+        }
+
+        // R13: candidate readback is accepted only for an active, expiring,
+        // local-route probe and the precise expected typed value response.
+        // An E0 flow frame, an AtomMessage ACK, or an Input value cannot populate
+        // the Output HDR Type / Gamut UI. Raw payloads are always logged.
+        val r13Kind = outputR13ProbeKind
+        if (r13Kind != null) {
+            val active = android.os.SystemClock.elapsedRealtime() <= outputR13ProbeExpiresAt
+            val expectedType = outputR13ProbeExpectedResponse
+            if (normalizedMessageType == expectedType ||
+                normalizedMessageType == expectedType + 1 ||
+                messageType == 0xFFFF || messageType == 0xFFFE) {
+                android.util.Log.i(
+                    "AtomRemoteOutputR13",
+                    "RX_CANDIDATE kind=$r13Kind response=0x${messageType.toString(16)} " +
+                        "normalized=0x${normalizedMessageType.toString(16)} expected=0x${expectedType.toString(16)} " +
+                        "local=$local active=$active packetId=$packetId raw=${body.toHex()}"
+                )
+            }
+            if (active && local && normalizedMessageType == expectedType && body.isNotEmpty()) {
+                val value = protoVarintField(body, 1)
+                if (value != null && value in 0..255) {
+                    if (r13Kind == "hdr-type") _outputHdrTypeId.value = value
+                    if (r13Kind == "gamut") _outputGamutId.value = value
+                    android.util.Log.i(
+                        "AtomRemoteOutputR13",
+                        "READBACK_CONFIRMED kind=$r13Kind value=$value " +
+                            "type=0x${messageType.toString(16)} local=$local raw=${body.toHex()}"
+                    )
+                    outputR13ProbeKind = null
+                    outputR13ProbeExpiresAt = 0L
+                    outputR13ProbeExpectedResponse = -1
+                } else {
+                    android.util.Log.i("AtomRemoteOutputR13", "READBACK_INVALID kind=$r13Kind raw=${body.toHex()}")
+                }
+            } else if (active && (messageType == 0xFFFF || messageType == 0xFFFE) &&
+                pending?.purpose == "remote-output-r13-candidate-$r13Kind") {
+                android.util.Log.i("AtomRemoteOutputR13", "REJECT kind=$r13Kind response=0x${messageType.toString(16)}")
+                outputR13ProbeKind = null
+                outputR13ProbeExpiresAt = 0L
+                outputR13ProbeExpectedResponse = -1
+            }
+        }
+
+        // R9: observe only output GET result candidates, including explicit
+        // rejects. Seeing an RX candidate is NOT a validated readback unless
+        // existing HDR/LUT parser accepts its protobuf fields.
+        if (normalizedMessageType == 0x00DC ||
+            normalizedMessageType == REMOTE_OUTPUT_LUT_OUTPUT_AVAILABLE_RESPONSE ||
+            normalizedMessageType == REMOTE_OUTPUT_LUT_OUTPUT_ENABLE_RESPONSE ||
+            messageType == 0xFFFF || messageType == 0xFFFE) {
+            outputR7Trace(
+                "R9_RX_OUTPUT_CANDIDATE type=0x${messageType.toString(16).uppercase()} " +
+                    "packetId=$packetId local=$local payloadLen=${body.size} " +
+                    "pending=${pending?.purpose ?: "async"} raw=${body.toHex().take(120)}"
+            )
+        }
+
         handleExtendedInputPayload(messageType, body, local)
 
         // 19.12.10 semantic correlation survives the E0 transport turn. The
         // PacketLink transport may clear pendingRemotePacket before the recorder's
         // typed getter payload arrives, so the collector owns a separate probe token.
+        input06aCaptureBootstrapResponse(packetId, messageType, body)
         handleInputGranularPayload(messageType, body, local)
 
         // 20.04.0/20.04.1 MonitorModeGet typed readback.
@@ -7602,6 +8285,17 @@ class GattClient(context: Context) {
         // 20.09.0-20.09.2 recorder-backed LUT family recovered from
         // the latest supplied macOS ATOMOS Remote binary.
         when (normalizedMessageType) {
+            0x00DC -> {
+                // HdrEnableGet response; accept only canonical protobuf boolean.
+                // Invalid/non-boolean payloads remain unknown, not guessed.
+                val raw = protoVarintField(body, 1)
+                if (raw == 0 || raw == 1) {
+                    _outputHdrEnabled.value = raw == 1
+                    appendEvent("OUTPUT0614 HDR READBACK value=${_outputHdrEnabled.value} raw=${body.toHex()}")
+                } else {
+                    appendEvent("OUTPUT0614 HDR RESPONSE UNPARSED raw=${body.toHex()}")
+                }
+            }
             REMOTE_MONITOR_LUT_SLOT_RESPONSE -> {
                 val actual = protoVarintField(body, 1) ?: 0
                 if (actual in 0..8) {
@@ -7870,16 +8564,7 @@ class GattClient(context: Context) {
             // AtomProtobuf storage order recovered from Contents(3).zip:
             // 1 codec, 2 inputInfo, 3 inputCamera, 4 inputGamma, 5 inputGamut,
             // 6 outputInfo, 7 outputHdrType, 8 outputGamut.
-            _inputCodecId.value = protoVarintField(body, 1) ?: 0
-            // Fresh SwiftProtobuf metadata names field #1 simply `codec`. Proto3
-            // omits enum zero, so an absent field #1 is authoritative raw codec 0
-            // (ProRes Proxy), not unknown.
-            // Fresh SwiftProtobuf metadata names field #1 simply `codec`. Treat
-            // it as the recorder's current codec wire enum and combine it with
-            // RecordPage.codec_bitdepth (field #6) before publishing hardware truth.
-            codecPageWireFromSummary = _inputCodecId.value
-            publishCodecHardwareFromPageSources("InputOutputSummary")
-            onCodecCurrentPageReceived(REMOTE_APP_POLLING_INPUT_OUTPUT_SUMMARY_GET)
+            _inputCodecId.value = protoVarintField(body, 1)
             val inputInfoBytes = protoLengthDelimitedField(body, 2)
             _inputFormatInfo.value = inputInfoBytes?.let(::printableProtoText)
                 ?: inputInfoBytes?.let { "0x${it.toHex()}" }
@@ -8834,31 +9519,6 @@ class GattClient(context: Context) {
             }
         }
 
-        if (pending?.purpose?.startsWith("remote-codec-profile-list:") == true ||
-            (codecCapabilityReadbackBitDepth != null && normalizedMessageType == REMOTE_RECORD_CODEC_PROFILE_LIST_GET)) {
-            val normalizedType = messageType and 0x7FFF
-            val requestedDepth = pending?.purpose?.takeIf { it.startsWith("remote-codec-profile-list:") }
-                ?.split(':')?.getOrNull(1)?.toIntOrNull() ?: codecCapabilityReadbackBitDepth
-            if (normalizedType == REMOTE_RECORD_CODEC_PROFILE_LIST_GET) {
-                val wireList = parseProtoRepeatedVarintField(body, 1)
-                val logicalList = wireList.mapNotNull(::codecLogicalFromWire).distinct()
-                if (logicalList.isNotEmpty()) {
-                    _codecSupportedProfiles.value = logicalList
-                    _tcsRemoteState.value = _tcsRemoteState.value.copy(
-                        lastStatus = "Codec capability list synchronized from recorder",
-                        lastError = null
-                    )
-                }
-                appendEvent(
-                    "TCS20.15R16.2 CODEC LIST RX bitDepth=${requestedDepth ?: -1} " +
-                        "wire=$wireList logical=$logicalList raw=${body.toHex()}"
-                )
-            } else if (messageType == 0xFFFF || messageType == 0xFFFE) {
-                appendEvent("TCS20.15R16.2 CODEC LIST REJECT response=0x${messageType.toString(16).uppercase()} depth=${requestedDepth ?: -1}")
-            }
-            codecCapabilityReadbackBitDepth = null
-        }
-
         if (pending?.purpose?.startsWith("remote-codec-profile-get:") == true || pendingCodecReadbackExpected != null) {
             val parts = pending?.purpose?.takeIf { it.startsWith("remote-codec-profile-get:") }?.split(':')
             val expectedPair = pendingCodecReadbackExpected
@@ -8882,11 +9542,8 @@ class GattClient(context: Context) {
                     val actualWireCodec = protoVarintField(body, 1) ?: 0
                     val actualCodec = codecLogicalFromWire(actualWireCodec)
                     val actualBitDepth = protoVarintField(body, 2) ?: 0
-                    if (actualCodec != null && actualBitDepth in 0..3) {
-                        val displayBitDepth = if (actualBitDepth == 3 && actualWireCodec <= 12) 0 else actualBitDepth
-                        if (displayBitDepth in 0..2) {
-                            _codecHardwareProfile.value = actualCodec to displayBitDepth
-                        }
+                    if (actualCodec != null && actualBitDepth in 0..2) {
+                        _codecHardwareProfile.value = actualCodec to actualBitDepth
                         val matches = expectedCodec == actualCodec && expectedBitDepth == actualBitDepth
                         _tcsRemoteState.value = _tcsRemoteState.value.copy(
                             lastStatus = if (matches) {
@@ -8897,9 +9554,8 @@ class GattClient(context: Context) {
                             lastError = null
                         )
                         appendEvent(
-                            "TCS20.15R16.7 CODEC READBACK rawCodec=$actualWireCodec logical=$actualCodec " +
-                                "rawDepth=$actualBitDepth displayDepth=$displayBitDepth expected=$expectedCodec/$expectedBitDepth " +
-                                "match=${if (matches) 1 else 0} source=$source raw=${body.toHex()}"
+                            "TCS20.15R15 CODEC READBACK raw=$actualWireCodec logical=$actualCodec/$actualBitDepth " +
+                                "expected=$expectedCodec/$expectedBitDepth match=${if (matches) 1 else 0} source=$source raw=${body.toHex()}"
                         )
                     } else {
                         _tcsRemoteState.value = _tcsRemoteState.value.copy(
@@ -9286,6 +9942,7 @@ class GattClient(context: Context) {
         inputProbeTimeout = null
         codecReadbackTimeout?.let { mainHandler.removeCallbacks(it) }
         codecReadbackTimeout = null
+        input06aBootstrapPending.clear()
         inputCollectorValues.clear()
         inputCollectorRunning = false
         inputCollectorRefreshPending = false
@@ -9295,6 +9952,8 @@ class GattClient(context: Context) {
         _inputCodecCollector.value = InputCodecCollectorSnapshot()
         stateSyncPages.clear()
         stateSyncPacketToPage.clear()
+        _outputPageRawR19.value = null
+        _outputPageRxGenerationR23.value = 0
         appPollingPacketSequence = 0
         stateSyncGeneration = 0
         remoteBootstrapTotal = 0
@@ -9325,6 +9984,36 @@ class GattClient(context: Context) {
     ) {
         val label = appPollingPageLabel(commandId)
         val fieldsJson = protoDebugJson(body)
+        // AUDIO R26.03: passive, non-mutating wire evidence on the existing
+        // correlated AppPolling page route. No new request or transport rule.
+        if (commandId == REMOTE_APP_POLLING_AUDIO_METERS_PAGE_GET) {
+            val usable = body.isNotEmpty() && responseType != 0xFFFF && responseType != 0xFFFE
+            android.util.Log.i("AtomRemoteAudioR26",
+                "PAGE_CORRELATED_RX command=0x0647 response=0x${responseType.toString(16)} " +
+                    "local=$local bytes=${body.size} usableRaw=$usable payload=${body.toHex()}")
+            android.util.Log.i("AtomRemoteAudioR26P2",
+                "AB_0647_RX route=${if (local) "LOCAL" else "NONLOCAL"} " +
+                    "responseType=0x${responseType.toString(16)} bodyBytes=${body.size} " +
+                    "typedNonempty=$usable raw=${body.toHex()}")
+        }
+        if (commandId == REMOTE_APP_POLLING_INPUT_PAGE_GET ||
+            commandId == REMOTE_APP_POLLING_INPUT_HDR_PAGE_GET) {
+            appendEvent("INPUT12 BULK PAGE VERIFIED label=$label response=0x${responseType.toString(16).uppercase()} bytes=${body.size} payload=${body.toHex()}")
+        }
+        if (commandId == REMOTE_APP_POLLING_OUTPUT_PAGE_GET) {
+            if (body.isNotEmpty() && responseType != 0xFFFF && responseType != 0xFFFE) {
+                _outputPageRawR19.value = body.toHex()
+                _outputPageRxGenerationR23.value = _outputPageRxGenerationR23.value + 1
+                android.util.Log.i("AtomRemoteOutputR23", "PAGE_VERIFIED_RX generation=${_outputPageRxGenerationR23.value} bytes=${body.size}")
+                android.util.Log.i("AtomRemoteOutputR19",
+                    "PAGE_TYPED_RX command=0x0644 response=0x${responseType.toString(16)} " +
+                        "local=$local payload=${body.toHex()} fields=${protoDebugJson(body)}")
+            } else {
+                android.util.Log.i("AtomRemoteOutputR19",
+                    "PAGE_EMPTY_OR_REJECT response=0x${responseType.toString(16)} " +
+                        "bodySize=${body.size} NOT_A_SETTING")
+            }
+        }
         stateSyncPages[commandId] = RemotePageSnapshot(
             commandId = commandId,
             label = label,
@@ -9424,33 +10113,13 @@ class GattClient(context: Context) {
         }
 
         if (commandId == REMOTE_APP_POLLING_RECORD_PAGE_GET) {
-            // R16.2 correction from the fresh macOS AppPollingRecordPageStateMsg
-            // SwiftProtobuf storage order:
-            //   #1 preroll_enabled, #2 preroll_changeable, #3 codec_list,
-            //   #4 state, #5 record_format, #6 codec_bitdepth,
-            //   #7 codec_bitdepth_list.
-            // R16.1 incorrectly treated #3 as the current codec and #7 as the
-            // current bit depth, which is exactly why ProRes HQ was not selected.
-            val wireProfiles = parseProtoRepeatedVarintField(body, 3)
-            val logicalProfiles = wireProfiles.mapNotNull(::codecLogicalFromWire).distinct()
-            if (logicalProfiles.isNotEmpty()) _codecSupportedProfiles.value = logicalProfiles
-
-            val bitDepth = protoVarintField(body, 6) ?: 0
-            // Proto3 omits enum zero. RecordPage.codec_bitdepth absent therefore
-            // means raw bit-depth 0 (10-bit 4:2:2), not "unknown".
-            if (bitDepth in 0..2) {
-                codecPageBitDepth = bitDepth
-                publishCodecHardwareFromPageSources("RecordPage")
+            // RecordPageState: field 3 codec, field 7 codecBitdepth.
+            val codec = protoVarintField(body, 3)
+            val bitDepth = protoVarintField(body, 7) ?: 0
+            if (codec != null && codec > 0) {
+                _codecHardwareProfile.value = codec to bitDepth
+                appendEvent("TCS19.12.9 RECORD PAGE codec=$codec bitDepth=$bitDepth raw=${body.toHex()}")
             }
-            val bitDepthList = parseProtoRepeatedVarintField(body, 7).filter { it in 0..2 }.distinct()
-            if (bitDepthList.isNotEmpty()) _codecSupportedBitDepths.value = bitDepthList
-
-            appendEvent(
-                "TCS20.15R16.2 RECORD PAGE codecListWire=$wireProfiles codecListLogical=$logicalProfiles " +
-                    "bitDepth=$bitDepth bitDepthList=$bitDepthList state=${protoVarintField(body, 4) ?: -1} " +
-                    "recordFormat=${protoVarintField(body, 5) ?: -1} raw=${body.toHex()}"
-            )
-            onCodecCurrentPageReceived(REMOTE_APP_POLLING_RECORD_PAGE_GET)
         }
 
         if (commandId == REMOTE_APP_POLLING_MONITOR_ASSIST_SUMMARY_GET) {
@@ -9709,44 +10378,6 @@ class GattClient(context: Context) {
                     if (index + 4 > data.size) break
                     index += 4
                 }
-                else -> break
-            }
-        }
-        return out
-    }
-
-    /** Decode one repeated protobuf varint field, packed or unpacked. */
-    private fun parseProtoRepeatedVarintField(data: ByteArray, targetField: Int): List<Int> {
-        val out = mutableListOf<Int>()
-        var index = 0
-        while (index < data.size) {
-            val keyRead = readProtoVarint(data, index) ?: break
-            val key = keyRead.first
-            index = keyRead.second
-            val field = (key ushr 3).toInt()
-            when ((key and 0x07).toInt()) {
-                0 -> {
-                    val v = readProtoVarint(data, index) ?: break
-                    if (field == targetField && v.first <= Int.MAX_VALUE.toLong()) out += v.first.toInt()
-                    index = v.second
-                }
-                1 -> if (index + 8 <= data.size) index += 8 else break
-                2 -> {
-                    val l = readProtoVarint(data, index) ?: break
-                    index = l.second
-                    val len = l.first.toInt()
-                    if (len < 0 || index + len > data.size) break
-                    val end = index + len
-                    if (field == targetField) {
-                        while (index < end) {
-                            val v = readProtoVarint(data, index) ?: break
-                            if (v.first <= Int.MAX_VALUE.toLong()) out += v.first.toInt()
-                            index = v.second
-                        }
-                        index = end
-                    } else index = end
-                }
-                5 -> if (index + 4 <= data.size) index += 4 else break
                 else -> break
             }
         }
@@ -10036,6 +10667,170 @@ class GattClient(context: Context) {
         mainHandler.postDelayed(task, 120L)
     }
 
+
+    // WL-3.5 READ-ONLY NETWORK REQUEST-SHAPE MATRIX
+    // Rebased on the current user-confirmed Frame Guide working GattClient baseline.
+    // GETTERS ONLY. No Wi-Fi / LiveMode / Network setter is transmitted.
+    private data class Wl32NetworkGetter(val commandId: Int, val label: String)
+    private data class Wl35PendingProbe(
+        val getter: Wl32NetworkGetter,
+        val variant: Int,
+        val localRoute: Boolean,
+        val protoTrue: Boolean
+    )
+
+    // WL-3.3 ID recovery proof:
+    // Input metadata order is sequential and matches known hardware IDs:
+    // SourceGet 0x0064 -> DeviceNameGet 0x0070 -> HdrEnableStateGet 0x0071.
+    // In the official macOS binary, Connect has 22 commands and Debug has 14
+    // commands immediately before Display.BacklightBrightnessSet, which is
+    // hardware-proven as 0x0320. Therefore ConnectModeSet = 0x02FC and
+    // ConnectModeGet..NetworkConfigGet map to 0x02FD..0x0311.
+    // WL-3.5 isolates only the three recorder identity/network getters.
+    // Hardware evidence now distinguishes routes:
+    //   local=true + EMPTY + sequential packetId -> typed 0xFFFE reject
+    //   local=false + EMPTY -> transport completes with no correlated payload
+    // This phase keeps the same candidate IDs and tests the four read-only
+    // request envelopes already used by the proven Input getter route matrix.
+    // WL-P3 SOURCE PROTOTYPE:
+    // Evidence-backed request shape only: remote route + normal packetId + EMPTY payload.
+    // No local route, no 08 01 payload, no setter.
+    //
+    // NetworkConfig + LiveMode GETs are read-only diagnostic requests.
+    private val wl32NetworkGetters = listOf(
+        Wl32NetworkGetter(WlConnectPrototype.WIFI_SSID_GET, "WifiSsidGet"),
+        Wl32NetworkGetter(WlConnectPrototype.IP_ADDRESS_GET, "IpAddressGet"),
+        Wl32NetworkGetter(WlConnectPrototype.EUI48_GET, "Eui48Get"),
+        Wl32NetworkGetter(WlConnectPrototype.NETWORK_CONFIG_GET, "NetworkConfigGet"),
+        Wl32NetworkGetter(0x02FF, "LiveModeValidGet"),
+        Wl32NetworkGetter(0x0300, "LiveModeEnabledGet")
+    )
+
+    private var wl32NetworkProbeTask: Runnable? = null
+    private var wl32NetworkProbeIndex: Int = 0
+    private var wl35NetworkProbeVariant: Int = 0
+
+    // WL-3.5: keep the full route/request-shape tuple for asynchronous response
+    // correlation. This remains read-only and is cleared on disconnect/re-arm.
+    private val wl32PendingByPacketId = mutableMapOf<Int, Wl35PendingProbe>()
+
+    private fun wl32AsciiPreview(bytes: ByteArray): String {
+        if (bytes.isEmpty()) return "<empty>"
+        return buildString {
+            bytes.forEach { b ->
+                val v = b.toInt() and 0xFF
+                append(if (v in 0x20..0x7E) v.toChar() else '.')
+            }
+        }.take(96)
+    }
+
+    @SuppressLint("MissingPermission")
+    private fun queueWl32NetworkGetter(getter: Wl32NetworkGetter, variant: Int): Boolean {
+        if (!remoteBootstrapCompleted || !_tcsRemoteState.value.linked) return false
+        if (pendingRemotePacket != null) return false
+        if (variant != 0) {
+            appendEvent("WLP2 BLOCK non-evidence variant=$variant label=${getter.label}")
+            return false
+        }
+
+        val current = gatt ?: return false
+        val service = current.getService(UUID.fromString(AIRGLU_SHOGUN_SERVICE_UUID)) ?: return false
+        service.getCharacteristic(UUID.fromString(TCS_PACKET_WRITE_UUID)) ?: return false
+
+        // WL-P2 evidence-backed read-only envelope:
+        //   m_isLocal = false
+        //   packetId = normal non-zero sequence
+        //   protobuf payload = EMPTY
+        //
+        // WL-5.7 proved this envelope reaches PacketLink. The previous local and
+        // 08 01 variants are intentionally no longer transmitted.
+        tcsCommandSequence = if (tcsCommandSequence >= 255) 1 else tcsCommandSequence + 1
+        val packetId = tcsCommandSequence
+        val body = buildOfficialAtomMessageBodyWithProtoPayload(
+            packetId,
+            getter.commandId,
+            byteArrayOf()
+        )
+        val packet = PendingRemotePacket(
+            body = body,
+            purpose = "wlp2-connect-readonly:${getter.label}",
+            label = "WL-P2 ${getter.label}",
+            commandId = getter.commandId,
+            packetId = packetId,
+            expectedResponseId = null
+        )
+        pendingRemotePacket = packet
+        pendingRemoteFrameWritten = false
+        wl32PendingByPacketId[packetId] = Wl35PendingProbe(
+            getter = getter,
+            variant = 0,
+            localRoute = false,
+            protoTrue = false
+        )
+
+        appendEvent(
+            "WLP3 TX READONLY label=${getter.label} cmd=0x${getter.commandId.toString(16).uppercase()} " +
+                "variant=0 packetId=$packetId m_isLocal=0 payload=EMPTY expected=UNKNOWN"
+        )
+        return queueRemotePacket18_8(packet, local = false)
+    }
+    private fun cancelWl32NetworkReadback() {
+        wl32NetworkProbeTask?.let(mainHandler::removeCallbacks)
+        wl32NetworkProbeTask = null
+        wl32NetworkProbeIndex = 0
+        wl35NetworkProbeVariant = 0
+        wl32PendingByPacketId.clear()
+    }
+
+    private fun scheduleWl32NetworkReadback(delayMs: Long = 650L) {
+        cancelWl32NetworkReadback()
+        wl32NetworkProbeIndex = 0
+        wl35NetworkProbeVariant = 0
+
+        val task = object : Runnable {
+            override fun run() {
+                if (!remoteBootstrapCompleted || !_tcsRemoteState.value.linked) {
+                    appendEvent("WL35 STOP reason=remote-not-linked")
+                    wl32NetworkProbeTask = null
+                    return
+                }
+
+                if (wl32NetworkProbeIndex >= wl32NetworkGetters.size) {
+                    appendEvent(
+                        "WLP3 COMPLETE getters=${wl32NetworkGetters.size} variants=1 " +
+                            "attempts=${wl32NetworkGetters.size} mutationCommands=0 " +
+                            "shape=remote-empty pendingCorrelation=${wl32PendingByPacketId.size}"
+                    )
+                    wl32NetworkProbeTask = null
+                    return
+                }
+
+                if (pendingRemotePacket != null || operationInFlight || pendingOps.isNotEmpty()) {
+                    mainHandler.postDelayed(this, 160L)
+                    return
+                }
+
+                val getter = wl32NetworkGetters[wl32NetworkProbeIndex]
+                if (queueWl32NetworkGetter(getter, 0)) {
+                    wl35NetworkProbeVariant = 0
+                    wl32NetworkProbeIndex++
+                    // Give any asynchronous typed response room to arrive.
+                    // PacketLink transport itself remains unchanged.
+                    mainHandler.postDelayed(this, 1000L)
+                } else {
+                    mainHandler.postDelayed(this, 180L)
+                }
+            }
+        }
+
+        wl32NetworkProbeTask = task
+        appendEvent(
+            "WLP3 ARMED getters=${wl32NetworkGetters.size} variants=1 readonly=1 " +
+                "matrix=remote-empty-only mutationCommands=0 delayMs=$delayMs"
+        )
+        mainHandler.postDelayed(task, delayMs)
+    }
+
     private fun scheduleRemoteBootstrapSettle() {
         cancelRemoteBootstrapSettle()
         _tcsRemoteState.value = _tcsRemoteState.value.copy(
@@ -10053,14 +10848,16 @@ class GattClient(context: Context) {
                 available = true,
                 linked = true,
                 lastStatus = if (remoteBootstrapResponses > 0) {
-                    "Remote ready â€¢ $remoteBootstrapResponses state response${if (remoteBootstrapResponses == 1) "" else "s"}"
+                    "Remote ready Ã¢â‚¬Â¢ $remoteBootstrapResponses state response${if (remoteBootstrapResponses == 1) "" else "s"}"
                 } else {
-                    "Remote ready â€¢ macOS-parity PacketLink active"
+                    "Remote ready Ã¢â‚¬Â¢ macOS-parity PacketLink active"
                 },
                 lastError = null
             )
             publishRemoteStateSnapshot(cycleComplete = true, source = "connection-complete")
             appendEvent("TCS19.12.9 STATE SYNC COMPLETE sent=$remoteBootstrapTotal payloadResponses=$remoteBootstrapResponses statePages=${stateSyncPages.size}/$APP_POLLING_STATE_PAGE_COUNT; Remote controls enabled")
+            appendEvent("WL35 LINKED HOOK scheduling read-only network request-shape matrix")
+            scheduleWl32NetworkReadback()
             if (PacketLinkSessionPolicy.AUTO_POST_READY_INPUT_ENABLED) {
                 appendEvent("TCS20.03.4.2 POST-READY AUTO INPUT linked-hook")
                 schedulePostReadyInputCollector()
@@ -10083,6 +10880,9 @@ class GattClient(context: Context) {
         cancelRemoteResponseTimeout()
         val task = Runnable {
             if (pendingRemotePacket !== packet) return@Runnable
+            if (outputR7IsTrackedPurpose(packet.purpose)) {
+                outputR7Trace("RESPONSE_TIMEOUT purpose=${packet.purpose} cmd=0x${packet.commandId.toString(16)} packetId=${packet.packetId} frameWritten=$pendingRemoteFrameWritten E0polls=$remoteEmptyPolls")
+            }
             pendingRemotePacket = null
             pendingRemoteFrameWritten = false
             remoteEmptyPolls = 0
@@ -10437,6 +11237,10 @@ class GattClient(context: Context) {
                 // + read cycle until the remote payload is available.
                 if (packet != null) {
                     remoteEmptyPolls++
+                    if (outputR7IsTrackedPurpose(packet.purpose) &&
+                        (remoteEmptyPolls == 1 || remoteEmptyPolls % 25 == 0)) {
+                        outputR7Trace("E0_FLOW_ONLY purpose=${packet.purpose} packetId=${packet.packetId} polls=$remoteEmptyPolls frameWritten=$pendingRemoteFrameWritten")
+                    }
                     if (packet.bootstrap) {
                         // E0 is not the query response, but it does finish this
                         // PacketLink transport turn and grants credit. Queue the
@@ -10482,6 +11286,10 @@ class GattClient(context: Context) {
             val declaredEnd = (5 + payloadLen).coerceAtMost(completePayload.size)
             val messagePayload = if (declaredEnd > 5) completePayload.copyOfRange(5, declaredEnd) else byteArrayOf()
             val decoded = "AtomMessage packetId=$packetId payloadLen=$payloadLen messageType=$messageType data=${messagePayload.toHex()}"
+            if (outputR7IsTrackedPurpose(packet?.purpose) ||
+                messageType in arrayOf(0x00DC, 0x0648, 0xFFFF, 0xFFFE, 0x00E2, 0x00E3, 0x00E6, 0x00E7)) {
+                outputR7Trace("RX_ATOM purpose=${packet?.purpose ?: "async"} requestPacketId=${packet?.packetId ?: -1} responsePacketId=$packetId type=0x${messageType.toString(16)} payloadLen=$payloadLen availableBytes=${completePayload.size} local=${tcsPacketLocalFlag} raw=${messagePayload.toHex().take(120)}")
+            }
 
             val phase34FeaturePacket = packet?.purpose?.startsWith("remote-monitor-") == true ||
                 packet?.purpose?.startsWith("remote-scope-") == true ||
@@ -10655,6 +11463,9 @@ class GattClient(context: Context) {
                 appendEvent("TCS18.5 FLOW CREDIT TX OK; reading cxtic12 for bit0x20 grant")
             }
             purpose.startsWith("remote-data:") -> {
+                if (outputR7IsTrackedPurpose(pendingRemotePacket?.purpose)) {
+                    outputR7Trace("GATT_WRITE_OK purpose=${pendingRemotePacket?.purpose} cmd=${pendingRemotePacket?.commandId} packetId=${pendingRemotePacket?.packetId} next=read-cxtic12")
+                }
                 pendingRemoteFrameWritten = true
                 _tcsRemoteState.value = _tcsRemoteState.value.copy(
                     phase = "awaiting-response",
@@ -10931,11 +11742,13 @@ class GattClient(context: Context) {
         while (pendingOps.isNotEmpty()) {
             val op = pendingOps.removeFirst()
             val label = when (op) {
+                is PendingOp.OutputR21Mtu -> "output-r21-mtu"
                 is PendingOp.Read -> "${op.purpose ?: "read"} ${op.characteristic.uuid}"
                 is PendingOp.WriteDescriptor -> "${op.purpose ?: "CCCD"} ${op.descriptor.characteristic.uuid}"
                 is PendingOp.WriteCharacteristic -> "${op.purpose} ${op.characteristic.uuid}"
             }
             val started = when (op) {
+                is PendingOp.OutputR21Mtu -> g.requestMtu(op.mtu)
                 is PendingOp.Read -> g.readCharacteristic(op.characteristic)
                 is PendingOp.WriteDescriptor -> {
                     if (Build.VERSION.SDK_INT >= 33) {
@@ -10966,6 +11779,12 @@ class GattClient(context: Context) {
                 operationInFlight = true
                 armOperationTimeout(g, label)
                 return
+            }
+            if (op is PendingOp.OutputR21Mtu) {
+                outputR21MtuResult = "request-start-rejected"
+                outputR21MtuRequested = false // allow ONE retry on next user Output refresh
+                android.util.Log.i("AtomRemoteOutputR22", "MTU_START_REJECTED requested=${op.mtu} retry=NEXT_REFRESH")
+                // Not a recorder failure. Continue normal ATT traffic.
             }
             // Android's BluetoothGatt can briefly report BUSY immediately after a
             // completed ATT callback even though our serialized queue is logically
@@ -11003,6 +11822,7 @@ class GattClient(context: Context) {
 
             appendEvent("ATT operation could not start $label; continuing")
             val connectedPurpose = when (op) {
+                is PendingOp.OutputR21Mtu -> "output-r21-mtu"
                 is PendingOp.Read -> op.purpose
                 is PendingOp.WriteDescriptor -> op.purpose
                 is PendingOp.WriteCharacteristic -> op.purpose
@@ -11094,10 +11914,18 @@ class GattClient(context: Context) {
             activeOp = null
             appendEvent("ATT operation timeout: $label; continuing")
             val timedPurpose = when (timedOut) {
+                is PendingOp.OutputR21Mtu -> "output-r21-mtu"
                 is PendingOp.Read -> timedOut.purpose
                 is PendingOp.WriteDescriptor -> timedOut.purpose
                 is PendingOp.WriteCharacteristic -> timedOut.purpose
                 null -> null
+            }
+            if (timedPurpose == "output-r21-mtu") {
+                outputR21MtuResult = "callback-timeout"
+                outputR21MtuRequested = false // retry only on another explicit Output refresh
+                android.util.Log.i("AtomRemoteOutputR22", "MTU_TIMEOUT requested=185 current=$outputR21MtuBytes retry=NEXT_REFRESH")
+                processNext(g)
+                return@Runnable
             }
             if (timedPurpose == PLINK18_WRITE_PURPOSE || timedPurpose == PLINK18_READ_PURPOSE) {
                 if (timedPurpose == PLINK18_WRITE_PURPOSE) {
@@ -11205,7 +12033,7 @@ class GattClient(context: Context) {
             processNext(g)
         }
         operationTimeout = task
-        mainHandler.postDelayed(task, 900L)
+        mainHandler.postDelayed(task, if (label == "output-r21-mtu") 3500L else 900L)
     }
 
     private fun cancelOperationTimeout() {
@@ -11274,7 +12102,36 @@ class GattClient(context: Context) {
         return "u32le=$le u32be=$be mod1e9(le=${le % 1_000_000_000L},be=${be % 1_000_000_000L})"
     }
 
+    // OUTPUT-R7: passive observability only; never enqueue/alter a recorder packet.
+    private fun outputR7IsTrackedPurpose(purpose: String?): Boolean =
+        purpose == "remote-input-output-summary-get" ||
+        purpose == "remote-output-hdr-enable-get" ||
+        (purpose?.startsWith("remote-lut-") == true) ||
+        (purpose?.startsWith("remote-output-r17-get-") == true) ||
+        purpose == "remote-output-r19-output-page-get" ||
+        purpose == "remote-output-r20-output-page-local-get" ||
+        // R26.11.1: opt Audio read-only probes into EXISTING passive TX/RX logs.
+        // This only expands diagnostics; packet routing, pairing, and controls stay untouched.
+        purpose == "remote-audio-r26-meters-page-get" ||
+        purpose == "remote-audio-r26-part2-nonlocal-read-only"
+
+    private fun outputR7Trace(message: String) {
+        Log.i("AtomRemoteOutputR7", message)
+    }
+
     private fun appendEvent(message: String) {
+        // OUTPUT R6: INFO-level diagnostic mirror only. No PacketLink framing,
+        // queue policy, parsing, TCS pairing or recorder controls are modified.
+        // Some OEM loggers suppress all DEBUG records even with adb logcat -d.
+        if (message.startsWith("OUTPUT0614") ||
+            message.startsWith("TCS19.9 INPUT SUMMARY") ||
+            message.startsWith("TCS19.10 INPUT SUMMARY REJECT") ||
+            message.startsWith("TCS19.12.10 APPPOLLING OPTIONAL INPUT SUMMARY") ||
+            message.startsWith("TCS20.09.4 LUT OUTPUT") ||
+            message.startsWith("TCS20.09.R1 LUT OUTPUT") ||
+            (message.startsWith("TCS19.4.2 MONITOR blocked") && message.contains("input-output-summary"))) {
+            Log.i("AtomRemoteOutputR6", message)
+        }
         Log.d("AtomRemoteGatt", message)
         _events.value = (_events.value + message).takeLast(500)
     }
@@ -11468,6 +12325,35 @@ class GattClient(context: Context) {
 
         override fun onMtuChanged(g: BluetoothGatt, mtu: Int, status: Int) {
             appendEvent("MTU changed mtu=$mtu status=$status")
+            // R21: only finish the MTU ATT op if IT owns activeOp.
+            // Unsolicited/late callbacks must never cancel another GATT read.
+            if (gatt !== g) return
+            if (status == BluetoothGatt.GATT_SUCCESS) outputR21MtuBytes = mtu
+            val ownsOp = activeOp is PendingOp.OutputR21Mtu
+            if (ownsOp) {
+                outputR21MtuResult = if (status == BluetoothGatt.GATT_SUCCESS)
+                    "negotiated" else "rejected-status-$status"
+                cancelOperationTimeout()
+                activeOp = null
+                operationInFlight = false
+            }
+            android.util.Log.i("AtomRemoteOutputR21",
+                "MTU_RESULT requested=185 negotiated=$outputR21MtuBytes status=$status " +
+                    "owned=$ownsOp result=$outputR21MtuResult")
+            if (ownsOp) processNext(g)
+            // Audio-only continuation of the user-requested read. An E0 or
+            // successful MTU callback does not itself prove Audio readback.
+            if (r26AudioGetWaitingForMtu && ownsOp) {
+                android.util.Log.i("AtomRemoteAudioR26Fix",
+                    "AUDIO_MTU_RESULT negotiated=$outputR21MtuBytes status=$status " +
+                        "sufficient=${status == BluetoothGatt.GATT_SUCCESS && outputR21MtuBytes >= 61}")
+                if (status == BluetoothGatt.GATT_SUCCESS && outputR21MtuBytes >= 61) {
+                    mainHandler.postDelayed({ dispatchR26AudioGetAfterMtu(100) }, 350L)
+                } else {
+                    r26AudioGetWaitingForMtu = false
+                    android.util.Log.i("AtomRemoteAudioR26Fix", "AUDIO_GET_BLOCKED_MTU retry-manual")
+                }
+            }
         }
 
         override fun onPhyUpdate(g: BluetoothGatt, txPhy: Int, rxPhy: Int, status: Int) {
@@ -11713,7 +12599,6 @@ class GattClient(context: Context) {
         // 0x013F is the normal non-reboot Record picker setter.
         private const val REMOTE_RECORD_CODEC_PROFILE_GET = 0x013A
         private const val REMOTE_RECORD_CODEC_PROFILE_SET = 0x013B
-        private const val REMOTE_RECORD_CODEC_PROFILE_LIST_GET = 0x013D
         private const val REMOTE_RECORD_NON_REBOOT_CODEC_PROFILE_SET = 0x013F
 
         // Phase 09 read-only polling IDs recovered from macOS Contents(2).zip.
@@ -11729,7 +12614,7 @@ class GattClient(context: Context) {
         private const val REMOTE_APP_POLLING_INPUT_OUTPUT_SUMMARY_GET = 0x0648
         private const val REMOTE_APP_POLLING_MONITOR_ASSIST_SUMMARY_GET = 0x0649
         private const val APP_POLLING_STATE_PAGE_COUNT = 10
-        private const val INPUT_GRANULAR_RESPONSE_TIMEOUT_MS = 650L
+        private const val INPUT_GRANULAR_RESPONSE_TIMEOUT_MS = 1100L
         private const val CODEC_GRANULAR_RESPONSE_TIMEOUT_MS = 1200L
 
         // 20.06 Scopes exact contiguous RemoteApi matrix.
@@ -11898,6 +12783,9 @@ class GattClient(context: Context) {
         private const val CONNECTED_TIMECODE_REFRESH_MS = 750L
     }
 }
+
+
+
 
 
 

@@ -1,0 +1,20 @@
+﻿
+E:\AtomosRemoteWithBackend\INPUT06C_CAPTURE_20261009_230455\logcat-full.txt:2796:10-09 23:06:03.897  4305 21213 I DC_ADS  : saveAdvanceData notifyDataChange 
+:alg_app_widget, collector alg_app_widget
+E:\AtomosRemoteWithBackend\INPUT06C_CAPTURE_20261009_230455\logcat-full.txt:5340:10-09 23:06:07.661  1278  1331 D fpCoreHal: fpDataStoreImpl.cpp 
+collector_info, reset auth info
+E:\AtomosRemoteWithBackend\INPUT06C_CAPTURE_20261009_230455\logcat-full.txt:5343:10-09 23:06:07.661  1278  1331 D fpCoreHal: fpDataStoreImpl.cpp 
+collector_info, reset img info
+E:\AtomosRemoteWithBackend\INPUT06C_CAPTURE_20261009_230455\logcat-full.txt:6579:10-09 23:06:09.543 29724 29724 E WakeLockMetricsCollector: Unknown wakelock 
+modified
+E:\AtomosRemoteWithBackend\INPUT06C_CAPTURE_20261009_230455\logcat-full.txt:6581:10-09 23:06:09.546 29724 29928 E WakeLockMetricsCollector: Unknown wakelock 
+modified
+E:\AtomosRemoteWithBackend\INPUT06C_CAPTURE_20261009_230455\logcat-full.txt:6713:10-09 23:06:09.942  4305 21213 I BatteryEventCollector: onBatteryChange[2]1
+E:\AtomosRemoteWithBackend\INPUT06C_CAPTURE_20261009_230455\logcat-full.txt:6714:10-09 23:06:09.942  4305 21213 I BatteryEventCollector: onBatteryChange[2]1, 
+isCharging:false, level:63, oldLevel:64
+E:\AtomosRemoteWithBackend\INPUT06C_CAPTURE_20261009_230455\logcat-full.txt:6900:10-09 23:06:10.578 23559 23559 I roid.apps.turbo: Using generational 
+CollectorTypeCMC GC.
+E:\AtomosRemoteWithBackend\INPUT06C_CAPTURE_20261009_230455\logcat-full.txt:6984:10-09 23:06:10.912 23573 23573 I sion.tranengine: Using generational 
+CollectorTypeCMC GC.
+
+

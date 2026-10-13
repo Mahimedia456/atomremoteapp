@@ -1,0 +1,46 @@
+{
+  "style": "AtomRemoteBackend cyan/black outline icon system",
+  "colors": {
+    "cyan": "#16E8F3",
+    "white": "#F7FAFC",
+    "red": "#FF2D34",
+    "muted": "#8A98A6",
+    "background": "#081014"
+  },
+  "icons": [
+    "settings",
+    "wifi",
+    "monitor",
+    "ssd",
+    "codec",
+    "battery",
+    "waveform",
+    "focus",
+    "zebra",
+    "false_color",
+    "lut",
+    "frame_guide",
+    "grid",
+    "zoom",
+    "safe_area",
+    "record",
+    "stop",
+    "play",
+    "pause",
+    "connected",
+    "signal_bars",
+    "timecode",
+    "input_hdmi",
+    "remote_mark"
+  ],
+  "recommended_android": {
+    "vector": "Use SVGs as source and convert to Android VectorDrawable where needed.",
+    "sizes_dp": [
+      20,
+      24,
+      28,
+      32
+    ],
+    "touch_target_dp": 48
+  }
+}

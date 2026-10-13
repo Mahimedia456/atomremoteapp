@@ -2,8 +2,15 @@
     <style name="Theme.AtomosRemote" parent="android:style/Theme.Material.NoActionBar">
         <item name="android:fontFamily">sans</item>
         <item name="android:windowLightStatusBar">false</item>
-        <item name="android:statusBarColor">#080B0D</item>
-        <item name="android:navigationBarColor">#080B0D</item>
-        <item name="android:windowBackground">#080B0D</item>
+        <item name="android:statusBarColor">@color/atom_remote_bg</item>
+        <item name="android:navigationBarColor">@color/atom_remote_bg</item>
+        <item name="android:windowBackground">@color/atom_remote_bg</item>
+        <item name="android:windowActionModeOverlay">true</item>
+        <item name="android:colorAccent">@color/atom_remote_cyan</item>
+    </style>
+
+    <!-- Pre Android 12 starting window. Compose immediately covers this after first draw. -->
+    <style name="Theme.AtomosRemote.Starting" parent="Theme.AtomosRemote">
+        <item name="android:windowBackground">@drawable/atom_remote_splash_background</item>
     </style>
 </resources>

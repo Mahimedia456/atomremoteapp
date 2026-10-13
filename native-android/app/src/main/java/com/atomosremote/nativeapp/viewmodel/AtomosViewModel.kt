@@ -19,9 +19,6 @@ import com.atomosremote.nativeapp.atomos.ProtocolProfile
 import com.atomosremote.nativeapp.atomos.S1cChannel
 import com.atomosremote.nativeapp.atomos.S1cCommands
 import com.atomosremote.nativeapp.atomos.S1cStatus
-import com.atomosremote.nativeapp.atomos.extractS1cAscii
-import com.atomosremote.nativeapp.atomos.isS1cReply
-import com.atomosremote.nativeapp.atomos.reduceS1cStatus
 import com.atomosremote.nativeapp.ble.BleAdvertisement
 import com.atomosremote.nativeapp.ble.BleScanner
 import com.atomosremote.nativeapp.ble.GattClient
@@ -37,6 +34,7 @@ import com.atomosremote.nativeapp.data.DeviceIdentityStore
 import com.atomosremote.nativeapp.data.KnownPrimaryDevice
 import com.atomosremote.nativeapp.data.ProtocolProfileStore
 import com.atomosremote.nativeapp.data.SavedAtomosDevice
+import com.atomosremote.nativeapp.output.OutputSessionSnapshot
 import com.atomosremote.nativeapp.input.InputSessionSnapshotCache
 import com.atomosremote.nativeapp.monitor.MonitorCoreCatalog
 import com.atomosremote.nativeapp.monitor.MonitorZoomCoreState
@@ -59,6 +57,7 @@ import com.atomosremote.nativeapp.network.PortProbeResult
 import com.atomosremote.nativeapp.qa.QaReport
 import com.atomosremote.nativeapp.qa.ReleaseReadinessRunner
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -114,6 +113,11 @@ class AtomosViewModel(app: Application) : AndroidViewModel(app) {
     private val _scanState = MutableStateFlow("idle")
     val scanState: StateFlow<String> = _scanState
 
+    // UI-visible and logcat diagnostics distinguish no radio results from app filtering.
+    private val _scanDiagnostics = MutableStateFlow("Scan not started")
+    val scanDiagnostics: StateFlow<String> = _scanDiagnostics
+    private var scanEpoch = 0L
+
     private val _selected = MutableStateFlow<BleAdvertisement?>(null)
     val selected: StateFlow<BleAdvertisement?> = _selected
 
@@ -155,9 +159,130 @@ class AtomosViewModel(app: Application) : AndroidViewModel(app) {
     val zoomCapabilitiesKnown: StateFlow<Boolean> = gatt.zoomCapabilitiesKnown
     val monitorZoomCore: StateFlow<MonitorZoomCoreState> = gatt.monitorZoomCore
     val monitorZoomViewport: StateFlow<MonitorZoomViewportState> = gatt.monitorZoomViewport
-    val monitorFocusAssistState: StateFlow<MonitorFocusAssistState> = gatt.monitorFocusAssist
-    val monitorZebraState: StateFlow<MonitorZebraState> = gatt.monitorZebraState
-    val monitorAssistEffects: StateFlow<MonitorAssistEffectsState> = gatt.monitorAssistEffects
+    // UI-SHARED-MONITOR-STATE-FIX-R2-20261008
+    // UI/ViewModel only. Protocol and GattClient remain untouched.
+    private var uiFocusEnabledOverride: Boolean? = null
+    private var uiFocusTypeOverride: Int? = null
+    private var uiFocusThresholdOverride: Int? = null
+    private var uiFocusColourOverride: Int? = null
+    private var uiZebraEnabledOverride: Boolean? = null
+    private var uiZebraThresholdOverride: Int? = null
+    private var uiFalseColourOverride: Boolean? = null
+    private var uiBlueOnlyOverride: Boolean? = null
+
+    private val _uiMonitorFocusAssistState = MutableStateFlow(gatt.monitorFocusAssist.value)
+    val monitorFocusAssistState: StateFlow<MonitorFocusAssistState> = _uiMonitorFocusAssistState
+    private val _uiMonitorZebraState = MutableStateFlow(gatt.monitorZebraState.value)
+    val monitorZebraState: StateFlow<MonitorZebraState> = _uiMonitorZebraState
+    private val _uiMonitorAssistEffects = MutableStateFlow(gatt.monitorAssistEffects.value)
+    val monitorAssistEffects: StateFlow<MonitorAssistEffectsState> = _uiMonitorAssistEffects
+
+    private fun publishFocusUi() {
+        val actual = gatt.monitorFocusAssist.value
+        _uiMonitorFocusAssistState.value = actual.copy(
+            enabled = uiFocusEnabledOverride ?: actual.enabled,
+            type = uiFocusTypeOverride ?: actual.type,
+            threshold = uiFocusThresholdOverride ?: actual.threshold,
+            colour = uiFocusColourOverride ?: actual.colour
+        )
+    }
+
+    private fun publishZebraUi() {
+        val actual = gatt.monitorZebraState.value
+        _uiMonitorZebraState.value = actual.copy(
+            enabled = uiZebraEnabledOverride ?: actual.enabled,
+            threshold = uiZebraThresholdOverride ?: actual.threshold
+        )
+    }
+
+    private fun publishEffectsUi() {
+        val actual = gatt.monitorAssistEffects.value
+        _uiMonitorAssistEffects.value = actual.copy(
+            falseColourEnabled = uiFalseColourOverride ?: actual.falseColourEnabled,
+            blueOnlyEnabled = uiBlueOnlyOverride ?: actual.blueOnlyEnabled
+        )
+    }
+
+    private fun clearFocusUiOverrides() {
+        uiFocusEnabledOverride = null
+        uiFocusTypeOverride = null
+        uiFocusThresholdOverride = null
+        uiFocusColourOverride = null
+        uiZebraEnabledOverride = null
+        uiZebraThresholdOverride = null
+        publishFocusUi()
+        publishZebraUi()
+    }
+
+    private fun clearEffectsUiOverrides() {
+        uiFalseColourOverride = null
+        uiBlueOnlyOverride = null
+        publishEffectsUi()
+    }
+
+    // OUTPUT06-14-R5: request-admission diagnostics; not substitute for recorder readback.
+    private val _outputReadbackStatus = MutableStateFlow("Idle")
+    val outputReadbackStatus: StateFlow<String> = _outputReadbackStatus
+    private var outputReadbackJob: Job? = null
+
+    // OUTPUT03: passive, connection-scoped cache of hardware-confirmed values.
+    // No additional RemoteApi command is transmitted here.
+    private val _outputSessionSnapshot = MutableStateFlow(OutputSessionSnapshot())
+    val outputSessionSnapshot: StateFlow<OutputSessionSnapshot> = _outputSessionSnapshot
+
+    init {
+        // OUTPUT03 observers are passive and independent of navigation.
+        viewModelScope.launch { gatt.outputInfo.collect { publishOutputSessionSnapshot() } }
+        viewModelScope.launch { gatt.outputHdrTypeId.collect { publishOutputSessionSnapshot() } }
+        viewModelScope.launch { gatt.outputGamutId.collect { publishOutputSessionSnapshot() } }
+        viewModelScope.launch { gatt.inputOutputRawHex.collect { publishOutputSessionSnapshot() } }
+        viewModelScope.launch { gatt.tcsRemoteState.collect { publishOutputSessionSnapshot() } }
+        viewModelScope.launch { gatt.tcsPairingState.collect { publishOutputSessionSnapshot() } }
+        viewModelScope.launch { selected.collect { publishOutputSessionSnapshot() } }
+        viewModelScope.launch {
+            gatt.monitorFocusAssist.collect { actual ->
+                if (actual.status.contains("rejected", ignoreCase = true)) {
+                    uiFocusEnabledOverride = null
+                    uiFocusTypeOverride = null
+                    uiFocusThresholdOverride = null
+                    uiFocusColourOverride = null
+                }
+                if (actual.pendingKey == null) {
+                    if (uiFocusEnabledOverride != null && actual.enabled == uiFocusEnabledOverride) uiFocusEnabledOverride = null
+                    if (uiFocusTypeOverride != null && actual.type == uiFocusTypeOverride) uiFocusTypeOverride = null
+                    if (uiFocusThresholdOverride != null && actual.threshold == uiFocusThresholdOverride) uiFocusThresholdOverride = null
+                    if (uiFocusColourOverride != null && actual.colour == uiFocusColourOverride) uiFocusColourOverride = null
+                }
+                publishFocusUi()
+            }
+        }
+        viewModelScope.launch {
+            gatt.monitorZebraState.collect { actual ->
+                if (actual.status.contains("rejected", ignoreCase = true)) {
+                    uiZebraEnabledOverride = null
+                    uiZebraThresholdOverride = null
+                }
+                if (actual.pendingKey == null) {
+                    if (uiZebraEnabledOverride != null && actual.enabled == uiZebraEnabledOverride) uiZebraEnabledOverride = null
+                    if (uiZebraThresholdOverride != null && actual.threshold == uiZebraThresholdOverride) uiZebraThresholdOverride = null
+                }
+                publishZebraUi()
+            }
+        }
+        viewModelScope.launch {
+            gatt.monitorAssistEffects.collect { actual ->
+                if (actual.status.contains("rejected", ignoreCase = true)) {
+                    uiFalseColourOverride = null
+                    uiBlueOnlyOverride = null
+                }
+                if (actual.pendingKey == null) {
+                    if (uiFalseColourOverride != null && actual.falseColourEnabled == uiFalseColourOverride) uiFalseColourOverride = null
+                    if (uiBlueOnlyOverride != null && actual.blueOnlyEnabled == uiBlueOnlyOverride) uiBlueOnlyOverride = null
+                }
+                publishEffectsUi()
+            }
+        }
+    }
     val monitorScopeState: StateFlow<MonitorScopeState> = gatt.monitorScopeState
     val monitorGuideState: StateFlow<MonitorGuideState> = gatt.monitorGuideState
     val monitorAnamorphicState: StateFlow<MonitorAnamorphicState> = gatt.monitorAnamorphicState
@@ -208,20 +333,12 @@ class AtomosViewModel(app: Application) : AndroidViewModel(app) {
     // current codec before Phase 10 read-back/state synchronization.
     private val _codecProfile = MutableStateFlow(0)
     val codecProfile: StateFlow<Int> = _codecProfile
-    // R16.2: -1 means recorder bit depth has not been read yet. Do not paint
-    // 10-bit as selected merely because protobuf enum zero is a valid value.
-    private val _codecBitDepth = MutableStateFlow(-1)
+    private val _codecBitDepth = MutableStateFlow(0)
     val codecBitDepth: StateFlow<Int> = _codecBitDepth
-    // R16.1 keeps the user's draft choice separate from recorder-authoritative
-    // confirmation so periodic RecordPage polling cannot overwrite LT/HQ/etc.
-    // between selection and APPLY.
-    private var codecSelectionDirty: Boolean = false
     // 19.11.9 exposes the last recorder-readback tuple separately from the
     // currently selected UI tuple. A selection is never called confirmed until
     // CodecProfileGet reports it.
     val codecHardwareProfile: StateFlow<Pair<Int, Int>?> = gatt.codecHardwareProfile
-    val codecSupportedProfiles: StateFlow<List<Int>> = gatt.codecSupportedProfiles
-    val codecSupportedBitDepths: StateFlow<List<Int>> = gatt.codecSupportedBitDepths
 
     // Phase 09 read-only recorder-reported Input / Format summary.
     val inputFormatInfo: StateFlow<String?> = gatt.inputFormatInfo
@@ -232,6 +349,32 @@ class AtomosViewModel(app: Application) : AndroidViewModel(app) {
     val outputInfo: StateFlow<String?> = gatt.outputInfo
     val outputHdrTypeId: StateFlow<Int?> = gatt.outputHdrTypeId
     val outputGamutId: StateFlow<Int?> = gatt.outputGamutId
+    val outputDownscaleRawId: StateFlow<Int?> = gatt.outputDownscaleRawId
+    val outputDciCropRawId: StateFlow<Int?> = gatt.outputDciCropRawId
+    val outputHdmiTimecodeEnabled: StateFlow<Boolean?> = gatt.outputHdmiTimecodeEnabled
+
+    private fun publishOutputSessionSnapshot() {
+        val address = _selected.value?.address
+        val isReady = gatt.tcsPairingState.value.acceptWritten && gatt.tcsRemoteState.value.available
+        val old = _outputSessionSnapshot.value
+        val sameDevice = old.address == address
+        _outputSessionSnapshot.value = OutputSessionSnapshot(
+            address = address,
+            connected = isReady,
+            outputInfo = if (isReady) gatt.outputInfo.value else if (sameDevice) old.outputInfo else null,
+            hdrTypeId = if (isReady) gatt.outputHdrTypeId.value else if (sameDevice) old.hdrTypeId else null,
+            gamutId = if (isReady) gatt.outputGamutId.value else if (sameDevice) old.gamutId else null,
+            rawSummaryAvailable = if (isReady) !gatt.inputOutputRawHex.value.isNullOrBlank() else if (sameDevice) old.rawSummaryAvailable else false,
+            status = when {
+                !isReady -> "Disconnected / last-known values"
+                gatt.outputHdrTypeId.value != null || gatt.outputGamutId.value != null ||
+                    !gatt.outputInfo.value.isNullOrBlank() || !gatt.inputOutputRawHex.value.isNullOrBlank() ->
+                    "Remote ready / partial recorder readback"
+                else -> "Remote ready / awaiting recorder readback"
+            }
+        )
+    }
+
     val inputOutputRawHex: StateFlow<String?> = gatt.inputOutputRawHex
     val inputCodecCollector = gatt.inputCodecCollector
 
@@ -249,12 +392,30 @@ class AtomosViewModel(app: Application) : AndroidViewModel(app) {
     private var inputSessionExpectedCoreGeneration: Int = -1
     private var inputSessionExpectedExtendedGeneration: Int = -1
     private var inputSessionCoreGeneration: Int = -1
+    // INPUT06G: one native Input snapshot owner per connected session.
+    private var input06gPrefetchAddress: String? = null
+    // INPUT08: one independent 17-property scan per connected session.
+    private var input08ExtendedScheduledAddress: String? = null
+    private var input08ExtendedJob: Job? = null
+    // INPUT09: bounded no-data recovery only. Never cancel an active native collector.
+    private var input09RecoveryJob: Job? = null
+    private var input09RecoveryAddress: String? = null
+    private var input09RecoveryAttempts = 0
+    // INPUT05D: session-bounded native retry if the official core GETs returned no data.
+    // This never transmits an invented command and never changes the PacketLink queue.
+    private var input05dRetryAddress: String? = null
+    private var input05dEmptyCoreRetries: Int = 0
+    private var input05dRetryJob: Job? = null
 
     fun shouldAutoSyncInput(): Boolean =
         !inputSessionSnapshotCache.isReadyFor(_selected.value?.address)
 
     fun markInputAutoSyncCached() {
         val address = _selected.value?.address ?: return
+        if (gatt.inputCodecCollector.value.inputResponses == 0) {
+            Log.w("AtomRemoteSession", "INPUT05D CACHE REJECTED: no core recorder response")
+            return
+        }
         inputSessionSnapshotCache.ready(
             address = address,
             coreGeneration = gatt.inputCodecCollector.value.generation,
@@ -269,6 +430,14 @@ class AtomosViewModel(app: Application) : AndroidViewModel(app) {
         inputSessionExpectedCoreGeneration = -1
         inputSessionExpectedExtendedGeneration = -1
         inputSessionCoreGeneration = -1
+        input06gPrefetchAddress = null
+        input08ExtendedScheduledAddress = null
+        input08ExtendedJob?.cancel()
+        input08ExtendedJob = null
+        input09RecoveryJob?.cancel()
+        input09RecoveryJob = null
+        input09RecoveryAddress = null
+        input09RecoveryAttempts = 0
         Log.d("AtomRemoteSession", "TCS20.03.7.9 INPUT SESSION CACHE INVALIDATED")
     }
 
@@ -277,6 +446,9 @@ class AtomosViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     fun refreshInputSessionSnapshotFromUi() {
+        input05dRetryJob?.cancel()
+        input05dEmptyCoreRetries = 0
+        input05dRetryAddress = _selected.value?.address
         invalidateInputAutoSyncCache()
         startInputSessionBootstrapIfNeeded("user-refresh")
     }
@@ -290,16 +462,60 @@ class AtomosViewModel(app: Application) : AndroidViewModel(app) {
         }
         if (inputAutoRefreshJob?.isActive == true) return
         inputAutoRefreshJob = viewModelScope.launch {
-            // One recorder refresh per Input-tab entry. No repeating timer.
-            if (_selected.value != null && gatt.tcsRemoteState.value.available &&
-                !gatt.inputCodecCollector.value.running && !gatt.inputExtendedSnapshot.value.running &&
-                !gatt.inputSetterState.value.busy) {
-                invalidateInputAutoSyncCache()
-                startInputSessionBootstrapIfNeeded("input-tab-one-shot")
-                Log.d("AtomRemoteSession", "TCS20.12.5 INPUT TAB ONE-SHOT REFRESH")
-            } else {
-                Log.d("AtomRemoteSession", "TCS20.12.5 INPUT TAB ONE-SHOT DEFER busy-or-not-ready")
+            // Input entry consumes the session prefetch. Never invalidate a valid
+            // snapshot just because the user navigated to the Input tab.
+            // INPUT21: tab switching only observes cached data. If connection-ready
+            // was missed, recover only when no connected-session job exists.
+            if (input06gPrefetchAddress == null && inputSessionBootstrapJob?.isActive != true) {
+                startInputSessionBootstrapIfNeeded("input-tab-missed-ready-fallback")
             }
+            val core = gatt.inputCodecCollector.value
+            val ext = gatt.inputExtendedSnapshot.value
+            // INPUT20: tab navigation never owns hardware GETs. Connection-ready
+            // prefetch is the only automatic owner; cached values render here.
+            Log.d("AtomRemoteSession", "INPUT20 TAB CACHE-ONLY core=${core.inputResponses}/${core.inputExpected} ext=${ext.completed}/${ext.expected}")
+            Log.d("AtomRemoteSession", "INPUT15 TAB CACHE FIRST phase=${inputSessionSnapshot.value.phase}")
+        }
+    }
+
+    private fun armInput09Recovery(address: String) {
+        if (input09RecoveryAddress != address) {
+            input09RecoveryJob?.cancel()
+            input09RecoveryJob = null
+            input09RecoveryAddress = address
+            input09RecoveryAttempts = 0
+        }
+        if (input09RecoveryJob?.isActive == true || input09RecoveryAttempts >= 2) return
+        input09RecoveryJob = viewModelScope.launch {
+            repeat(6) {
+                delay(8_000L)
+                if (_selected.value?.address != address ||
+                    !_pairingCodeAccepted.value ||
+                    !gatt.tcsPairingState.value.acceptWritten ||
+                    !gatt.tcsRemoteState.value.available) return@launch
+                val core = gatt.inputCodecCollector.value
+                val ext = gatt.inputExtendedSnapshot.value
+                // Do not disturb real hardware GETs or discard confirmed values.
+                if (core.inputResponses >= core.inputExpected && core.inputExpected > 0) return@launch
+                // INPUT10: Extended success is not evidence that Source or HDR arrived.
+                // Preserve confirmed extended values, retry core only after scans finish.
+                if (core.running || ext.running) {
+                    Log.d("AtomRemoteSession", "INPUT09 WATCH waiting for native collector address=$address")
+                    return@repeat
+                }
+                if (inputSessionBootstrapJob?.isActive == true || input08ExtendedJob?.isActive == true) return@repeat
+                if (input09RecoveryAttempts >= 2) return@launch
+                input09RecoveryAttempts++
+                input06gPrefetchAddress = null
+                inputSessionExpectedCoreGeneration = -1
+                // Keep extended snapshot/ownership intact: confirmed 12/17 must survive.
+                Log.w("AtomRemoteSession", "INPUT10 CORE RECOVERY attempt=$input09RecoveryAttempts address=$address core=${core.inputResponses}/${core.inputExpected} ext=${ext.completed}/${ext.expected}")
+                // Explicit core refresh avoids cache-ready/dedup shortcut; native
+                // GATT still owns packet serialization and command response parsing.
+                val queued = gatt.refreshGranularInputState()
+                Log.d("AtomRemoteSession", "INPUT10 CORE RETRY queued=$queued address=$address")
+            }
+            Log.w("AtomRemoteSession", "INPUT09 RECOVERY LIMIT reached-or-timeout address=$address attempts=$input09RecoveryAttempts")
         }
     }
 
@@ -307,9 +523,21 @@ class AtomosViewModel(app: Application) : AndroidViewModel(app) {
         val address = _selected.value?.address ?: return
         if (!_pairingCodeAccepted.value || !gatt.tcsPairingState.value.acceptWritten) return
         if (!gatt.tcsRemoteState.value.available) return
+        if (reason != "user-refresh") armInput09Recovery(address)
 
+        if (input05dRetryAddress != address) {
+            input05dRetryAddress = address
+            input05dEmptyCoreRetries = 0
+            input05dRetryJob?.cancel()
+        }
         if (inputSessionSnapshotCache.isReadyFor(address)) {
-            Log.d("AtomRemoteSession", "TCS20.03.7.9 INPUT SESSION CACHE HIT reason=$reason address=$address")
+            Log.d("AtomRemoteSession", "INPUT06G NATIVE CACHE REUSE reason=$reason address=$address responses=${gatt.inputCodecCollector.value.inputResponses}")
+            return
+        }
+        // INPUT06G: repeated transport-ready/linked callbacks must not schedule
+        // a second collector for the same connected recorder session.
+        if (input06gPrefetchAddress == address && reason != "user-refresh") {
+            Log.d("AtomRemoteSession", "INPUT06G SESSION PREFETCH DEDUP reason=$reason address=$address")
             return
         }
         if (inputSessionSnapshotCache.isRunningFor(address) || inputSessionBootstrapJob?.isActive == true) return
@@ -322,10 +550,44 @@ class AtomosViewModel(app: Application) : AndroidViewModel(app) {
                 if (_selected.value?.address != address) return@launch
                 if (!gatt.tcsRemoteState.value.available) return@launch
 
+                // INPUT06C: consume confirmed MAC13 data without repeating 3 GETs.
+                val current = gatt.inputCodecCollector.value
+                val keys = listOf("source", "hdrState", "deviceName")
+                if (!current.running && keys.all { key ->
+                        current.inputValues[key]?.let { it.isNotBlank() &&
+                            !it.startsWith("NO_RESPONSE") && !it.startsWith("REJECT") } == true
+                    }) {
+                    inputSessionExpectedCoreGeneration = -1
+                    inputSessionSnapshotCache.ready(
+                        address = address,
+                        coreGeneration = current.generation,
+                        extendedGeneration = gatt.inputExtendedSnapshot.value.generation,
+                        partial = true
+                    )
+                    Log.d("AtomRemoteSession", "INPUT06C BOOTSTRAP CORE REUSE confirmed=3/3 reason=$reason")
+                    startInputExtendedSessionBootstrap(address, current.generation)
+                    return@launch
+                }
+                // INPUT06D: an already-running native collector owns this session.
+                // Adopt its actual generation instead of starting another three-GET pass.
+                if (current.running && current.generation > 0) {
+                    input06gPrefetchAddress = address
+                    inputSessionExpectedCoreGeneration = current.generation
+                    inputSessionSnapshotCache.beginCore(address = address, expectedGeneration = current.generation)
+                    Log.d("AtomRemoteSession", "INPUT06D CORE ADOPT generation=${current.generation} reason=$reason")
+                    startInputExtendedSessionBootstrap(address, current.generation)
+                    return@launch
+                }
+                val generationBefore = gatt.inputCodecCollector.value.generation
                 val queued = gatt.refreshGranularInputState()
                 if (queued) {
+                    input06gPrefetchAddress = address
+                    // Native may either start synchronously or defer behind MAC13.
+                    // Follow the actual generation, not an unconditional +1.
+                    val generationAfter = gatt.inputCodecCollector.value.generation
                     inputSessionExpectedCoreGeneration =
-                        gatt.inputCodecCollector.value.generation + 1
+                        if (generationAfter > generationBefore) generationAfter
+                        else generationBefore + 1
                     inputSessionSnapshotCache.beginCore(
                         address = address,
                         expectedGeneration = inputSessionExpectedCoreGeneration
@@ -334,9 +596,12 @@ class AtomosViewModel(app: Application) : AndroidViewModel(app) {
                         "AtomRemoteSession",
                         "TCS20.03.7.9 INPUT SESSION PREFETCH START reason=$reason address=$address attempt=$attempt expectedCore=$inputSessionExpectedCoreGeneration"
                     )
+                    // INPUT08: initiate extended work now, not at core 3/3 completion.
+                    // Existing native GATT readiness gate still serializes real ATT work.
+                    startInputExtendedSessionBootstrap(address, inputSessionExpectedCoreGeneration)
                     return@launch
                 }
-                delay(100L)
+                delay(50L)
             }
             Log.d(
                 "AtomRemoteSession",
@@ -347,28 +612,74 @@ class AtomosViewModel(app: Application) : AndroidViewModel(app) {
 
     private fun startInputExtendedSessionBootstrap(address: String, coreGeneration: Int) {
         if (_selected.value?.address != address) return
-        viewModelScope.launch {
-            repeat(40) { attempt ->
+        // INPUT08: Core and extended snapshots have separate ownership. Do not
+        // start 17 GETs again when the 3-GET collector later completes.
+        if (input08ExtendedScheduledAddress == address) {
+            Log.d("AtomRemoteSession", "INPUT08 EXTENDED DEDUP address=$address")
+            return
+        }
+        input08ExtendedScheduledAddress = address
+        input08ExtendedJob = viewModelScope.launch {
+            // INPUT17: request all 17 Input details at the SAME TIME as core 1/3 begins.
+            // A single serialized PacketLink owns actual GATT writes: native
+            // refreshExtendedInputState() refuses to steal the core/bootstrap owner.
+            // Poll readiness without the old 5-second core-to-extended delay.
+            Log.d("AtomRemoteSession", "INPUT18 UNIFIED SYNC ARMED address=$address generation=$coreGeneration")
+            // INPUT21: strictly CORE-FIRST. One native PacketLink owner at a time.
+            // Never release Details merely because core is RUNNING (INPUT18 bug).
+            // An already-confirmed 3/3 is reusable. Keep waiting across tab switches;
+            // UI visibility must not cancel this connected-session job.
+            var coreFinished = false
+            for (turn in 0 until 1500) {
+                if (_selected.value?.address != address) return@launch
+                if (!gatt.tcsRemoteState.value.available) return@launch
+                val core = gatt.inputCodecCollector.value
+                val confirmed3 = listOf("source", "hdrState", "deviceName").all { key ->
+                    core.inputValues[key]?.let { value ->
+                        value.isNotBlank() && !value.startsWith("NO_RESPONSE") && !value.startsWith("REJECT")
+                    } == true
+                }
+                if (confirmed3 || (core.generation >= coreGeneration && !core.running &&
+                            core.inputExpected > 0)) {
+                    coreFinished = true
+                    break
+                }
+                if (turn % 50 == 0) Log.d("AtomRemoteSession", "INPUT22 CORE-FIRST WAIT core=${core.inputResponses}/${core.inputExpected} running=${core.running}")
+                delay(20L)
+            }
+            Log.d("AtomRemoteSession", "INPUT22 CORE-FIRST HANDOFF finished=$coreFinished core=${gatt.inputCodecCollector.value.inputResponses}/${gatt.inputCodecCollector.value.inputExpected}")
+            if (!coreFinished) {
+                // Do not run Details first when the native core owner never started/settled.
+                // Leave existing verified values intact. This is diagnostic, not fake success.
+                Log.w("AtomRemoteSession", "INPUT22 CORE NOT SETTLED; Details deferred to protect core-first order address=$address")
+                input08ExtendedScheduledAddress = null
+                return@launch
+            }
+            repeat(1200) { attempt ->
                 if (_selected.value?.address != address) return@launch
                 val queued = gatt.refreshExtendedInputState()
                 if (queued) {
                     inputSessionCoreGeneration = coreGeneration
                     inputSessionExpectedExtendedGeneration =
-                        gatt.inputExtendedSnapshot.value.generation + 1
+                        gatt.inputExtendedSnapshot.value.generation
                     inputSessionSnapshotCache.beginExtended(
                         address = address,
                         coreGeneration = coreGeneration,
                         expectedGeneration = inputSessionExpectedExtendedGeneration
                     )
-                    Log.d(
-                        "AtomRemoteSession",
-                        "TCS20.03.7.9 INPUT SESSION EXTENDED PREFETCH START address=$address attempt=$attempt expectedExtended=$inputSessionExpectedExtendedGeneration"
-                    )
+                    Log.d("AtomRemoteSession", "INPUT17 EXTENDED START address=$address attempt=$attempt core=${gatt.inputCodecCollector.value.inputResponses}/${gatt.inputCodecCollector.value.inputExpected} extendedGeneration=$inputSessionExpectedExtendedGeneration")
                     return@launch
                 }
-                delay(100L)
+                if (attempt == 0 || attempt % 80 == 0) {
+                    Log.d("AtomRemoteSession", "INPUT17 EXTENDED WAIT attempt=$attempt coreRunning=${gatt.inputCodecCollector.value.running} core=${gatt.inputCodecCollector.value.inputResponses}/${gatt.inputCodecCollector.value.inputExpected}")
+                }
+                delay(25L)
             }
+            Log.w("AtomRemoteSession", "INPUT17 EXTENDED START TIMEOUT address=$address; preserving real core values")
 
+            // INPUT08: an extended collection that never started is NOT a
+            // complete snapshot. Preserve any real core data; never fake 17/17.
+            input08ExtendedScheduledAddress = null
             // Core 3/3 is still valid useful recorder state even when every
             // optional extended getter cannot start.
             inputSessionSnapshotCache.ready(
@@ -383,6 +694,7 @@ class AtomosViewModel(app: Application) : AndroidViewModel(app) {
             )
         }
     }
+    val audioR26Live = gatt.audioR26Live // macOS-disassembled GET collector, no SET
     val remoteStateSnapshot = gatt.remoteStateSnapshot // AppPolling diagnostic only in 19.12.10
     val safeAreaSummaryRaw = gatt.safeAreaSummaryRaw
     val frameGuideFormatSummaryRaw = gatt.frameGuideFormatSummaryRaw
@@ -610,18 +922,9 @@ class AtomosViewModel(app: Application) : AndroidViewModel(app) {
         viewModelScope.launch {
             gatt.codecHardwareProfile.collect { profile ->
                 if (profile == null) return@collect
-                val draftMatchesRecorder =
-                    _codecProfile.value == profile.first && _codecBitDepth.value == profile.second
-                if (!codecSelectionDirty || draftMatchesRecorder) {
-                    _codecProfile.value = profile.first
-                    _codecBitDepth.value = profile.second
-                    codecSelectionDirty = false
-                }
-                _commandStatus.value = if (codecSelectionDirty && !draftMatchesRecorder) {
-                    "Recorder is ${codecProfileLabel(profile.first)}; selected ${codecProfileLabel(_codecProfile.value)} is not confirmed yet"
-                } else {
-                    "Codec ${codecProfileLabel(profile.first)} confirmed by recorder readback"
-                }
+                _codecProfile.value = profile.first
+                _codecBitDepth.value = profile.second
+                _commandStatus.value = "Codec ${codecProfileLabel(profile.first)} confirmed by recorder readback"
             }
         }
         viewModelScope.launch {
@@ -642,22 +945,71 @@ class AtomosViewModel(app: Application) : AndroidViewModel(app) {
                     "AtomRemoteSession",
                     "TCS19.12.10 COLLECTOR UI generation=${snapshot.generation} running=${snapshot.running} input=${snapshot.inputResponses}/${snapshot.inputExpected} codecVerified=${snapshot.codecVerified} json=${snapshot.json}"
                 )
+                // INPUT06G: backend-equivalent cache consumption: hardware typed
+                // RX values are in GattClient StateFlow, and can be exposed before
+                // the remaining getter attempts finish. Do not synthesize data.
+                if (snapshot.running && snapshot.inputResponses > 0) {
+                    val address = _selected.value?.address
+                    if (address != null &&
+                        inputSessionExpectedCoreGeneration > 0 &&
+                        snapshot.generation >= inputSessionExpectedCoreGeneration &&
+                        inputSessionSnapshotCache.isRunningFor(address)) {
+                        inputSessionSnapshotCache.ready(
+                            address = address,
+                            coreGeneration = snapshot.generation,
+                            extendedGeneration = gatt.inputExtendedSnapshot.value.generation,
+                            partial = true
+                        )
+                        Log.d("AtomRemoteSession", "INPUT11 CORE LIVE RX confirmed=${snapshot.inputResponses}/${snapshot.inputExpected} address=$address")
+                    }
+                }
                 if (!snapshot.running) {
-                    _commandStatus.value = "Input recorder data ${snapshot.inputResponses}/${snapshot.inputExpected} getters returned"
+                    // INPUT06C: core collector counters belong in diagnostics, not the
+                    // Remote Home status bar. Live values still come only from typed RX.
+                    Log.d("AtomRemoteSession", "INPUT06C CORE RX ${snapshot.inputResponses}/${snapshot.inputExpected}")
 
                     val address = _selected.value?.address
                     if (
                         address != null &&
                         inputSessionExpectedCoreGeneration > 0 &&
                         snapshot.generation >= inputSessionExpectedCoreGeneration &&
-                        inputSessionSnapshotCache.isRunningFor(address)
+                        (inputSessionSnapshotCache.isRunningFor(address) || inputSessionSnapshotCache.isReadyFor(address))
                     ) {
                         inputSessionExpectedCoreGeneration = -1
                         Log.d(
                             "AtomRemoteSession",
                             "TCS20.03.7.9 INPUT SESSION CORE READY generation=${snapshot.generation} responses=${snapshot.inputResponses}/${snapshot.inputExpected}"
                         )
-                        startInputExtendedSessionBootstrap(address, snapshot.generation)
+                        if (snapshot.inputResponses < snapshot.inputExpected) {
+                            // INPUT06D: actual recorder values are published per typed RX.
+                            // Do not hide them behind 1/3 and 2/3 and do not automatically
+                            // repeat all three route-variant GETs for absent fields.
+                            // Missing values remain missing and manual Refresh is available.
+                            input05dRetryJob?.cancel()
+                            inputSessionSnapshotCache.ready(
+                                address = address,
+                                coreGeneration = snapshot.generation,
+                                extendedGeneration = gatt.inputExtendedSnapshot.value.generation,
+                                partial = true
+                            )
+                            Log.w("AtomRemoteSession", "INPUT07 CORE PARTIAL responses=${snapshot.inputResponses}/${snapshot.inputExpected} address=$address; starting independent 17-field snapshot")
+                            // INPUT07: The extended Input scan must not require core 3/3.
+                            // Real typed responses populate the native GATT state as they arrive.
+                            startInputExtendedSessionBootstrap(address, snapshot.generation)
+                        } else {
+                            input05dEmptyCoreRetries = 0
+                            // INPUT05F: publish recorder-confirmed core response readiness
+                            // immediately; 17 optional extended GETs must not gate core UI.
+                            // PARTIAL explicitly means extended properties are still pending.
+                            inputSessionSnapshotCache.ready(
+                                address = address,
+                                coreGeneration = snapshot.generation,
+                                extendedGeneration = gatt.inputExtendedSnapshot.value.generation,
+                                partial = true
+                            )
+                            Log.d("AtomRemoteSession", "INPUT05J CORE COMPLETE READY responses=${snapshot.inputResponses}/${snapshot.inputExpected} address=$address")
+                            startInputExtendedSessionBootstrap(address, snapshot.generation)
+                        }
                     }
                 }
             }
@@ -685,6 +1037,7 @@ class AtomosViewModel(app: Application) : AndroidViewModel(app) {
                         "AtomRemoteSession",
                         "TCS20.03.7.9 INPUT SESSION READY partial=$partial completed=${snapshot.completed}/${snapshot.expected} address=$address"
                     )
+                    Log.d("AtomRemoteSession", "INPUT11 EXTENDED SETTLED completed=${snapshot.completed}/${snapshot.expected} core=${gatt.inputCodecCollector.value.inputResponses}/${gatt.inputCodecCollector.value.inputExpected} address=$address")
                 }
             }
         }
@@ -720,13 +1073,19 @@ class AtomosViewModel(app: Application) : AndroidViewModel(app) {
                     "bootstrapping" -> {
                         _commandStatus.value = remote.lastStatus ?: "Synchronizing recorder state..."
                         if (_screen.value == Screen.PAIR) _screen.value = Screen.REMOTE
+                        // INPUT21: bootstrap is not READY. Do not start Details or core
+                        // here; give the existing RemoteApi bootstrap ownership until
+                        // transport-ready. This prevents premature extended-first GETs.
+                        Log.d("AtomRemoteSession", "INPUT21 WAIT REMOTE READY before core getter")
                     }
                     "transport-ready" -> {
                         _s1cStatus.value = _s1cStatus.value.copy(state = "tcs-linked", error = null)
                         _commandStatus.value = remote.lastStatus
                             ?: "PacketLink connected. RemoteApi state is unverified; controls remain enabled for direct hardware testing."
                         if (_screen.value == Screen.PAIR) _screen.value = Screen.REMOTE
-                        Log.d("AtomRemoteSession", "TCS20.11 INPUT HOME PREFETCH SUPPRESSED phase=transport-ready")
+                        // Only Input snapshot bootstrap is added; pairing and PacketLink remain frozen.
+                        startInputSessionBootstrapIfNeeded("session-transport-ready")
+                        Log.d("AtomRemoteSession", "INPUT02 CONNECTION PREFETCH REQUEST phase=transport-ready")
                     }
                     "sending" -> _commandStatus.value = "Sending ${remote.lastCommand ?: "remote command"}..."
                     "awaiting-response" -> _commandStatus.value = remote.lastStatus ?: "Waiting for recorder response..."
@@ -734,7 +1093,9 @@ class AtomosViewModel(app: Application) : AndroidViewModel(app) {
                         _s1cStatus.value = _s1cStatus.value.copy(state = "tcs-linked", error = null)
                         _commandStatus.value = "Recorder remote transport is ready."
                         if (_screen.value == Screen.PAIR) _screen.value = Screen.REMOTE
-                        Log.d("AtomRemoteSession", "TCS20.11 INPUT HOME PREFETCH SUPPRESSED phase=linked")
+                        // Only Input snapshot bootstrap is added; pairing and PacketLink remain frozen.
+                        startInputSessionBootstrapIfNeeded("session-linked")
+                        Log.d("AtomRemoteSession", "INPUT02 CONNECTION PREFETCH REQUEST phase=linked")
                     }
                     "error" -> {
                         val selected = _selected.value
@@ -833,45 +1194,83 @@ class AtomosViewModel(app: Application) : AndroidViewModel(app) {
     fun bluetoothAvailable(): Boolean = scanner.isAvailable()
 
     fun startScan() {
-        // Discovery list remains scanner-only. 18.0 never requires the phone to
-        // advertise a fake recorder profile during official TCS application pairing.
+        // Prevent accidental scan-throttling from rapid taps, without changing
+        // the official paired-device TCS code-scan or remote command paths.
+        if (_scanState.value.startsWith("scanning")) return
         peripheral.stopPairingPresence()
         peripheral.setExpectedCentralAddress(null)
         scanJob?.cancel()
+        val myEpoch = ++scanEpoch
         _devices.value = emptyList()
         _pairingCodeCandidates.value = emptyList()
         selectedSessionPairingId = null
         _scanState.value = "scanning"
+        _scanDiagnostics.value = "Starting unfiltered BLE discovery (legacy + extended)..."
         scanJob = viewModelScope.launch {
-            // Preserve first-seen order. RSSI changes several times per second and must never
-            // reorder LazyColumn rows while the user is trying to tap a recorder.
+            // Preserve address order to keep the visible list stable on RSSI updates.
             val map = linkedMapOf<String, BleAdvertisement>()
-            val failure = runCatching {
-                withTimeoutOrNull(12_000L) {
-                    scanner.scan().collect { ad ->
-                        val merged = mergeAdvertisement(map[ad.address], ad)
-                        map[ad.address] = merged
-                        _devices.value = map.values.filter(::isStrictDiscoveryCandidate)
-                        if (_selected.value?.address == merged.address) {
-                            _selected.value = mergeAdvertisement(_selected.value, merged)
+            var packets = 0
+            val failures = mutableListOf<String>()
+            suspend fun scanPass(extended: Boolean, durationMs: Long) {
+                val result = runCatching {
+                    withTimeoutOrNull(durationMs) {
+                        val flow = if (extended) scanner.scanDiscovery() else scanner.scan()
+                        flow.collect { ad ->
+                            packets++
+                            val existing = map[ad.address]
+                            val merged = mergeAdvertisement(existing, ad)
+                            map[ad.address] = merged
+                            // Recognize by proven service/name, including packet metadata
+                            // merged over multiple advertisement events from the same MAC.
+                            _devices.value = map.values.filter(::isStrictDiscoveryCandidate)
+                            if (existing == null || (existing.name == null && merged.name != null)) {
+                                Log.i("AtomRemoteBleScan", "RECEIVED addr=${merged.address} name=${merged.name ?: "(unnamed)"} " +
+                                    "rssi=${merged.rssi} connectable=${merged.connectable} uuids=${merged.serviceUuids} " +
+                                    "serviceData=${merged.serviceDataUuids} recognized=${isStrictDiscoveryCandidate(merged)}")
+                            }
+                            if (_selected.value?.address == merged.address) {
+                                _selected.value = mergeAdvertisement(_selected.value, merged)
+                            }
+                            _scanDiagnostics.value = "Radio packets: $packets | Unique BLE: ${map.size} | ATOMOS candidates: ${_devices.value.size}"
                         }
                     }
+                }.exceptionOrNull()
+                if (result != null && isActive) {
+                    failures += (result.message ?: result.javaClass.simpleName)
+                    Log.w("AtomRemoteBleScan", "Pass extended=$extended failed: ${result.message}")
                 }
-            }.exceptionOrNull()
-
-            if (failure != null) {
-                _scanState.value = "error:${failure.message}"
-            } else {
-                _scanState.value = "complete:${map.values.count(::isStrictDiscoveryCandidate)}"
             }
+
+            // Some recorders advertise only a manufacturer/extended frame. Others
+            // need legacy-only scanning on OEM Bluetooth implementations.
+            scanPass(extended = true, durationMs = 18_000L)
+            if (isActive && myEpoch == scanEpoch && _devices.value.isEmpty()) {
+                _scanState.value = "scanning-legacy"
+                _scanDiagnostics.value = "No identified recorder yet. Trying legacy-only BLE scan... " +
+                    "(raw unique=${map.size})"
+                delay(1_400L) // close previous callback before registering the fallback
+                scanPass(extended = false, durationMs = 13_000L)
+            }
+            if (!isActive || myEpoch != scanEpoch) return@launch
+            val found = _devices.value.size
+            val unrecognized = map.values.count { !isStrictDiscoveryCandidate(it) }
+            val summary = "Radio packets: $packets | Unique BLE: ${map.size} | ATOMOS: $found | Other: $unrecognized"
+            _scanDiagnostics.value = summary
+            _scanState.value = if (failures.isNotEmpty() && packets == 0) {
+                "error:${failures.joinToString("; ")}"
+            } else {
+                "complete:$found"
+            }
+            Log.i("AtomRemoteBleScan", "COMPLETE $summary errors=${failures.joinToString(";")}")
             scanJob = null
         }
     }
 
     fun stopScan() {
+        ++scanEpoch
         scanJob?.cancel()
         scanJob = null
-        if (_scanState.value == "scanning" || _scanState.value == "pairing-id-scan") {
+        if (_scanState.value.startsWith("scanning") || _scanState.value == "pairing-id-scan") {
             _scanState.value = "stopped"
         }
     }
@@ -883,10 +1282,16 @@ class AtomosViewModel(app: Application) : AndroidViewModel(app) {
     private fun mergeAdvertisement(previous: BleAdvertisement?, latest: BleAdvertisement): BleAdvertisement {
         if (previous == null) return latest
         return latest.copy(
-            name = latest.name ?: previous.name,
+            name = latest.name?.takeIf { it.isNotBlank() } ?: previous.name,
             serviceUuids = (previous.serviceUuids + latest.serviceUuids).distinct(),
             manufacturerDataHex = latest.manufacturerDataHex ?: previous.manufacturerDataHex,
-            connectable = latest.connectable ?: previous.connectable,
+            // A true connectable frame wins over a second non-connectable
+            // extended/scan-response frame using the same advertiser address.
+            connectable = when {
+                latest.connectable == true || previous.connectable == true -> true
+                latest.connectable != null -> latest.connectable
+                else -> previous.connectable
+            },
             rawRecordHex = latest.rawRecordHex ?: previous.rawRecordHex,
             advertisedPairingId = latest.advertisedPairingId ?: previous.advertisedPairingId,
             manufacturerCompanyIds = (previous.manufacturerCompanyIds + latest.manufacturerCompanyIds).distinct(),
@@ -916,7 +1321,7 @@ class AtomosViewModel(app: Application) : AndroidViewModel(app) {
             n.contains("ninja") || n.contains("neon") || n.contains("sumo") ||
             n.contains("shinobi") || n == "ag" || n == "ag2" ||
             n.startsWith("ag-") || n.startsWith("ag2-")
-        return isAirGluSyncEndpoint(ad) || knownAtomosName
+        return isAirGluSyncEndpoint(ad) || knownAtomosName || loadTrustedTcs(ad.address) != null
     }
 
     private fun normalizePairingCode(raw: String?): String? {
@@ -1999,9 +2404,26 @@ class AtomosViewModel(app: Application) : AndroidViewModel(app) {
         }
         if (queued) {
             when (control) {
-                // 20.05.0 Focus is recorder-confirmed only.
-                // Zebra 20.05.4 is recorder-confirmed only.
-                // False Colour / Blue Only 20.05.6-7 are recorder-confirmed only.
+                "focus-assist" -> {
+                    uiFocusEnabledOverride = enabled
+                    _monitorFocusAssist.value = enabled
+                    publishFocusUi()
+                }
+                "zebra" -> {
+                    uiZebraEnabledOverride = enabled
+                    _monitorZebra.value = enabled
+                    publishZebraUi()
+                }
+                "false-color" -> {
+                    uiFalseColourOverride = enabled
+                    _monitorFalseColor.value = enabled
+                    publishEffectsUi()
+                }
+                "blue-only" -> {
+                    uiBlueOnlyOverride = enabled
+                    _monitorBlueOnly.value = enabled
+                    publishEffectsUi()
+                }
             }
             _commandStatus.value = if (control == "focus-assist") {
                 "$label change sent; waiting for recorder readback"
@@ -2036,6 +2458,7 @@ class AtomosViewModel(app: Application) : AndroidViewModel(app) {
 
     fun refreshFocusAssistState() {
         if (!remoteFeatureReady("Focus Assist")) return
+        clearFocusUiOverrides()
         val queued = gatt.refreshOfficialFocusAssistState()
         _commandStatus.value = if (queued) {
             "Reading Focus Assist from recorder..."
@@ -2048,7 +2471,14 @@ class AtomosViewModel(app: Application) : AndroidViewModel(app) {
         if (!remoteFeatureReady("Focus Type")) return
         queueLatestMonitorUiAction(
             label = "Focus Type",
-            action = { gatt.sendOfficialFocusPeakType(type) },
+            action = {
+                val ok = gatt.sendOfficialFocusPeakType(type)
+                if (ok) {
+                    uiFocusTypeOverride = type
+                    publishFocusUi()
+                }
+                ok
+            },
             acceptedText = "Applying Focus Type; waiting for recorder readback"
         )
     }
@@ -2057,7 +2487,14 @@ class AtomosViewModel(app: Application) : AndroidViewModel(app) {
         if (!remoteFeatureReady("Focus Threshold")) return
         queueLatestMonitorUiAction(
             label = "Focus Threshold",
-            action = { gatt.sendOfficialFocusPeakThreshold(threshold) },
+            action = {
+                val ok = gatt.sendOfficialFocusPeakThreshold(threshold)
+                if (ok) {
+                    uiFocusThresholdOverride = threshold
+                    publishFocusUi()
+                }
+                ok
+            },
             acceptedText = "Applying Focus threshold; waiting for recorder readback"
         )
     }
@@ -2066,13 +2503,21 @@ class AtomosViewModel(app: Application) : AndroidViewModel(app) {
         if (!remoteFeatureReady("Focus Colour")) return
         queueLatestMonitorUiAction(
             label = "Focus Colour",
-            action = { gatt.sendOfficialFocusPeakColour(colour) },
+            action = {
+                val ok = gatt.sendOfficialFocusPeakColour(colour)
+                if (ok) {
+                    uiFocusColourOverride = colour
+                    publishFocusUi()
+                }
+                ok
+            },
             acceptedText = "Applying Focus colour; waiting for recorder readback"
         )
     }
 
     fun refreshMonitorAssistEffects() {
         if (!remoteFeatureReady("Monitor Assist")) return
+        clearEffectsUiOverrides()
         val queued = gatt.refreshOfficialMonitorAssistEffects()
         _commandStatus.value = if (queued) "Reading exposure tools..." else "Monitor Assist readback is busy."
     }
@@ -2080,6 +2525,10 @@ class AtomosViewModel(app: Application) : AndroidViewModel(app) {
     fun setZebraThreshold(threshold: Int) {
         if (!remoteFeatureReady("Zebra Threshold")) return
         val queued = gatt.sendOfficialZebraThreshold(threshold)
+        if (queued) {
+            uiZebraThresholdOverride = threshold
+            publishZebraUi()
+        }
         _commandStatus.value = if (queued) {
             "Applying Zebra threshold; waiting for recorder readback"
         } else {
@@ -2549,6 +2998,211 @@ class AtomosViewModel(app: Application) : AndroidViewModel(app) {
         )
     }
 
+    /** OUTPUT R12: AG2-proven local=true readback first.
+     *
+     * 0x0648 AppPolling.InputOutputSummaryGet has not returned a usable Output
+     * response on this recorder. Do NOT put it in the Output tab's critical
+     * path; keep the separate existing GATT method for unrelated diagnostics.
+     *
+     * This method only issues existing verified GETs. It does not synthesize
+     * HDR Type / Gamut / downscale / timecode option lists or send any SET.
+     * TCS pairing, PacketLink and Input ownership remain unchanged.
+     */
+    /** AUDIO R26: a single read-only meters-page probe, no Audio SET. */
+    fun refreshAudioMetersR26(): Boolean {
+        val ready = gatt.tcsPairingState.value.acceptWritten && gatt.tcsRemoteState.value.available
+        if (!ready) {
+            Log.i("AtomRemoteAudioR26", "REFRESH_SKIPPED disconnected")
+            return false
+        }
+        val queued = gatt.probeR26AudioMetersPage()
+        Log.i("AtomRemoteAudioR26", "REFRESH_METERS queued=$queued")
+        return queued
+    }
+
+    /** R26.13: sequential confirmed-opcode Audio getter collector. */
+    fun refreshRecoveredAudioR26(): Boolean = gatt.startAudioR26RecoveredCollector()
+    fun stopRecoveredAudioR26() = gatt.cancelAudioR26RecoveredCollector()
+
+    /** AUDIO PART2: manually requested non-local read-only A/B probe. */
+    fun probeAudioMetersNonlocalR26Part2(): Boolean {
+        val queued = gatt.probeR26AudioMetersPageNonlocalOnce()
+        Log.i("AtomRemoteAudioR26P2", "NONLOCAL_UI_REQUEST queued=$queued")
+        return queued
+    }
+
+    fun refreshOutputHardwareReadback() {
+        val address = _selected.value?.address
+        val ready = gatt.tcsPairingState.value.acceptWritten && gatt.tcsRemoteState.value.available
+        Log.i("AtomRemoteOutputR12", "REFRESH_BEGIN ready=$ready address=$address summary0648=SKIPPED")
+        if (!remoteFeatureReady("Output readback")) {
+            _outputReadbackStatus.value = "Waiting for recorder connection"
+            return
+        }
+        outputReadbackJob?.cancel()
+        outputReadbackJob = viewModelScope.launch {
+            suspend fun boundedQueue(label: String, maxAttempts: Int, action: () -> Boolean): Boolean {
+                for (attempt in 1..maxAttempts) {
+                    if (_selected.value?.address != address ||
+                        !gatt.tcsPairingState.value.acceptWritten || !gatt.tcsRemoteState.value.available) {
+                        Log.i("AtomRemoteOutputR12", "GET_ABORT label=$label reason=disconnected")
+                        return false
+                    }
+                    if (action()) {
+                        Log.i("AtomRemoteOutputR12", "GET_QUEUED label=$label attempt=$attempt")
+                        return true
+                    }
+                    if (attempt == 1 || attempt % 5 == 0) {
+                        Log.i("AtomRemoteOutputR12", "GET_BUSY label=$label attempt=$attempt")
+                    }
+                    delay(300L)
+                }
+                Log.i("AtomRemoteOutputR12", "GET_NOT_QUEUED label=$label")
+                return false
+            }
+
+            // OUTPUT R24: run OutputPage before all other Output GET chains.
+            // R23 capture had 0 accepted page GETs when this ran last.
+            // Do not preempt any Input/Record/PendingRemotePacket transaction.
+            // The existing shared GATT owner remains authoritative.
+            // OUTPUT R19: the existing R17 speculative D2/D4/D6 GET probes
+            // returned NO TYPED REPLIES in the R18 awake capture; do not
+            // automatically hammer these unconfirmed IDs on tab refresh.
+            // Prefer the official AppPolling.OutputPageGet class/Android 0x0644
+            // as a SINGLE safe read-only page probe BEFORE HDR/LUT reads.
+            // This is source-mapped, NOT AG2-verified; no unsupported values
+            // will be interpreted or shown until a typed payload is captured.
+            _outputReadbackStatus.value = "Checking additional Output options"
+            // R21: R20 local=true returned a genuine 0x8644 header but the
+            // 54-byte declared body was cut to 16 bytes in an ATT read.
+            // Negotiate a larger MTU only AFTER official pairing/PacketLink
+            // readiness, serialized through the existing ATT queue.
+            val mtuQueued = boundedQueue("r21-post-pair-ble-mtu", 12) {
+                gatt.requestR21OutputPageMtu()
+            }
+            Log.i("AtomRemoteOutputR21", "MTU_PREPARE queued=$mtuQueued")
+            if (mtuQueued) delay(1200L)
+            // Prior R19 non-local probes never returned a typed page on AG2;
+            // skip redundant non-local GET. Use the already evidenced read-only
+            // local=true request and let the normal exact-length parser decide.
+            Log.i("AtomRemoteOutputR24", "PAGE_FIRST_BEGIN state=read-only-0x0644 paired=true")
+            val pageBeforeR23 = gatt.outputPageRawR19.value
+            val generationBeforeR23 = gatt.outputPageRxGenerationR23.value
+            Log.i("AtomRemoteOutputR23", "PAGE_REFRESH_BEGIN priorBytes=${pageBeforeR23?.length?.div(2) ?: 0} generation=$generationBeforeR23")
+            // Output R23: R22's complete page was cached forever. Always issue
+            // ONE proven read-only local=true 0x0644 GET on explicit Output
+            // refresh, so recorder-side A/B changes can be observed. Preserve
+            // the last verified page if the new read is rejected/times out.
+            if (_selected.value?.address == address &&
+                gatt.tcsPairingState.value.acceptWritten &&
+                gatt.tcsRemoteState.value.available) {
+                _outputReadbackStatus.value = "Reading current Output page from recorder"
+                val pageQueuedR23 = boundedQueue("r24-output-page-first-local-refresh", 24) {
+                    gatt.probeR20OutputPageGetLocal()
+                }
+                Log.i("AtomRemoteOutputR24", "PAGE_FIRST_QUEUE queued=$pageQueuedR23 attemptsMax=24")
+                if (pageQueuedR23) {
+                    // Bounded wait; a GATT write ACK / E0 is not readback.
+                    for (poll in 1..20) {
+                        delay(250L)
+                        if (gatt.outputPageRxGenerationR23.value > generationBeforeR23) break
+                    }
+                }
+                val latest = gatt.outputPageRawR19.value
+                Log.i("AtomRemoteOutputR24", "PAGE_FIRST_RESULT freshRx=${gatt.outputPageRxGenerationR23.value > generationBeforeR23} " +
+                    "currentBytes=${latest?.length?.div(2) ?: 0} queued=$pageQueuedR23")
+                Log.i("AtomRemoteOutputR23",
+                    "PAGE_REFRESH_RESULT queued=$pageQueuedR23 priorBytes=${pageBeforeR23?.length?.div(2) ?: 0} " +
+                        "currentBytes=${latest?.length?.div(2) ?: 0} changed=${latest != pageBeforeR23} " +
+                        "freshRx=${gatt.outputPageRxGenerationR23.value > generationBeforeR23} " +
+                        "pageAvailable=${latest != null} successRequires_PAGE_TYPED_RX=true")
+            }
+
+
+            // Priority 1: 0x00DD -> typed 0x80DC, local=true on AG2 (R9-R11).
+            _outputReadbackStatus.value = "Reading HDR Out from recorder"
+            val hdrBefore = gatt.outputHdrEnabled.value
+            val hdrQueued = boundedQueue("hdr-local-true-0x00DD", 16) {
+                gatt.refreshOfficialOutputHdrReadback()
+            }
+            if (hdrQueued) {
+                // Even if a cached value already exists, allow physical GET a
+                // short period. A non-null cache is not a fresh ACK proof.
+                if (hdrBefore != null) {
+                    delay(900L)
+                } else {
+                    for (poll in 1..14) {
+                        if (gatt.outputHdrEnabled.value != null) break
+                        delay(250L)
+                    }
+                }
+            }
+            val hdrCurrent = gatt.outputHdrEnabled.value
+            Log.i("AtomRemoteOutputR12", "HDR_RESULT queued=$hdrQueued cachedBefore=$hdrBefore current=$hdrCurrent " +
+                "freshness=${if (hdrBefore == null && hdrCurrent != null) "new-value" else "not-independently-proven"}")
+
+            // Priority 2: existing LUT sequence; GET 0x00E7 / 0x00E3 on
+            // local=true and 0x80E4 / 0x80E2 responses already validated.
+            _outputReadbackStatus.value = "Reading LUT Out from recorder"
+            val lutBefore = gatt.monitorLutState.value.outputLutEnabled
+            val lutAccepted = if (_selected.value?.address == address &&
+                gatt.tcsPairingState.value.acceptWritten && gatt.tcsRemoteState.value.available) {
+                gatt.refreshOfficialLutState() // existing native queued/retry chain
+            } else false
+            if (lutAccepted && lutBefore == null) {
+                for (poll in 1..14) {
+                    if (gatt.monitorLutState.value.outputLutEnabled != null) break
+                    delay(250L)
+                }
+            }
+            val lutNow = gatt.monitorLutState.value
+            Log.i("AtomRemoteOutputR12", "LUT_RESULT queuedOrDeferred=$lutAccepted " +
+                "available=${lutNow.outputLutAvailable} enabled=${lutNow.outputLutEnabled}")
+
+            // R13: isolated read-only probes for individual Output scalar
+            // getters. Numeric IDs are still *candidates* until typed AG2 RX.
+            // Do not run them ahead of R9's proven HDR/LUT paths, and do not
+            // allow these probes to touch Input, PacketLink framing, or SETs.
+            _outputReadbackStatus.value = "Checking Output HDR Type and Gamut support"
+            for (probe in listOf("hdr-type", "gamut")) {
+                val queued = boundedQueue("r13-$probe-readonly-candidate", 12) {
+                    gatt.probeR13OutputScalarGet(probe)
+                }
+                if (queued) {
+                    // Give the recorder and the pending-response token a bounded
+                    // window. Do not infer success from write ACK or old cache.
+                    for (poll in 1..18) {
+                        delay(250L)
+                        val result = if (probe == "hdr-type")
+                            gatt.outputHdrTypeId.value else gatt.outputGamutId.value
+                        if (result != null) break
+                    }
+                }
+                val result = if (probe == "hdr-type")
+                    gatt.outputHdrTypeId.value else gatt.outputGamutId.value
+                Log.i("AtomRemoteOutputR13", "PROBE_RESULT kind=$probe queued=$queued verifiedValue=${result ?: "none"}")
+                delay(300L)
+            }
+
+            // HDR Type/Gamut do NOT come from the rejected/unanswered 0x0648.
+            // Only display previously verified fields if another response
+            // genuinely populated them; never turn -1 into a fake enum value.
+            val hdrType = gatt.outputHdrTypeId.value
+            val gamut = gatt.outputGamutId.value
+            val known = hdrCurrent != null || lutNow.outputLutEnabled != null ||
+                lutNow.outputLutAvailable != null || hdrType != null || gamut != null
+            _outputReadbackStatus.value = if (known) {
+                if (hdrType != null || gamut != null) "HDR/LUT and individual Output readback available" else
+                    "HDR/LUT available; HDR Type and Gamut not yet confirmed by recorder"
+            } else {
+                "No confirmed Output response; HDR/LUT GET attempted"
+            }
+            Log.i("AtomRemoteOutputR12", "REFRESH_END known=$known hdr=$hdrCurrent " +
+                "lut=${lutNow.outputLutEnabled} hdrType=${hdrType ?: -1} gamut=${gamut ?: -1} " +
+                "summary0648=SKIPPED")
+        }
+    }
+
     fun refreshInputFormatSummary() {
         refreshInputCodecState()
     }
@@ -2661,132 +3315,59 @@ class AtomosViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
-    private fun enterCodecExclusiveTransport(reason: String) {
-        // R16.6: The MONITOR entry snapshot serializes many recorder reads. On AG2
-        // those optional reads can hold/reacquire the single PacketLink command slot
-        // for tens of seconds. A deliberate Codec interaction must take priority.
-        if (monitorSnapshotJob?.isActive == true) {
-            monitorSnapshotJob?.cancel()
-            monitorSnapshotJob = null
-            monitorSnapshotGeneration += 1
-            Log.d("AtomRemoteSession", "TCS20.15R16.6 CODEC EXCLUSIVE cancel-monitor-snapshot reason=$reason generation=$monitorSnapshotGeneration")
-        } else {
-            Log.d("AtomRemoteSession", "TCS20.15R16.6 CODEC EXCLUSIVE already-idle reason=$reason")
-        }
-    }
-
-    private fun queueCodecUiAction(
-        label: String,
-        action: () -> Boolean,
-        acceptedText: String
-    ) {
-        enterCodecExclusiveTransport(label)
-        monitorUiActionRetryJob?.cancel()
-        monitorUiActionRetryJob = viewModelScope.launch {
-            repeat(30) { attempt ->
-                val queued = action()
-                Log.d("AtomRemoteSession", "TCS20.15R16.6 CODEC UI QUEUE label=$label attempt=${attempt + 1} queued=$queued")
-                if (queued) {
-                    _commandStatus.value = acceptedText
-                    return@launch
-                }
-                if (attempt == 0) {
-                    _commandStatus.value = "$label waiting for the current recorder transaction..."
-                }
-                kotlinx.coroutines.delay(140L)
-            }
-            _commandStatus.value = "$label could not obtain the PacketLink command slot."
-            Log.w("AtomRemoteSession", "TCS20.15R16.6 CODEC UI GIVEUP label=$label")
-        }
-    }
-
     fun selectCodecProfile(profile: Int) {
-        Log.d("AtomRemoteSession", "TCS20.15R16.8 CODEC UI PROFILE TAP profile=$profile current=${codecHardwareProfile.value}")
-        enterCodecExclusiveTransport("profile-$profile")
-        if (codecHardwareProfile.value == null) {
-            _commandStatus.value = "Sync current codec from recorder before choosing a new codec."
-            return
-        }
         if (profile !in 1..19 || profile == 11) {
             _commandStatus.value = "Unsupported codec profile: $profile"
             return
         }
         _codecProfile.value = profile
-        if (profile in 1..5) {
-            _codecBitDepth.value = 0
-        }
-        codecSelectionDirty = true
-        _commandStatus.value = if (profile in 1..5) {
-            "Codec ${codecProfileLabel(profile)} selected. Official macOS recorder-managed tuple will be used on APPLY."
-        } else {
-            "Codec ${codecProfileLabel(profile)} selected. Tap APPLY to send it to the recorder."
-        }
+        _commandStatus.value = "Codec ${codecProfileLabel(profile)} selected. Tap APPLY to send it to the recorder."
     }
 
     fun selectCodecBitDepth(bitDepth: Int) {
-        Log.d("AtomRemoteSession", "TCS20.15R16.8 CODEC UI DEPTH TAP bitDepth=$bitDepth profile=${_codecProfile.value} current=${codecHardwareProfile.value}")
-        enterCodecExclusiveTransport("depth-$bitDepth")
-        if (codecHardwareProfile.value == null) {
-            _commandStatus.value = "Sync current codec from recorder before changing bit depth."
-            return
-        }
         if (bitDepth !in 0..2) {
             _commandStatus.value = "Unsupported codec bit-depth/chroma mode: $bitDepth"
             return
         }
-        if (_codecProfile.value in 1..5 && bitDepth != 0) {
-            _codecBitDepth.value = 0
-            _commandStatus.value = "ProRes depth is recorder-managed by the official macOS codec command path."
-            return
-        }
         _codecBitDepth.value = bitDepth
-        codecSelectionDirty = true
         _commandStatus.value = "Record bit depth ${codecBitDepthLabel(bitDepth)} selected. Tap APPLY to send it with the codec profile."
     }
 
     fun verifyCodecProfile() {
-        if (!remoteFeatureReady("Codec state sync")) return
-        // R16.8 CURRENT-FIRST: the codec editor is recorder-authoritative.
-        // Clear any stale draft and require the official macOS state pair
-        // RecordPage(0x0643) + InputOutputSummary(0x0648) before editing.
-        enterCodecExclusiveTransport("Codec Current Sync")
-        codecSelectionDirty = false
-        _codecProfile.value = 0
-        _codecBitDepth.value = -1
-        Log.d("AtomRemoteSession", "TCS20.15R16.8 CODEC UI SYNC TAP current-first=1")
-        queueCodecUiAction(
-            label = "Codec Current Sync",
-            action = { gatt.syncOfficialCodecState(-1) },
-            acceptedText = "Reading current codec, compression and bit depth from recorder..."
-        )
+        val profile = _codecProfile.value
+        val bitDepth = _codecBitDepth.value
+        if (profile !in 1..19 || profile == 11) {
+            _commandStatus.value = "Choose a supported codec profile, then tap VERIFY."
+            return
+        }
+        if (!remoteFeatureReady("Codec verification")) return
+        val queued = gatt.verifyOfficialCodecProfile(profile, bitDepth)
+        _commandStatus.value = if (queued) {
+            "Verifying ${codecProfileLabel(profile)} with recorder..."
+        } else {
+            gatt.tcsRemoteState.value.lastError ?: "Codec verification could not be queued."
+        }
+        Log.d("AtomRemoteSession", "TCS19.12.10 CODEC VERIFY UI queued=$queued expected=$profile/$bitDepth")
     }
 
     fun applyCodecProfile() {
         val profile = _codecProfile.value
         val bitDepth = _codecBitDepth.value
-        val recorderCurrent = codecHardwareProfile.value
-        if (recorderCurrent == null) {
-            _commandStatus.value = "Sync current codec from recorder first. Apply stays locked until recorder state is known."
-            return
-        }
         if (profile !in 1..19 || profile == 11) {
             _commandStatus.value = "Choose a supported codec/compression profile before applying."
-            return
-        }
-        if (bitDepth !in 0..2) {
-            _commandStatus.value = "Sync recorder codec first or choose a Bit Depth / Chroma mode before applying."
             return
         }
         if (!remoteFeatureReady("Codec")) return
         // Normal macOS Record picker uses NonRebootCodecProfileSet 0x013F.
         // 19.11.9 then verifies the recorder through CodecProfileGet 0x013A.
         // Transport delivery or a setter ACK alone does not change hardware truth.
-        Log.d("AtomRemoteSession", "TCS20.15R16.8 CODEC UI APPLY TAP current=$recorderCurrent draft=$profile/$bitDepth")
-        queueCodecUiAction(
-            label = "Codec Apply ${codecProfileLabel(profile)}",
-            action = { gatt.sendOfficialCodecProfile(profile, bitDepth) },
-            acceptedText = "Applying ${codecProfileLabel(profile)}. Recorder state check will run automatically."
-        )
+        val queued = gatt.sendOfficialCodecProfile(profile, bitDepth)
+        _commandStatus.value = if (queued) {
+            "Applying ${codecProfileLabel(profile)}. Recorder state check will run automatically."
+        } else {
+            gatt.tcsRemoteState.value.lastError
+                ?: "Codec command could not be queued. Wait for the current PacketLink transaction and retry."
+        }
     }
 
     fun activateCodecProfile() {
@@ -2796,17 +3377,14 @@ class AtomosViewModel(app: Application) : AndroidViewModel(app) {
             _commandStatus.value = "Choose a supported codec/compression profile before activation."
             return
         }
-        if (bitDepth !in 0..2) {
-            _commandStatus.value = "Sync recorder codec first or choose a Bit Depth / Chroma mode before restart apply."
-            return
-        }
         if (!remoteFeatureReady("Codec activation")) return
-        Log.d("AtomRemoteSession", "TCS20.15R16.6 CODEC UI RESTART APPLY TAP profile=$profile bitDepth=$bitDepth")
-        queueCodecUiAction(
-            label = "Codec Restart Apply ${codecProfileLabel(profile)}",
-            action = { gatt.activateOfficialCodecProfile(profile, bitDepth) },
-            acceptedText = "Restart-capable codec change ${codecProfileLabel(profile)} queued (0x013B); recorder readback will verify the result."
-        )
+        val queued = gatt.activateOfficialCodecProfile(profile, bitDepth)
+        _commandStatus.value = if (queued) {
+            "Restart-capable codec change ${codecProfileLabel(profile)} queued (0x013B); recorder readback will verify the result."
+        } else {
+            gatt.tcsRemoteState.value.lastError
+                ?: "Codec activation could not be queued. Wait for PacketLink and retry."
+        }
     }
 
     private fun codecProfileLabel(profile: Int): String = when (profile) {
@@ -2866,39 +3444,35 @@ class AtomosViewModel(app: Application) : AndroidViewModel(app) {
 
     fun isAirGluSyncEndpoint(ad: BleAdvertisement): Boolean {
         val n = ad.name?.trim()?.lowercase().orEmpty()
-        val hasFcc1 = ad.serviceUuids.any { it.lowercase().contains("fcc1") }
-        val hasShogunAirGluService = ad.serviceUuids.any { it.equals(AIRGLU_SHOGUN_SERVICE_UUID, ignoreCase = true) }
+        val hasFcc1 = (ad.serviceUuids + ad.serviceDataUuids).any { it.lowercase().contains("fcc1") }
+        val hasShogunAirGluService = (ad.serviceUuids + ad.serviceDataUuids)
+            .any { it.equals(AIRGLU_SHOGUN_SERVICE_UUID, ignoreCase = true) }
         val shortAirGluName = n == "ag2" || n == "ag" || n.startsWith("ag2-") || n.startsWith("ag-")
         return hasFcc1 || hasShogunAirGluService || shortAirGluName
     }
 
 
     fun displayNameFor(ad: BleAdvertisement): String {
-        val advertised = ad.name?.trim().orEmpty()
-        val lower = advertised.lowercase()
-        val matched = AtomosProfiles.match(advertised)
-
-        // Verified hardware identity wins over a short/internal DeviceName such
-        // as the AG2 Input payload "PC". This prevents Input from presenting the
-        // connected Shogun Ultra as Unknown/PC.
-        if (lower == "ag2" || lower.startsWith("ag2-")) return "Shogun Ultra"
-        if (matched != null && matched.id != "generic" && !advertised.equals("AG", true)) {
-            return matched.displayName
-        }
-
+        // V15.1: a BLE AirGlu code (AG2) is a protocol identity, NOT proof of
+        // Shogun Ultra model. Never rename a different recorder to Shogun Ultra.
+        // A previously verified name is per BLE MAC; unrelated devices cannot
+        // inherit it. Otherwise display the exact advertised BLE name.
         val storedName = trustedPrefs.getString(trustedKey(ad.address, "name"), null)?.trim().orEmpty()
-        if (
-            storedName.isNotBlank() &&
+        val validStored = storedName.isNotBlank() &&
             storedName.length > 3 &&
-            !storedName.equals("unknown", true)
-        ) {
-            return storedName
-        }
-
-        return when {
-            advertised.isNotBlank() && !advertised.equals("AG", true) -> advertised
-            else -> "ATOMOS Recorder"
-        }
+            !storedName.equals("unknown", ignoreCase = true) &&
+            !storedName.equals("PC", ignoreCase = true) &&
+            !storedName.equals("AG2", ignoreCase = true) &&
+            !storedName.equals("AG", ignoreCase = true)
+        val advertised = ad.name?.trim().orEmpty()
+        val shortAirGlu = advertised.equals("AG2", true) ||
+            advertised.equals("AG", true) ||
+            advertised.startsWith("AG2-", true) ||
+            advertised.startsWith("AG-", true)
+        // A descriptive name *actually advertised now* beats older cached data.
+        if (advertised.isNotBlank() && !shortAirGlu) return advertised
+        if (validStored) return storedName
+        return if (advertised.isNotBlank()) advertised else "ATOMOS Recorder"
     }
 
     fun isLikelyAtomRemoteCandidate(ad: BleAdvertisement): Boolean {
@@ -3223,4 +3797,62 @@ class AtomosViewModel(app: Application) : AndroidViewModel(app) {
         gatt.close()
         super.onCleared()
     }
+}
+
+// OUTPUT02/03 V4: local S1C compatibility functions copied verbatim from
+// existing S1cProtocol.kt. These have ViewModel-only visibility and do not
+// alter GATT, commands, or the public protocol implementation.
+private fun extractS1cAscii(event: String): String? {
+    val start = event.indexOf('[')
+    val end = event.lastIndexOf(']')
+    if (start >= 0 && end > start) {
+        return event.substring(start + 1, end).trim().takeIf { it.isNotBlank() }
+    }
+    val marker = event.indexOf("S1C<")
+    if (marker >= 0) return event.substring(marker + 4).trim().takeIf { it.isNotBlank() }
+    return null
+}
+
+private fun isS1cReply(text: String): Boolean {
+    val value = text.removePrefix("#").trim()
+    return listOf(
+        "GCMD=", "GCVR=", "GCBT=", "GCDV=", "GCCT=", "GCXS=", "GCXP=",
+        "BTPR=", "BTST=", "STVS=", "STSS=", "STSP=", "TCTM="
+    ).any { value.startsWith(it) }
+}
+
+private fun reduceS1cStatus(current: S1cStatus, replyRaw: String): S1cStatus {
+    val reply = replyRaw.removePrefix("#").trim()
+    var next = current.copy(lastReply = reply, error = null)
+    when {
+        reply.startsWith("GCMD=") -> {
+            val value = reply.substringAfter('=').trim()
+            next = next.copy(deviceModel = value.ifBlank { null })
+        }
+        reply.startsWith("GCVR=") -> next = next.copy(firmware = reply.substringAfter('=').trim().ifBlank { null })
+        reply.startsWith("GCBT=") -> next = next.copy(batteryPercent = reply.substringAfter('=').substringBefore(',').trim().toIntOrNull())
+        reply.startsWith("GCCT=") -> next = next.copy(transportState = reply.substringAfter('=').substringBefore(',').trim().toIntOrNull())
+        reply.startsWith("GCDV=") -> next = next.copy(media = reply.substringAfter('=').trim().ifBlank { null })
+        reply.startsWith("TCTM=") -> {
+            val raw = reply.substringAfter('=').trim()
+            val formatted = if (raw.length >= 8 && raw.take(8).all { it.isDigit() }) {
+                "${raw.substring(0,2)}:${raw.substring(2,4)}:${raw.substring(4,6)}:${raw.substring(6,8)}"
+            } else raw.ifBlank { null }
+            next = next.copy(timecode = formatted)
+        }
+        reply.startsWith("GCXP=") -> {
+            val fields = reply.substringAfter('=').split(',')
+            val transport = fields.getOrNull(0)?.trim()?.toIntOrNull()
+            val battery = fields.getOrNull(4)?.trim()?.toIntOrNull()
+            val mediaText = fields.drop(8).joinToString(",").trim().ifBlank { null }
+            next = next.copy(
+                transportState = transport ?: next.transportState,
+                batteryPercent = battery ?: next.batteryPercent,
+                media = mediaText ?: next.media
+            )
+        }
+        reply.startsWith("BTPR=") -> next = next.copy(pairingInfo = reply.substringAfter('=').trim())
+        reply.startsWith("BTST=") -> next = next.copy(pairedDevices = reply.substringAfter('=').trim())
+    }
+    return next
 }

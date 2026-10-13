@@ -1,0 +1,81 @@
+10-10 12:13:23.237  4413 10787 W GmsClient: IGmsServiceBroker.getService failed
+10-10 12:13:23.506  4305 13050 I Kolun_AI: SystemEventSubscribe: publisher.getMatcher() bluetooth
+10-10 12:13:23.511  4305  4418 I Kolun_AI: SystemEventSubscribe: publisher.getMatcher() bluetooth
+10-10 12:13:23.576 19593 24573 W WearableService: onGetService: Wear is not available on this device. Calling package: com.google.android.googlequicksearchbox
+10-10 12:13:23.731  4413 10787 W GmsClient: IGmsServiceBroker.getService failed
+10-10 12:13:23.915   862   905 I libPerfCtl: xgfGetFPS pid:2056 fps:-1
+10-10 12:13:23.915   862   905 I libPerfCtl: xgfGetFPS pid:2259 fps:-1
+10-10 12:13:23.915   862   905 I libPerfCtl: xgfGetFPS pid:15547 fps:59
+10-10 12:13:24.185  4413 10787 W GmsClient: IGmsServiceBroker.getService failed
+10-10 12:13:24.345  2221  2340 I bt_bta_gattc: bta_gattc_get_gatt_db: bta_gattc_get_gatt_db
+10-10 12:13:24.915   862   905 I libPerfCtl: xgfGetFPS pid:2056 fps:-1
+10-10 12:13:24.915   862   905 I libPerfCtl: xgfGetFPS pid:15547 fps:56
+10-10 12:13:24.992 15547 15586 E AtomRemoteBackend: 	at okhttp3.internal.connection.RealCall.getResponseWithInterceptorChain$okhttp(RealCall.kt:201)
+10-10 12:13:25.388  4413 10787 W GmsClient: IGmsServiceBroker.getService failed
+10-10 12:13:25.746  1994  1994 I WifiHAL : Get link layer stats
+10-10 12:13:25.746  1994  1994 I WifiHAL : GetLinkStatsCommand::create
+10-10 12:13:25.746  1994  1994 I WifiHAL : wifi_get_link_stats: result=-1
+10-10 12:13:25.915   862   905 I libPerfCtl: xgfGetFPS pid:15547 fps:-1
+10-10 12:13:26.032  4413 10787 W GmsClient: IGmsServiceBroker.getService failed
+10-10 12:13:26.844   862   906 E libPowerHal: [getCPUFreq] error cid:2, nClusterNum:2
+10-10 12:13:26.915   862   905 I libPerfCtl: xgfGetFPS pid:15547 fps:-1
+10-10 12:13:26.994 15547 15586 E AtomRemoteBackend: 	at okhttp3.internal.connection.RealCall.getResponseWithInterceptorChain$okhttp(RealCall.kt:201)
+10-10 12:13:27.915   862   905 I libPerfCtl: xgfGetFPS pid:15547 fps:-1
+10-10 12:13:28.266  4413 10787 W GmsClient: IGmsServiceBroker.getService failed
+10-10 12:13:28.752  4413 10787 W GmsClient: IGmsServiceBroker.getService failed
+10-10 12:13:28.754  1994  1994 I WifiHAL : Get link layer stats
+10-10 12:13:28.754  1994  1994 I WifiHAL : GetLinkStatsCommand::create
+10-10 12:13:28.754  1994  1994 I WifiHAL : wifi_get_link_stats: result=-1
+10-10 12:13:28.879  2221  2340 I bt_bta_gattc: bta_gattc_get_gatt_db: bta_gattc_get_gatt_db
+10-10 12:13:28.915   862   905 I libPerfCtl: xgfGetFPS pid:2056 fps:-1
+10-10 12:13:28.915   862   905 I libPerfCtl: xgfGetFPS pid:15547 fps:75
+10-10 12:13:28.995 15547 15586 E AtomRemoteBackend: 	at okhttp3.internal.connection.RealCall.getResponseWithInterceptorChain$okhttp(RealCall.kt:201)
+10-10 12:13:29.158  2221  2340 I bt_bta_gattc: bta_gattc_get_gatt_db: bta_gattc_get_gatt_db
+10-10 12:13:29.203  4413 10787 W GmsClient: IGmsServiceBroker.getService failed
+10-10 12:13:29.542   832 15751 I resolv  : GetHostByAddrHandler::run: {137 137 137 983177 10341 0}
+10-10 12:13:29.915   862   905 I libPerfCtl: xgfGetFPS pid:2056 fps:-1
+10-10 12:13:29.916   862   905 I libPerfCtl: xgfGetFPS pid:15547 fps:-1
+10-10 12:13:30.410  4413 10787 W GmsClient: IGmsServiceBroker.getService failed
+10-10 12:13:30.915   862   905 I libPerfCtl: xgfGetFPS pid:2056 fps:-1
+10-10 12:13:30.916   862   905 I libPerfCtl: xgfGetFPS pid:15547 fps:-1
+10-10 12:13:30.996 15547 15586 E AtomRemoteBackend: 	at okhttp3.internal.connection.RealCall.getResponseWithInterceptorChain$okhttp(RealCall.kt:201)
+10-10 12:13:31.056  4413 10787 W GmsClient: IGmsServiceBroker.getService failed
+10-10 12:13:31.329  2221  2340 I bt_bta_gattc: bta_gattc_get_gatt_db: bta_gattc_get_gatt_db
+10-10 12:13:31.763  1994  1994 I WifiHAL : Get link layer stats
+10-10 12:13:31.763  1994  1994 I WifiHAL : GetLinkStatsCommand::create
+10-10 12:13:31.763  1994  1994 I WifiHAL : wifi_get_link_stats: result=-1
+10-10 12:13:31.889 19593 19621 I ConsentManagerApiServic: (REDACTED) ConsentManagerApiService onGetService success %s
+10-10 12:13:31.916   862   905 I libPerfCtl: xgfGetFPS pid:2056 fps:-1
+10-10 12:13:31.916   862   905 I libPerfCtl: xgfGetFPS pid:15547 fps:-1
+10-10 12:13:31.989   832 15758 I resolv  : GetAddrInfoHandler::run: {137 786569 137 983177 10121 0}
+10-10 12:13:32.199   832 15761 I resolv  : GetAddrInfoHandler::run: {137 786569 137 983177 10121 0}
+10-10 12:13:32.916   862   905 I libPerfCtl: xgfGetFPS pid:2056 fps:-1
+10-10 12:13:32.916   862   905 I libPerfCtl: xgfGetFPS pid:15547 fps:-1
+10-10 12:13:32.936   862   906 E libPowerHal: [getCPUFreq] error cid:2, nClusterNum:2
+10-10 12:13:32.999 15547 15586 E AtomRemoteBackend: 	at okhttp3.internal.connection.RealCall.getResponseWithInterceptorChain$okhttp(RealCall.kt:201)
+10-10 12:13:33.371   832 15767 I resolv  : GetAddrInfoHandler::run: {137 786569 137 983177 99901000 0}
+10-10 12:13:33.557   832 15770 I resolv  : GetHostByAddrHandler::run: {137 137 137 983177 10341 0}
+10-10 12:13:33.850   832 15771 I resolv  : GetHostByAddrHandler::run: {137 137 137 983177 10341 0}
+10-10 12:13:33.916   862   905 I libPerfCtl: xgfGetFPS pid:2056 fps:-1
+10-10 12:13:33.916   862   905 I libPerfCtl: xgfGetFPS pid:15547 fps:61
+10-10 12:13:34.773  1994  1994 I WifiHAL : Get link layer stats
+10-10 12:13:34.773  1994  1994 I WifiHAL : GetLinkStatsCommand::create
+10-10 12:13:34.773  1994  1994 I WifiHAL : wifi_get_link_stats: result=-1
+10-10 12:13:34.916   862   905 I libPerfCtl: xgfGetFPS pid:2056 fps:-1
+10-10 12:13:34.916   862   905 I libPerfCtl: xgfGetFPS pid:15547 fps:61
+10-10 12:13:34.998 15547 15586 E AtomRemoteBackend: 	at okhttp3.internal.connection.RealCall.getResponseWithInterceptorChain$okhttp(RealCall.kt:201)
+10-10 12:13:35.916   862   905 I libPerfCtl: xgfGetFPS pid:2056 fps:-1
+10-10 12:13:35.916   862   905 I libPerfCtl: xgfGetFPS pid:15547 fps:-1
+10-10 12:13:36.916   862   905 I libPerfCtl: xgfGetFPS pid:2056 fps:-1
+10-10 12:13:36.916   862   905 I libPerfCtl: xgfGetFPS pid:15547 fps:-1
+10-10 12:13:36.999 15547 15586 E AtomRemoteBackend: 	at okhttp3.internal.connection.RealCall.getResponseWithInterceptorChain$okhttp(RealCall.kt:201)
+10-10 12:13:37.782  1994  1994 I WifiHAL : Get link layer stats
+10-10 12:13:37.782  1994  1994 I WifiHAL : GetLinkStatsCommand::create
+10-10 12:13:37.782  1994  1994 I WifiHAL : wifi_get_link_stats: result=-1
+10-10 12:13:37.917   862   905 I libPerfCtl: xgfGetFPS pid:15547 fps:-1
+10-10 12:13:38.917   862   905 I libPerfCtl: xgfGetFPS pid:15547 fps:-1
+10-10 12:13:39.000 15547 15586 E AtomRemoteBackend: 	at okhttp3.internal.connection.RealCall.getResponseWithInterceptorChain$okhttp(RealCall.kt:201)
+10-10 12:13:39.917   862   905 I libPerfCtl: xgfGetFPS pid:15547 fps:-1
+10-10 12:13:40.790  1994  1994 I WifiHAL : Get link layer stats
+10-10 12:13:40.790  1994  1994 I WifiHAL : GetLinkStatsCommand::create
+10-10 12:13:40.790  1994  1994 I WifiHAL : wifi_get_link_stats: result=-1

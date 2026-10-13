@@ -4,6 +4,7 @@ import android.annotation.SuppressLint
 import android.bluetooth.BluetoothAdapter
 import android.bluetooth.BluetoothManager
 import android.bluetooth.le.ScanCallback
+import android.util.Log
 import android.bluetooth.le.ScanResult
 import android.bluetooth.le.ScanSettings
 import android.content.Context
@@ -27,20 +28,28 @@ class BleScanner(context: Context) {
     fun isAvailable(): Boolean = adapter != null
     fun isEnabled(): Boolean = adapter?.isEnabled == true
 
+    /** Existing TCS pairing-code scan remains legacy to preserve its proven behavior. */
+    fun scan(): Flow<BleAdvertisement> = scanInternal(includeExtended = false)
+
+    /** Discovery-only path: collect legacy AND extended advertisements when supported. */
+    fun scanDiscovery(): Flow<BleAdvertisement> = scanInternal(includeExtended = true)
+
     @SuppressLint("MissingPermission")
-    fun scan(): Flow<BleAdvertisement> = callbackFlow {
+    private fun scanInternal(includeExtended: Boolean): Flow<BleAdvertisement> = callbackFlow {
         val scanner = adapter?.bluetoothLeScanner
         if (scanner == null) {
             close(IllegalStateException("Bluetooth LE scanner unavailable"))
             return@callbackFlow
         }
 
-        val settings = ScanSettings.Builder()
+        val settingsBuilder = ScanSettings.Builder()
             .setScanMode(ScanSettings.SCAN_MODE_LOW_LATENCY)
             .setCallbackType(ScanSettings.CALLBACK_TYPE_ALL_MATCHES)
-            .setMatchMode(ScanSettings.MATCH_MODE_AGGRESSIVE)
             .setReportDelay(0L)
-            .build()
+        // API 26+; false allows extended packets as well as legacy advertisements.
+        // Some OEMs reject extended settings, so discovery falls back in the ViewModel.
+        if (includeExtended) settingsBuilder.setLegacy(false)
+        val settings = settingsBuilder.build()
 
         fun advertisementFrom(result: ScanResult): BleAdvertisement {
             val record = result.scanRecord
@@ -62,7 +71,7 @@ class BleScanner(context: Context) {
 
             return BleAdvertisement(
                 device = result.device,
-                name = record?.deviceName ?: result.device.name,
+                name = record?.deviceName ?: runCatching { result.device.name }.getOrNull(),
                 address = result.device.address,
                 rssi = result.rssi,
                 serviceUuids = record?.serviceUuids?.map { it.uuid.toString() }.orEmpty(),
@@ -88,11 +97,31 @@ class BleScanner(context: Context) {
             }
 
             override fun onScanFailed(errorCode: Int) {
-                close(IllegalStateException("BLE scan failed: $errorCode"))
+                val reason = when (errorCode) {
+                    ScanCallback.SCAN_FAILED_ALREADY_STARTED -> "already started"
+                    ScanCallback.SCAN_FAILED_APPLICATION_REGISTRATION_FAILED -> "app registration failed"
+                    ScanCallback.SCAN_FAILED_INTERNAL_ERROR -> "Bluetooth stack internal error"
+                    ScanCallback.SCAN_FAILED_FEATURE_UNSUPPORTED -> "unsupported scan configuration"
+                    5 -> "Bluetooth hardware resources exhausted"
+                    6 -> "scanning too frequently; retry after a pause"
+                    else -> "unknown"
+                }
+                Log.e("AtomRemoteBleScan", "SCAN FAILED code=$errorCode reason=$reason extended=$includeExtended")
+                close(IllegalStateException("BLE scan failed code=$errorCode ($reason)"))
             }
         }
 
-        scanner.startScan(null, settings, callback)
-        awaitClose { scanner.stopScan(callback) }
+        try {
+            scanner.startScan(null, settings, callback)
+            Log.i("AtomRemoteBleScan", "START extended=$includeExtended sdk=${android.os.Build.VERSION.SDK_INT}")
+        } catch (error: Exception) {
+            Log.e("AtomRemoteBleScan", "SCAN START exception extended=$includeExtended", error)
+            close(error)
+            return@callbackFlow
+        }
+        awaitClose {
+            runCatching { scanner.stopScan(callback) }
+                .onFailure { Log.w("AtomRemoteBleScan", "STOP error: ${it.message}") }
+        }
     }
 }

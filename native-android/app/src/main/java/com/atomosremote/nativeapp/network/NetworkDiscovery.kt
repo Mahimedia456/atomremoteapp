@@ -1,4 +1,4 @@
-package com.atomosremote.nativeapp.network
+﻿package com.atomosremote.nativeapp.network
 
 import android.content.Context
 import android.net.ConnectivityManager
@@ -6,6 +6,7 @@ import android.net.NetworkCapabilities
 import android.net.nsd.NsdManager
 import android.net.nsd.NsdServiceInfo
 import android.net.wifi.WifiManager
+import android.util.Log
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -163,6 +164,7 @@ class NetworkDiscovery(private val context: Context) {
         }
 
         scanJob = scope.launch {
+            launch { discoverEnumeratedMdns() }
             launch { discoverSsdp() }
             launch { ingestArpNeighbours() }
             launch { boundedSubnetSweep() }
@@ -170,6 +172,77 @@ class NetworkDiscovery(private val context: Context) {
     }
 
     fun stop() = stopInternal(updateStatus = true)
+
+    /**
+     * WL-5.0: enumerate DNS-SD service types advertised on the LAN, then fold any
+     * resolved records into the existing service/host models. This is discovery-only:
+     * it does not probe ports or open a recorder session. Existing UI consumes the
+     * same StateFlows, so no visual or navigation changes are required.
+     */
+    private suspend fun discoverEnumeratedMdns() = withContext(Dispatchers.IO) {
+        val result = runCatching { MdnsServiceEnumerator.enumerate() }
+            .onFailure { Log.d("AtomRemoteWL50", "WL50 mDNS enumeration failed: ${it.message}") }
+            .getOrNull() ?: return@withContext
+        Log.d(
+            "AtomRemoteWL50",
+            "WL50 ENUM packets=${result.packetCount} types=${result.discoveredTypes.joinToString("|")}"
+        )
+        result.services.forEach { candidate ->
+            Log.d(
+                "AtomRemoteWL50",
+                "WL50 SERVICE type=${candidate.serviceType} name=${candidate.serviceName} " +
+                    "host=${candidate.host ?: "?"} port=${candidate.port ?: 0} resolved=${candidate.resolved} attrs=${candidate.attributes}"
+            )
+
+            if (candidate.resolved &&
+                candidate.host != null &&
+                candidate.port != null &&
+                WlPreviewTransportPrototype.isMediaServiceCandidate(candidate.serviceType)
+            ) {
+                val previewCandidate = WlPreviewCandidate(
+                    serviceType = candidate.serviceType,
+                    host = candidate.host,
+                    port = candidate.port,
+                    source = "mDNS-enumerator"
+                )
+                Log.d(
+                    "AtomRemoteWLP7",
+                    "WLP7 PREVIEW CANDIDATE source=${previewCandidate.source} " +
+                        "type=${previewCandidate.serviceType} host=${previewCandidate.host} " +
+                        "port=${previewCandidate.port} receiverEnabled=${WlPreviewTransportPrototype.ACTIVE_RECEIVER_ENABLED}"
+                )
+            } else if (candidate.resolved && candidate.host != null && candidate.port != null) {
+                Log.d(
+                    "AtomRemoteWLP7",
+                    "WLP7 NONMEDIA SERVICE type=${candidate.serviceType} host=${candidate.host} " +
+                        "port=${candidate.port}"
+                )
+            }
+            val existing = found[candidate.key]
+            val merged = if (existing == null) candidate else existing.copy(
+                host = candidate.host ?: existing.host,
+                port = candidate.port ?: existing.port,
+                attributes = existing.attributes + candidate.attributes,
+                resolved = existing.resolved || candidate.resolved
+            )
+            found[candidate.key] = merged
+            candidate.host?.let { host ->
+                mergeHost(
+                    host = host,
+                    displayName = candidate.serviceName,
+                    source = "mDNS-enum",
+                    ports = candidate.port?.let(::setOf).orEmpty(),
+                    serviceTypes = setOf(candidate.serviceType),
+                    textEvidence = buildString {
+                        append(candidate.serviceName).append(' ')
+                        append(candidate.serviceType).append(' ')
+                        candidate.attributes.forEach { (k, v) -> append(k).append('=').append(v).append(' ') }
+                    }
+                )
+            }
+        }
+        publishServices()
+    }
 
     private fun stopInternal(updateStatus: Boolean) {
         listeners.values.toList().forEach { listener -> runCatching { nsd.stopServiceDiscovery(listener) } }
@@ -217,6 +290,32 @@ class NetworkDiscovery(private val context: Context) {
                     )
                     found[key] = candidate
                     publishServices()
+
+                    if (candidate.resolved &&
+                        candidate.host != null &&
+                        candidate.port != null &&
+                        WlPreviewTransportPrototype.isMediaServiceCandidate(candidate.serviceType)
+                    ) {
+                        val previewCandidate = WlPreviewCandidate(
+                            serviceType = candidate.serviceType,
+                            host = candidate.host,
+                            port = candidate.port,
+                            source = "Android-NSD"
+                        )
+                        Log.d(
+                            "AtomRemoteWLP7",
+                            "WLP7 PREVIEW CANDIDATE source=${previewCandidate.source} " +
+                                "type=${previewCandidate.serviceType} host=${previewCandidate.host} " +
+                                "port=${previewCandidate.port} receiverEnabled=${WlPreviewTransportPrototype.ACTIVE_RECEIVER_ENABLED}"
+                        )
+                    } else if (candidate.resolved && candidate.host != null && candidate.port != null) {
+                        Log.d(
+                            "AtomRemoteWLP7",
+                            "WLP7 NONMEDIA SERVICE type=${candidate.serviceType} host=${candidate.host} " +
+                                "port=${candidate.port}"
+                        )
+                    }
+
                     if (host != null) {
                         mergeHost(
                             host = host,
@@ -378,7 +477,7 @@ class NetworkDiscovery(private val context: Context) {
                 openPorts = old?.openPorts.orEmpty() + ports,
                 serviceTypes = old?.serviceTypes.orEmpty() + serviceTypes,
                 likelyAtomos = old?.likelyAtomos == true || likely,
-                evidence = listOfNotNull(old?.evidence, textEvidence.takeIf { it.isNotBlank() }).distinct().joinToString(" • ").take(180),
+                evidence = listOfNotNull(old?.evidence, textEvidence.takeIf { it.isNotBlank() }).distinct().joinToString(" â€¢ ").take(180),
                 lastSeenMs = System.currentTimeMillis()
             )
         }
@@ -453,3 +552,4 @@ class NetworkDiscovery(private val context: Context) {
         return (p[0] shl 24) + (p[1] shl 16) + (p[2] shl 8) + p[3]
     }
 }
+

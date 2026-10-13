@@ -36,6 +36,9 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.onSizeChanged
+import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.zIndex
 import androidx.compose.ui.unit.IntSize
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.painterResource
@@ -56,15 +59,17 @@ import com.atomosremote.nativeapp.atomos.TelemetryParser
 import com.atomosremote.nativeapp.ble.BleAdvertisement
 import com.atomosremote.nativeapp.ble.BlePermission
 import com.atomosremote.nativeapp.ble.ZoomBoxState
+import com.atomosremote.nativeapp.output.OutputPageWireDecoder
 import com.atomosremote.nativeapp.monitor.MonitorLutState
 import com.atomosremote.nativeapp.monitor.MonitorDisplayState
 import com.atomosremote.nativeapp.network.LanDeviceCandidate
 import com.atomosremote.nativeapp.network.NetworkServiceCandidate
 import com.atomosremote.nativeapp.ndi.NdiPreviewState
 import com.atomosremote.nativeapp.ndi.NdiSourceRegistry
-import com.atomosremote.nativeapp.ui.theme.AtomosCyan
-import com.atomosremote.nativeapp.ui.theme.AtomosRed
-import com.atomosremote.nativeapp.ui.theme.AtomosSurface2
+import com.atomosremote.nativeapp.ndi06.NdiDiscovery
+import com.atomosremote.nativeapp.ndi06.NdiSource as Ndi06DiscoveredSource
+import com.atomosremote.nativeapp.ndi07.Ndi07Native
+import com.atomosremote.nativeapp.ndi07.Ndi07InlinePreview
 import com.atomosremote.nativeapp.viewmodel.AtomosViewModel
 import com.atomosremote.nativeapp.viewmodel.RemoteTransportUiController
 import com.atomosremote.nativeapp.input.InputSourceCatalog
@@ -88,10 +93,54 @@ import com.atomosremote.nativeapp.monitor.MonitorScopeState
 import com.atomosremote.nativeapp.monitor.MonitorGuideState
 import com.atomosremote.nativeapp.monitor.MonitorAnamorphicState
 import com.atomosremote.nativeapp.input.InputEditCatalog
+import com.atomosremote.nativeapp.audio.AudioR26Catalog
+import com.atomosremote.nativeapp.audio.AudioR26Setting
+import com.atomosremote.nativeapp.audio.AudioR26WireInspector
+import com.atomosremote.nativeapp.audio.AudioR26Part2Plan
+
+// OUTPUT01-COLOR-RESOLVE-V2: UI-local color aliases preserve the established palette.
+// No changes to global theme or recorder control transport.
+private val AtomosCyan = androidx.compose.ui.graphics.Color(0xFF19E7D3)
+private val AtomosRed = androidx.compose.ui.graphics.Color(0xFFFF3B3B)
+private val AtomosSurface2 = androidx.compose.ui.graphics.Color(0xFF182125)
+
+// V16.1: BLE addresses cannot be derived from NDI DNS-SD advertisements.
+// Use only a UNIQUE, strong recorder-name match for automatic selection.
+// Otherwise the user explicitly binds the desired NDI sender to this BLE device.
+private fun ndi161NameToken(value: String): String = value.uppercase(java.util.Locale.ROOT)
+    .filter { it in 'A'..'Z' || it in '0'..'9' }
+
+private fun ndi161LikelySameRecorder(deviceName: String, ndiName: String): Boolean {
+    val device = ndi161NameToken(deviceName)
+    val sender = ndi161NameToken(ndiName)
+    if (device.length < 6 || sender.length < 6) return false
+    if (device in setOf("ATOMOSRECORDER", "SHOGUNULTRA", "UNKNOWNDEVICE", "BLUETOOTHREMOTE")) return false
+    return sender.startsWith(device) || (sender.length >= 8 && device.startsWith(sender))
+}
+
+// V16: Strict PRIVATE IPv4 validation. Never send NDI traffic to mobile-data
+// public addresses. Hotspot host/client can have any RFC1918 subnet.
+private fun ndi16LocalIpv4(value: String): Boolean {
+    if (value.isBlank() || value.length > 15) return false
+    val parts = value.split('.')
+    if (parts.size != 4) return false
+    val a = IntArray(4)
+    for (i in 0..3) {
+        val part = parts[i]
+        if (part.isEmpty() || part.length > 3 || part.any { it !in '0'..'9' }) return false
+        if (part.length > 1 && part[0] == '0') return false
+        val octet = part.toIntOrNull() ?: return false
+        if (octet !in 0..255) return false
+        a[i] = octet
+    }
+    return (a[0] == 10) || (a[0] == 172 && a[1] in 16..31) ||
+        (a[0] == 192 && a[1] == 168) || (a[0] == 169 && a[1] == 254)
+}
 
 @Composable
 fun AtomosApp(vm: AtomosViewModel = viewModel()) {
     val screen by vm.screen.collectAsState()
+    if (!AtomRemoteStartupGate()) return
     Surface(Modifier.fillMaxSize()) {
         when (screen) {
             AtomosViewModel.Screen.HOME -> HomeScreen(vm)
@@ -120,33 +169,67 @@ fun AtomosApp(vm: AtomosViewModel = viewModel()) {
 
 @Composable
 private fun AppHeader(title: String, subtitle: String? = null, onBack: (() -> Unit)? = null) {
-    Row(
-        modifier = Modifier
-            .fillMaxWidth()
-            .background(Color(0xFF0A0D0F))
-            .statusBarsPadding()
-            .heightIn(min = 64.dp)
-            .padding(horizontal = 16.dp, vertical = 10.dp),
-        verticalAlignment = Alignment.CenterVertically
+    Surface(
+        modifier = Modifier.fillMaxWidth().statusBarsPadding(),
+        color = Color(0xFF030B0E),
+        tonalElevation = 0.dp
     ) {
-        if (onBack != null) {
-            TextButton(/* AGENT7 20.03.3.1 ROBUST BACK BUTTON REPAIR */
-            modifier = Modifier
-                .heightIn(min = 44.dp)
-                .widthIn(min = 48.dp),
-onClick = onBack, contentPadding = PaddingValues(horizontal = 4.dp, vertical = 0.dp)) {
-                // AGENT7 20.03.4 COMPACT BACK ICON
-            Text("<", fontSize = 32.sp, color = AtomosCyan)
+        Row(
+            modifier = Modifier.fillMaxWidth().heightIn(min = 68.dp).padding(horizontal = 14.dp, vertical = 9.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            if (onBack != null) {
+                Surface(
+                    modifier = Modifier.size(40.dp).clickable(onClick = onBack),
+                    shape = RoundedCornerShape(12.dp),
+                    color = Color(0xFF071619),
+                    border = androidx.compose.foundation.BorderStroke(1.dp, Color(0xFF1B393D))
+                ) {
+                    Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                        Text("<", fontSize = 27.sp, color = RemoteMint, fontWeight = FontWeight.Bold)
+                    }
+                }
+                Spacer(Modifier.width(9.dp))
             }
-            Spacer(Modifier.width(4.dp))
+
+            Image(
+                painter = painterResource(R.drawable.atom_remote_brand_mark),
+                contentDescription = "Atom Remote",
+                modifier = Modifier.size(39.dp)
+            )
+            Spacer(Modifier.width(9.dp))
+
+            Text(
+                "REMOTE",
+                color = Color.White,
+                fontWeight = FontWeight.Black,
+                fontSize = 15.sp,
+                letterSpacing = 0.8.sp,
+                maxLines = 1
+            )
+
+            Spacer(Modifier.weight(1f))
+
+            Column(horizontalAlignment = Alignment.End) {
+                Text(
+                    title,
+                    color = RemoteMint,
+                    fontWeight = FontWeight.ExtraBold,
+                    fontSize = 10.sp,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis
+                )
+                if (subtitle != null) {
+                    Text(
+                        subtitle,
+                        color = Color(0xFF839397),
+                        fontSize = 8.5.sp,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis
+                    )
+                }
+            }
         }
-        Box(Modifier.size(8.dp).background(AtomosCyan, CircleShape))
-        Spacer(Modifier.width(9.dp))
-        Column(Modifier.weight(1f)) {
-            Text(title, fontWeight = FontWeight.ExtraBold, fontSize = 19.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
-            if (subtitle != null) Text(subtitle, color = Color(0xFF868D90), fontSize = 11.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
-        }
-        Text("ATOMOS", color = AtomosCyan, fontWeight = FontWeight.Black, letterSpacing = 1.4.sp, fontSize = 14.sp)
     }
 }
 
@@ -162,104 +245,161 @@ private fun HomeScreen(vm: AtomosViewModel) {
         onDispose { vm.stopNetworkDiscovery() }
     }
 
-    Box(Modifier.fillMaxSize().background(MaterialTheme.colorScheme.background)) {
-        Column(
-            Modifier.fillMaxSize().padding(24.dp).verticalScroll(rememberScrollState()),
-            horizontalAlignment = Alignment.CenterHorizontally,
-            verticalArrangement = Arrangement.Center
-        ) {
-            Image(painterResource(R.drawable.atomos_logo), contentDescription = "ATOMOS", modifier = Modifier.size(112.dp))
-            Spacer(Modifier.height(14.dp))
-            Text("ATOMOS REMOTE", fontSize = 28.sp, fontWeight = FontWeight.Black)
-            Text("Recorder Control", color = Color.Gray)
-            Spacer(Modifier.height(28.dp))
-            Button(
-                onClick = { vm.go(AtomosViewModel.Screen.CONNECT) },
-                modifier = Modifier.fillMaxWidth().height(56.dp)
-            ) { Text("CONNECT ATOMOS", fontWeight = FontWeight.Bold) }
-
-            if (saved != null) {
-                Spacer(Modifier.height(10.dp))
-                OutlinedButton(
-                    onClick = { vm.reconnectSaved() },
-                    modifier = Modifier.fillMaxWidth().height(50.dp)
-                ) { Text("RECONNECT ${saved!!.name.uppercase()}") }
+    Column(
+        Modifier
+            .fillMaxSize()
+            .background(Color(0xFF02090B))
+            .statusBarsPadding()
+            .verticalScroll(rememberScrollState())
+            .padding(horizontal = 18.dp, vertical = 18.dp)
+    ) {
+        Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+            Image(
+                painter = painterResource(R.drawable.atom_remote_brand_mark),
+                contentDescription = "Atom Remote",
+                modifier = Modifier.size(56.dp)
+            )
+            Spacer(Modifier.width(10.dp))
+            Column(Modifier.weight(1f)) {
+                Text("REMOTE", color = Color.White, fontSize = 20.sp, fontWeight = FontWeight.Black, letterSpacing = 1.sp)
+                Text("Wireless recorder control", color = Color(0xFF7A8C90), fontSize = 9.5.sp)
             }
+            Surface(
+                shape = RoundedCornerShape(10.dp),
+                color = Color(0xFF071A18),
+                border = androidx.compose.foundation.BorderStroke(1.dp, RemoteMint.copy(alpha = 0.35f))
+            ) {
+                Text(
+                    if (networkStatus.connected) "ONLINE" else "READY",
+                    color = RemoteMint,
+                    fontSize = 8.sp,
+                    fontWeight = FontWeight.Black,
+                    modifier = Modifier.padding(horizontal = 9.dp, vertical = 6.dp)
+                )
+            }
+        }
 
-            Spacer(Modifier.height(12.dp))
-            Card(Modifier.fillMaxWidth(), colors = CardDefaults.cardColors(containerColor = AtomosSurface2)) {
-                Column(Modifier.padding(12.dp)) {
-                    Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
-                        Column(Modifier.weight(1f)) {
-                            Text("SAME WI-FI / LAN", color = AtomosCyan, fontWeight = FontWeight.Bold, fontSize = 12.sp)
-                            Text(
-                                "${networkStatus.transport} â€¢ ${if (networkStatus.connected) "CONNECTED" else "OFFLINE"} â€¢ ${lanDevices.size} device(s)",
-                                color = Color.LightGray,
-                                fontSize = 11.sp
-                            )
-                            networkStatus.localAddresses.firstOrNull { it.contains('.') }?.let {
-                                Text("Phone: $it", color = Color.Gray, fontSize = 10.sp)
-                            }
-                        }
-                        TextButton(onClick = { vm.stopNetworkDiscovery(); vm.startNetworkDiscovery() }) { Text("SCAN") }
+        Spacer(Modifier.height(22.dp))
+
+        Surface(
+            modifier = Modifier.fillMaxWidth(),
+            shape = RoundedCornerShape(24.dp),
+            color = Color(0xFF061316),
+            border = androidx.compose.foundation.BorderStroke(1.dp, RemoteMint.copy(alpha = 0.45f))
+        ) {
+            Column(
+                Modifier.fillMaxWidth().padding(horizontal = 18.dp, vertical = 22.dp),
+                horizontalAlignment = Alignment.CenterHorizontally
+            ) {
+                Image(
+                    painter = painterResource(R.drawable.atom_remote_brand_mark),
+                    contentDescription = null,
+                    modifier = Modifier.size(112.dp)
+                )
+                Text("CONTROL YOUR RECORDER", color = Color.White, fontSize = 18.sp, fontWeight = FontWeight.ExtraBold)
+                Text(
+                    "Pair once, then control monitoring, recording and recorder settings from one workspace.",
+                    color = Color(0xFF84969A),
+                    fontSize = 10.sp,
+                    lineHeight = 15.sp,
+                    textAlign = androidx.compose.ui.text.style.TextAlign.Center,
+                    modifier = Modifier.padding(horizontal = 12.dp, vertical = 6.dp)
+                )
+                Button(
+                    onClick = { vm.go(AtomosViewModel.Screen.CONNECT) },
+                    modifier = Modifier.fillMaxWidth().padding(top = 10.dp).height(50.dp),
+                    shape = RoundedCornerShape(14.dp),
+                    colors = ButtonDefaults.buttonColors(containerColor = RemoteMint, contentColor = Color(0xFF00110D))
+                ) {
+                    Text("SCAN & CONNECT", fontWeight = FontWeight.Black, fontSize = 10.sp)
+                }
+                if (saved != null) {
+                    OutlinedButton(
+                        onClick = { vm.reconnectSaved() },
+                        modifier = Modifier.fillMaxWidth().padding(top = 8.dp).height(46.dp),
+                        shape = RoundedCornerShape(14.dp),
+                        border = androidx.compose.foundation.BorderStroke(1.dp, Color(0xFF28544D))
+                    ) {
+                        Text("RECONNECT ${saved!!.name.uppercase()}", color = RemoteMint, fontSize = 9.5.sp, fontWeight = FontWeight.Bold)
                     }
-                    if (lanDevices.isEmpty()) {
-                        Text("Searching mDNS, SSDP and the current local subnet...", color = Color.Gray, fontSize = 10.sp)
-                    } else {
-                        lanDevices.take(4).forEach { device ->
-                            Spacer(Modifier.height(6.dp))
-                            Row(Modifier.fillMaxWidth()) {
-                                Column(Modifier.weight(1f)) {
-                                    Text(
-                                        if (device.likelyAtomos) "ATOMOS CANDIDATE â€¢ ${device.displayName}" else device.displayName,
-                                        color = if (device.likelyAtomos) AtomosCyan else Color.White,
-                                        fontSize = 11.sp,
-                                        fontWeight = if (device.likelyAtomos) FontWeight.Bold else FontWeight.Normal,
-                                        maxLines = 1,
-                                        overflow = TextOverflow.Ellipsis
-                                    )
-                                    Text(
-                                        "${device.host} â€¢ ${device.sources.joinToString()}${if (device.openPorts.isNotEmpty()) " â€¢ ports ${device.openPorts.sorted().joinToString()}" else ""}",
-                                        color = Color.Gray,
-                                        fontSize = 9.sp,
-                                        maxLines = 1,
-                                        overflow = TextOverflow.Ellipsis
-                                    )
-                                }
-                                if (device.likelyAtomos) {
-                                    TextButton(onClick = { vm.startWifiAssistedRemote(device) }) { Text("PAIR REMOTE") }
-                                }
-                            }
+                }
+            }
+        }
+
+        Spacer(Modifier.height(12.dp))
+
+        Surface(
+            modifier = Modifier.fillMaxWidth(),
+            shape = RoundedCornerShape(18.dp),
+            color = Color(0xFF071216),
+            border = androidx.compose.foundation.BorderStroke(1.dp, Color(0xFF1C363B))
+        ) {
+            Column(Modifier.padding(14.dp)) {
+                Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                    Box(Modifier.size(8.dp).background(if (networkStatus.connected) RemoteMint else Color(0xFF66767A), CircleShape))
+                    Spacer(Modifier.width(8.dp))
+                    Column(Modifier.weight(1f)) {
+                        Text("SAME NETWORK", color = Color.White, fontWeight = FontWeight.Bold, fontSize = 11.sp)
+                        Text(
+                            "${networkStatus.transport} | ${lanDevices.size} discovered",
+                            color = Color(0xFF71858A),
+                            fontSize = 8.5.sp
+                        )
+                    }
+                    TextButton(onClick = { vm.stopNetworkDiscovery(); vm.startNetworkDiscovery() }) {
+                        Text("RESCAN", color = RemoteMint, fontSize = 8.5.sp, fontWeight = FontWeight.Bold)
+                    }
+                }
+
+                lanDevices.take(3).forEach { device ->
+                    Row(Modifier.fillMaxWidth().padding(top = 9.dp), verticalAlignment = Alignment.CenterVertically) {
+                        Column(Modifier.weight(1f)) {
+                            Text(
+                                device.displayName,
+                                color = if (device.likelyAtomos) RemoteMint else Color.White,
+                                fontSize = 10.sp,
+                                fontWeight = FontWeight.Bold,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis
+                            )
+                            Text(device.host, color = Color(0xFF5F7378), fontSize = 8.sp)
                         }
-                        if (lanDevices.size > 4) {
-                            TextButton(onClick = { vm.go(AtomosViewModel.Screen.NETWORK) }) { Text("VIEW ALL ${lanDevices.size} DEVICES") }
+                        if (device.likelyAtomos) {
+                            TextButton(onClick = { vm.startWifiAssistedRemote(device) }) {
+                                Text("PAIR", color = RemoteMint, fontSize = 8.sp, fontWeight = FontWeight.Black)
+                            }
                         }
                     }
                 }
             }
+        }
 
-            Spacer(Modifier.height(12.dp))
-            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                OutlinedButton(onClick = { vm.go(AtomosViewModel.Screen.NETWORK) }, modifier = Modifier.weight(1f)) { Text("NETWORK (${lanDevices.size})") }
-                OutlinedButton(onClick = { vm.go(AtomosViewModel.Screen.MULTI) }, modifier = Modifier.weight(1f)) { Text("MULTI (${savedAll.size})") }
-            }
-            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                OutlinedButton(onClick = { vm.go(AtomosViewModel.Screen.COMPATIBILITY) }, modifier = Modifier.weight(1f)) { Text("DEVICES") }
-                OutlinedButton(onClick = { vm.go(AtomosViewModel.Screen.AIRGLU) }, modifier = Modifier.weight(1f)) { Text("AIRGLU") }
-            }
-            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                OutlinedButton(onClick = { vm.go(AtomosViewModel.Screen.NDI) }, modifier = Modifier.weight(1f)) { Text("NDI") }
-                OutlinedButton(onClick = { vm.go(AtomosViewModel.Screen.PRESETS) }, modifier = Modifier.weight(1f)) { Text("PRESETS") }
-            }
-            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                OutlinedButton(onClick = { vm.go(AtomosViewModel.Screen.CAPTURE) }, modifier = Modifier.weight(1f)) { Text("CAPTURE") }
-                OutlinedButton(onClick = { vm.go(AtomosViewModel.Screen.QA) }, modifier = Modifier.weight(1f)) { Text("FINAL QA") }
+        Spacer(Modifier.height(12.dp))
+        val utilityRows = listOf(
+            Triple("NETWORK", "MULTI ${savedAll.size}", Pair(AtomosViewModel.Screen.NETWORK, AtomosViewModel.Screen.MULTI)),
+            Triple("DEVICES", "AIRGLU", Pair(AtomosViewModel.Screen.COMPATIBILITY, AtomosViewModel.Screen.AIRGLU)),
+            Triple("NDI", "PRESETS", Pair(AtomosViewModel.Screen.NDI, AtomosViewModel.Screen.PRESETS))
+        )
+        utilityRows.forEach { row ->
+            Row(Modifier.fillMaxWidth().padding(bottom = 7.dp), horizontalArrangement = Arrangement.spacedBy(7.dp)) {
+                OutlinedButton(
+                    onClick = { vm.go(row.third.first) },
+                    modifier = Modifier.weight(1f).height(44.dp),
+                    shape = RoundedCornerShape(12.dp),
+                    border = androidx.compose.foundation.BorderStroke(1.dp, Color(0xFF25423F))
+                ) { Text(row.first, color = Color.White, fontSize = 9.sp) }
+                OutlinedButton(
+                    onClick = { vm.go(row.third.second) },
+                    modifier = Modifier.weight(1f).height(44.dp),
+                    shape = RoundedCornerShape(12.dp),
+                    border = androidx.compose.foundation.BorderStroke(1.dp, Color(0xFF25423F))
+                ) { Text(row.second, color = Color.White, fontSize = 9.sp) }
             }
         }
     }
 }
 
-private fun permissionsGranted(context: android.content.Context): Boolean = BlePermission.runtimePermissions().all {
+private fun permissionsGranted(context: android.content.Context): Boolean = BlePermission.requiredScanPermissions().all {
     ContextCompat.checkSelfPermission(context, it) == PackageManager.PERMISSION_GRANTED
 }
 
@@ -268,14 +408,19 @@ private fun ConnectScreen(vm: AtomosViewModel) {
     val context = LocalContext.current
     val devices by vm.devices.collectAsState()
     val scanState by vm.scanState.collectAsState()
+    val scanDiagnostics by vm.scanDiagnostics.collectAsState()
     val wifiAssistTarget by vm.wifiAssistTarget.collectAsState()
     var permissionDenied by remember { mutableStateOf(false) }
+    var optionalLocationPrompted by remember { mutableStateOf(context.getSharedPreferences("atomremote_startup_permissions", android.content.Context.MODE_PRIVATE).getBoolean("optional_location_offered", false)) }
 
     val enableBt = rememberLauncherForActivityResult(ActivityResultContracts.StartActivityForResult()) {
         if (vm.bluetoothEnabled()) vm.startScan()
     }
     val permissionLauncher = rememberLauncherForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) { result ->
-        val ok = BlePermission.runtimePermissions().all { result[it] == true || ContextCompat.checkSelfPermission(context, it) == PackageManager.PERMISSION_GRANTED }
+        // Fine Location is optional on Android 12+; refusing it does NOT block a scan.
+        val ok = BlePermission.requiredScanPermissions().all {
+            result[it] == true || ContextCompat.checkSelfPermission(context, it) == PackageManager.PERMISSION_GRANTED
+        }
         permissionDenied = !ok
         if (ok) {
             if (vm.bluetoothEnabled()) vm.startScan() else enableBt.launch(Intent(BluetoothAdapter.ACTION_REQUEST_ENABLE))
@@ -284,94 +429,186 @@ private fun ConnectScreen(vm: AtomosViewModel) {
 
     fun begin() {
         permissionDenied = false
-        if (!permissionsGranted(context)) permissionLauncher.launch(BlePermission.runtimePermissions())
-        else if (!vm.bluetoothEnabled()) enableBt.launch(Intent(BluetoothAdapter.ACTION_REQUEST_ENABLE))
+        val missingRequired = BlePermission.requiredScanPermissions().filter {
+            ContextCompat.checkSelfPermission(context, it) != PackageManager.PERMISSION_GRANTED
+        }
+        val missingOptional = if (!optionalLocationPrompted) BlePermission.optionalDiscoveryPermissions().filter {
+            ContextCompat.checkSelfPermission(context, it) != PackageManager.PERMISSION_GRANTED
+        } else emptyList()
+        if (missingRequired.isNotEmpty() || missingOptional.isNotEmpty()) {
+            if (missingOptional.isNotEmpty()) optionalLocationPrompted = true
+            permissionLauncher.launch((missingRequired + missingOptional).distinct().toTypedArray())
+        } else if (!vm.bluetoothEnabled()) enableBt.launch(Intent(BluetoothAdapter.ACTION_REQUEST_ENABLE))
         else vm.startScan()
     }
 
     LaunchedEffect(Unit) { begin() }
     DisposableEffect(Unit) { onDispose { vm.stopScan() } }
 
-    Column(Modifier.fillMaxSize().background(Color(0xFF0A0C0D))) {
+    // Discovery and pairing eligibility are decided in one authoritative place:
+    // ViewModel's strict ATOMOS/AirGlu filter, not an extra UI-side filter.
+    val visibleDevices = devices
+    val scanning = scanState.startsWith("scanning")
+
+    Column(Modifier.fillMaxSize().background(Color(0xFF02090C))) {
         AppHeader(
-            "Find your device",
-            "Compatible ATOMOS recorders",
+            "Connect recorder",
+            "Bluetooth / AirGlu discovery",
             onBack = { vm.stopScan(); vm.stopPairingPresence(); vm.clearWifiAssist(); vm.go(AtomosViewModel.Screen.HOME) }
         )
 
-    
-    LazyColumn(
+        LazyColumn(
             Modifier.fillMaxSize(),
-            contentPadding = PaddingValues(horizontal = 18.dp, vertical = 16.dp),
+            contentPadding = PaddingValues(horizontal = 18.dp, vertical = 14.dp),
             verticalArrangement = Arrangement.spacedBy(12.dp)
         ) {
             item {
-                Column {
-                    Text("Connect an ATOMOS recorder", fontSize = 22.sp, fontWeight = FontWeight.ExtraBold)
-                    Text(
-                        "Open Bluetooth / AirGlu Pair on the recorder, then scan.",
-                        color = Color(0xFF868D90),
-                        fontSize = 12.sp,
-                        lineHeight = 18.sp
-                    )
+                Surface(
+                    modifier = Modifier.fillMaxWidth(),
+                    shape = RoundedCornerShape(20.dp),
+                    color = Color(0xFF051519),
+                    border = androidx.compose.foundation.BorderStroke(1.dp, AtomosCyan.copy(alpha = 0.55f))
+                ) {
+                    Column(
+                        Modifier.fillMaxWidth().padding(horizontal = 18.dp, vertical = 18.dp),
+                        horizontalAlignment = Alignment.CenterHorizontally
+                    ) {
+                        Text("DISCOVERY", color = AtomosCyan, fontSize = 9.sp, fontWeight = FontWeight.Black, letterSpacing = 1.2.sp)
+                        Text("Find your ATOMOS", color = Color.White, fontSize = 23.sp, fontWeight = FontWeight.ExtraBold)
+                        Text(
+                            "Open Bluetooth / AirGlu Pair on the recorder and keep that screen visible.",
+                            color = Color(0xFF7E9297),
+                            fontSize = 10.sp,
+                            lineHeight = 15.sp,
+                            textAlign = androidx.compose.ui.text.style.TextAlign.Center,
+                            modifier = Modifier.padding(top = 4.dp)
+                        )
+
+                        Box(Modifier.size(128.dp).padding(top = 12.dp), contentAlignment = Alignment.Center) {
+                            Box(Modifier.size(122.dp).border(1.dp, Color(0xFF173D44), CircleShape))
+                            Box(Modifier.size(88.dp).border(1.dp, Color(0xFF18525B), CircleShape))
+                            Box(
+                                Modifier
+                                    .size(54.dp)
+                                    .background(Color(0xFF08282D), CircleShape)
+                                    .border(1.dp, AtomosCyan.copy(alpha = 0.60f), CircleShape),
+                                contentAlignment = Alignment.Center
+                            ) {
+                                Text("A", color = AtomosCyan, fontSize = 22.sp, fontWeight = FontWeight.Black)
+                            }
+                            if (scanning) {
+                                CircularProgressIndicator(Modifier.size(122.dp), strokeWidth = 2.dp, color = AtomosCyan)
+                            }
+                        }
+
+                        Text(
+                            if (scanning) "Scanning for compatible recorders..." else "${visibleDevices.size} compatible device(s)",
+                            color = if (scanning) AtomosCyan else Color(0xFF91A3A7),
+                            fontSize = 10.sp,
+                            fontWeight = FontWeight.SemiBold,
+                            modifier = Modifier.padding(top = 8.dp)
+                        )
+                        Text(
+                            scanDiagnostics,
+                            color = Color(0xFF8FA7AC), fontSize = 9.sp,
+                            modifier = Modifier.padding(top = 5.dp)
+                        )
+                        if (scanState.startsWith("error:")) {
+                            Text(
+                                scanState.removePrefix("error:"), color = Color(0xFFFFA3A8), fontSize = 10.sp,
+                                modifier = Modifier.padding(top = 8.dp)
+                            )
+                        }
+                        Button(
+                            onClick = { begin() },
+                            enabled = !scanning,
+                            modifier = Modifier.fillMaxWidth().padding(top = 12.dp).height(47.dp),
+                            shape = RoundedCornerShape(12.dp),
+                            colors = ButtonDefaults.buttonColors(containerColor = AtomosCyan, contentColor = Color(0xFF001013))
+                        ) {
+                            Text(if (scanning) "SCANNING..." else "SCAN FOR DEVICES", fontSize = 10.sp, fontWeight = FontWeight.Black)
+                        }
+                    }
                 }
             }
 
             wifiAssistTarget?.let { target ->
                 item {
-                    Card(colors = CardDefaults.cardColors(containerColor = Color(0xFF151A1C)), shape = RoundedCornerShape(14.dp)) {
+                    Surface(
+                        modifier = Modifier.fillMaxWidth(),
+                        shape = RoundedCornerShape(15.dp),
+                        color = Color(0xFF07171B),
+                        border = androidx.compose.foundation.BorderStroke(1.dp, Color(0xFF16434A))
+                    ) {
                         Column(Modifier.padding(14.dp)) {
-                            Text("SAME WI-FI RECORDER", color = AtomosCyan, fontWeight = FontWeight.Bold, fontSize = 11.sp)
-                            Text(target.displayName, fontWeight = FontWeight.Bold, modifier = Modifier.padding(top = 3.dp))
-                            Text(target.host, color = Color(0xFF868D90), fontSize = 11.sp)
+                            Text("SAME WI-FI RECORDER", color = AtomosCyan, fontWeight = FontWeight.Black, fontSize = 9.sp)
+                            Text(target.displayName, color = Color.White, fontWeight = FontWeight.Bold, modifier = Modifier.padding(top = 3.dp))
+                            Text(target.host, color = Color(0xFF768B90), fontSize = 9.sp)
                         }
                     }
-                }
-            }
-
-            item {
-                Card(colors = CardDefaults.cardColors(containerColor = Color(0xFF151A1C)), shape = RoundedCornerShape(14.dp)) {
-                    Row(Modifier.fillMaxWidth().padding(14.dp), verticalAlignment = Alignment.CenterVertically) {
-                        Box(Modifier.size(9.dp).background(AtomosCyan, CircleShape))
-                        Spacer(Modifier.width(10.dp))
-                        Column(Modifier.weight(1f)) {
-                            Text("BLUETOOTH REMOTE", color = Color(0xFF868D90), fontSize = 10.sp, fontWeight = FontWeight.Bold)
-                            Text("ATOMOS recorder pairing", fontWeight = FontWeight.Bold, color = AtomosCyan)
-                        }
-                    }
-                }
-            }
-
-            item {
-                Column(horizontalAlignment = Alignment.CenterHorizontally, modifier = Modifier.fillMaxWidth()) {
-                    Box(Modifier.size(118.dp).border(1.dp, Color(0xFF2B3032), CircleShape), contentAlignment = Alignment.Center) {
-                        Box(Modifier.size(80.dp).border(1.dp, Color(0xFF2B3032), CircleShape))
-                        Box(Modifier.size(42.dp).border(1.dp, Color(0xFF2B3032), CircleShape))
-                        if (scanState == "scanning") CircularProgressIndicator(Modifier.size(112.dp), strokeWidth = 2.dp, color = AtomosCyan)
-                        Box(Modifier.size(10.dp).background(AtomosCyan, CircleShape))
-                    }
-                    Spacer(Modifier.height(12.dp))
-                    Text(
-                        if (scanState == "scanning") "Scanning for AirGlu BT devicesâ€¦" else "Scan state: $scanState",
-                        color = Color(0xFF868D90),
-                        fontSize = 12.sp
-                    )
-                    TextButton(onClick = { begin() }) { Text("SCAN AGAIN") }
                 }
             }
 
             if (permissionDenied) {
-                item { Text("Nearby Bluetooth permission is required for BLE discovery.", color = AtomosRed, fontSize = 12.sp) }
+                item {
+                    Surface(
+                        modifier = Modifier.fillMaxWidth(),
+                        shape = RoundedCornerShape(13.dp),
+                        color = Color(0xFF241315),
+                        border = androidx.compose.foundation.BorderStroke(1.dp, Color(0xFF6E3036))
+                    ) {
+                        Text(
+                            "Bluetooth Nearby Devices is required. On Android 8 to 11 allow Location, and keep phone Location enabled while scanning.",
+                            color = Color(0xFFFFA3A8),
+                            fontSize = 10.sp,
+                            modifier = Modifier.padding(13.dp)
+                        )
+                    }
+                }
             }
 
-            val visibleDevices = devices.filter { likelyAtomosAdvertisement(it) && it.connectable != false }
+            item {
+                Column {
+                    Text("If 0 ATOMOS but Unique BLE > 0, the phone is scanning and recorder identity is not visible. Keep recorder Pair mode open.",
+                        color = Color(0xFF768B90), fontSize = 9.sp)
+                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.padding(top = 7.dp)) {
+                        OutlinedButton(
+                            onClick = { context.startActivity(Intent(Settings.ACTION_LOCATION_SOURCE_SETTINGS)) },
+                            modifier = Modifier.weight(1f)
+                        ) { Text("LOCATION", fontSize = 9.sp) }
+                        OutlinedButton(
+                            onClick = {
+                                context.startActivity(Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
+                                    android.net.Uri.parse("package:${context.packageName}")))
+                            }, modifier = Modifier.weight(1f)
+                        ) { Text("APP PERMISSIONS", fontSize = 9.sp) }
+                    }
+                }
+            }
+
+            item {
+                Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                    Column(Modifier.weight(1f)) {
+                        Text("NEARBY ATOMOS DEVICES", color = Color.White, fontSize = 12.sp, fontWeight = FontWeight.ExtraBold)
+                        Text("Tap a recorder to use the existing secure pairing flow.", color = Color(0xFF6E8287), fontSize = 9.sp)
+                    }
+                    Text("${visibleDevices.size}", color = AtomosCyan, fontSize = 11.sp, fontWeight = FontWeight.Black)
+                }
+            }
+
             if (visibleDevices.isEmpty()) {
                 item {
-                    Card(colors = CardDefaults.cardColors(containerColor = Color(0xFF151A1C)), shape = RoundedCornerShape(14.dp)) {
+                    Surface(
+                        modifier = Modifier.fillMaxWidth(),
+                        shape = RoundedCornerShape(15.dp),
+                        color = Color(0xFF071216),
+                        border = androidx.compose.foundation.BorderStroke(1.dp, Color(0xFF1C343A))
+                    ) {
                         Text(
-                            "No compatible ATOMOS recorder found yet. Open the recorder Bluetooth/AirGlu Pair screen and scan again.",
-                            color = Color(0xFF868D90),
-                            fontSize = 12.sp,
+                            if (scanning) "Searching..." else "No compatible recorder found. Keep the recorder Pair screen open and scan again.",
+                            color = Color(0xFF809398),
+                            fontSize = 10.sp,
+                            lineHeight = 15.sp,
                             modifier = Modifier.padding(16.dp)
                         )
                     }
@@ -420,32 +657,60 @@ private fun recorderModelCode(rawName: String?): String? {
 @Composable
 private fun DeviceCard(ad: BleAdvertisement, displayName: String, wifiAssist: Boolean = false, onClick: () -> Unit) {
     val service9383 = ad.serviceUuids.any { it.equals(AtomosViewModel.AIRGLU_SHOGUN_SERVICE_UUID, ignoreCase = true) }
-    Card(
-        onClick = onClick,
-        modifier = Modifier.fillMaxWidth(),
-        colors = CardDefaults.cardColors(containerColor = Color(0xFF1A1F21)),
-        shape = RoundedCornerShape(14.dp)
+    val signal = when {
+        ad.rssi >= -55 -> "EXCELLENT"
+        ad.rssi >= -67 -> "GOOD"
+        ad.rssi >= -78 -> "FAIR"
+        else -> "WEAK"
+    }
+
+    Surface(
+        modifier = Modifier.fillMaxWidth().clickable(onClick = onClick),
+        shape = RoundedCornerShape(16.dp),
+        color = Color(0xFF071317),
+        border = androidx.compose.foundation.BorderStroke(1.dp, Color(0xFF234149))
     ) {
-        Row(Modifier.fillMaxWidth().padding(15.dp), verticalAlignment = Alignment.CenterVertically) {
-            Box(Modifier.size(38.dp).background(Color(0xFF222729), RoundedCornerShape(10.dp)), contentAlignment = Alignment.Center) {
-                Box(Modifier.size(11.dp).background(AtomosCyan, CircleShape))
+        Row(Modifier.fillMaxWidth().padding(14.dp), verticalAlignment = Alignment.CenterVertically) {
+            Box(
+                Modifier
+                    .size(47.dp)
+                    .background(Color(0xFF08272C), RoundedCornerShape(13.dp))
+                    .border(1.dp, Color(0xFF15515A), RoundedCornerShape(13.dp)),
+                contentAlignment = Alignment.Center
+            ) {
+                Text(recorderModelCode(ad.name)?.take(2)?.uppercase() ?: "AR", color = AtomosCyan, fontSize = 12.sp, fontWeight = FontWeight.Black)
             }
+
             Spacer(Modifier.width(12.dp))
             Column(Modifier.weight(1f)) {
-                Text(displayName, fontSize = 15.sp, fontWeight = FontWeight.Bold)
-                recorderModelCode(ad.name)?.let { code ->
-                    Text("Model code: $code", color = AtomosCyan, fontSize = 10.sp, fontWeight = FontWeight.SemiBold)
+                Text(displayName, color = Color.White, fontSize = 14.sp, fontWeight = FontWeight.ExtraBold, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                recorderModelCode(ad.name)?.let {
+                    Text("AirGlu $it", color = AtomosCyan, fontSize = 9.sp, fontWeight = FontWeight.Bold)
                 }
                 Text(
-                    if (service9383) "ATOMOS Remote" else "Compatible ATOMOS device",
-                    color = Color(0xFF9AA2A5),
-                    fontSize = 10.sp,
-                    fontWeight = FontWeight.Medium
+                    "${if (service9383) "AirGlu Remote" else "Compatible ATOMOS"} | ${ad.rssi} dBm | $signal",
+                    color = Color(0xFF819398),
+                    fontSize = 8.7.sp
                 )
-                Text("${ad.address} Â· ${ad.rssi} dBm", color = Color(0xFF868D90), fontSize = 10.sp)
-                ad.advertisedPairingId?.let { Text("Pairing ID $it", color = Color(0xFFE8A23B), fontSize = 11.sp, fontWeight = FontWeight.Bold) }
+                Text(ad.address, color = Color(0xFF5F7479), fontSize = 8.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                ad.advertisedPairingId?.let {
+                    Text("Pairing ID $it", color = Color(0xFFFFC46C), fontSize = 9.sp, fontWeight = FontWeight.Bold)
+                }
             }
-            Text(if (wifiAssist) "PAIR" else "CONNECT", color = AtomosCyan, fontWeight = FontWeight.Bold, fontSize = 12.sp)
+
+            Surface(
+                shape = RoundedCornerShape(9.dp),
+                color = Color(0xFF082B30),
+                border = androidx.compose.foundation.BorderStroke(1.dp, AtomosCyan.copy(alpha = 0.55f))
+            ) {
+                Text(
+                    if (wifiAssist) "PAIR" else "CONNECT",
+                    color = AtomosCyan,
+                    fontWeight = FontWeight.Black,
+                    fontSize = 8.5.sp,
+                    modifier = Modifier.padding(horizontal = 10.dp, vertical = 7.dp)
+                )
+            }
         }
     }
 }
@@ -478,10 +743,10 @@ private fun PairScreen(vm: AtomosViewModel) {
     val busy = state == "connecting" || (state == "tcs-pairing" && tcsPairing.phase !in setOf("can-accept", "waiting-for-bcid", "accepted"))
     val staleBond = selected?.device?.bondState == BluetoothDevice.BOND_BONDED && !pairingAccepted && pairingId == null
 
-    Column(Modifier.fillMaxSize().background(Color(0xFF0A0C0D))) {
+    Column(Modifier.fillMaxSize().background(Color(0xFF02090C))) {
         AppHeader(
             connectedRecorderName?.takeIf { it.isNotBlank() } ?: selected?.let { vm.displayNameFor(it) } ?: "Connect recorder",
-            selected?.let { ad -> recorderModelCode(ad.name)?.let { "AirGlu $it Â· ${ad.address}" } ?: ad.address } ?: "ATOMOS recorder",
+            selected?.let { ad -> recorderModelCode(ad.name)?.let { "AirGlu $it | ${ad.address}" } ?: ad.address } ?: "ATOMOS recorder",
             onBack = { vm.stopScan(); vm.stopPairingPresence(); vm.gatt.disconnect(); vm.go(AtomosViewModel.Screen.CONNECT) }
         )
 
@@ -500,12 +765,12 @@ private fun PairScreen(vm: AtomosViewModel) {
             }
 
             item {
-                Card(colors = CardDefaults.cardColors(containerColor = Color(0xFF151A1C)), shape = RoundedCornerShape(16.dp)) {
+                Card(colors = CardDefaults.cardColors(containerColor = Color(0xFF071317)), shape = RoundedCornerShape(18.dp)) {
                     Column(Modifier.fillMaxWidth().padding(18.dp), horizontalAlignment = Alignment.CenterHorizontally) {
                         Text("PAIRING ID", color = Color(0xFF868D90), fontSize = 10.sp, letterSpacing = 1.2.sp)
                         Spacer(Modifier.height(10.dp))
                         Text(
-                            pairingId ?: if (pairingAccepted) "Accepted" else "Waitingâ€¦",
+                            pairingId ?: if (pairingAccepted) "Accepted" else "Waiting...",
                             fontSize = if (pairingId != null) 34.sp else 24.sp,
                             fontWeight = FontWeight.ExtraBold,
                             letterSpacing = if (pairingId != null) 1.2.sp else 0.sp
@@ -534,7 +799,7 @@ private fun PairScreen(vm: AtomosViewModel) {
 
             if (staleBond) {
                 item {
-                    Card(colors = CardDefaults.cardColors(containerColor = Color(0xFF2A2115)), shape = RoundedCornerShape(14.dp)) {
+                    Card(colors = CardDefaults.cardColors(containerColor = Color(0xFF2A2115)), shape = RoundedCornerShape(15.dp)) {
                         Column(Modifier.fillMaxWidth().padding(15.dp)) {
                             Text("STALE ANDROID BOND DETECTED", color = Color(0xFFE8A23B), fontSize = 11.sp, fontWeight = FontWeight.Bold)
                             Text(
@@ -572,7 +837,7 @@ private fun PairScreen(vm: AtomosViewModel) {
                             Column(Modifier.weight(1f)) {
                                 Text(candidate.pairingId, fontSize = 19.sp, fontWeight = FontWeight.Bold)
                                 Text(
-                                    if (candidate.exactAg2Source) "Recorder advertisement" else "Pairing signal Â· ${candidate.rssi} dBm",
+                                    if (candidate.exactAg2Source) "Recorder advertisement" else "Pairing signal | ${candidate.rssi} dBm",
                                     color = Color(0xFF868D90), fontSize = 10.sp
                                 )
                             }
@@ -604,7 +869,7 @@ private fun PairScreen(vm: AtomosViewModel) {
             }
 
             item {
-                Card(colors = CardDefaults.cardColors(containerColor = Color(0xFF151A1C)), shape = RoundedCornerShape(14.dp)) {
+                Card(colors = CardDefaults.cardColors(containerColor = Color(0xFF071317)), shape = RoundedCornerShape(15.dp)) {
                     Row(Modifier.fillMaxWidth().padding(14.dp), verticalAlignment = Alignment.CenterVertically) {
                         Box(Modifier.size(8.dp).background(if (remoteReady) AtomosCyan else Color(0xFF687174), CircleShape))
                         Spacer(Modifier.width(10.dp))
@@ -642,14 +907,58 @@ private fun PairStageChip(label: String, active: Boolean, modifier: Modifier = M
     }
 }
 
+private val RemoteMint = AtomosCyan // UI 07.3.5: same accent as connected top tabs everywhere
+private val RemoteMintDim = Color(0xFF2F8C7C)
+
 private enum class RemotePanel(val title: String, val subtitle: String, val badge: String) {
     MONITOR_ASSIST("Monitor Assist", "Focus, exposure and zoom tools", "MA"),
     SCOPES("Scopes", "Waveform and vectorscope controls", "SC"),
     GUIDES("Grid & Guides", "Grid, frame guides and safe areas", "GD"),
     ANAMORPHIC("Anamorphic", "De-squeeze monitoring ratios", "AN"),
     MONITORING("Monitoring", "Native, Rec.709, HLG, PQ and LUT", "MN"),
+    DISPLAY("Display", "Backlight, picture, flip and tally", "DS"),
     CODEC("Record Codec", "Codec profile and record format", "RC"),
     INPUT_FORMAT("Input / Format", "Recorder input and output details", "IF")
+}
+
+private enum class RemoteHomeTool(
+    val label: String,
+    val panel: RemotePanel,
+    val iconRes: Int
+) {
+    MONITOR("MONITOR", RemotePanel.MONITORING, R.drawable.ui_remote_tool_monitor),
+    WAVEFORM("WAVEFORM", RemotePanel.SCOPES, R.drawable.ui_remote_tool_waveform),
+    FOCUS("FOCUS", RemotePanel.MONITOR_ASSIST, R.drawable.ui_remote_tool_focus),
+    ZEBRA("ZEBRA", RemotePanel.MONITOR_ASSIST, R.drawable.ui_remote_tool_zebra),
+
+    FALSE_COLOR("FALSE COLOR", RemotePanel.MONITOR_ASSIST, R.drawable.ui_remote_tool_false_color),
+    BLUE_ONLY("BLUE ONLY", RemotePanel.MONITOR_ASSIST, R.drawable.ui_remote_tool_false_color),
+    LUT("LUT", RemotePanel.MONITORING, R.drawable.ui_remote_tool_lut),
+    FRAME_GUIDE("FRAME GUIDE", RemotePanel.GUIDES, R.drawable.ui_remote_tool_frame_guide),
+    GRID("GRID", RemotePanel.GUIDES, R.drawable.ui_remote_tool_grid),
+
+    ZOOM("ZOOM", RemotePanel.MONITOR_ASSIST, R.drawable.ui_remote_tool_zoom),
+    SAFE_AREA("SAFE AREA", RemotePanel.GUIDES, R.drawable.ui_remote_tool_safe_area),
+    DISPLAY("DISPLAY", RemotePanel.DISPLAY, R.drawable.ui_remote_tool_display),
+    CODEC("CODEC", RemotePanel.CODEC, R.drawable.ui_remote_tool_codec),
+    ANAMORPHIC("ANAMORPHIC", RemotePanel.ANAMORPHIC, R.drawable.ui_remote_tool_anamorphic)
+}
+
+private fun RemoteHomeTool.sheetTitle(): String = when (this) {
+    RemoteHomeTool.MONITOR -> "Monitor"
+    RemoteHomeTool.WAVEFORM -> "Waveform"
+    RemoteHomeTool.FOCUS -> "Focus Assist"
+    RemoteHomeTool.ZEBRA -> "Zebra"
+    RemoteHomeTool.FALSE_COLOR -> "False Color"
+    RemoteHomeTool.BLUE_ONLY -> "Blue Only"
+    RemoteHomeTool.LUT -> "LUT"
+    RemoteHomeTool.FRAME_GUIDE -> "Frame Guide"
+    RemoteHomeTool.GRID -> "Grid"
+    RemoteHomeTool.ZOOM -> "Zoom"
+    RemoteHomeTool.SAFE_AREA -> "Safe Area"
+    RemoteHomeTool.DISPLAY -> "Display"
+    RemoteHomeTool.CODEC -> "Codec"
+    RemoteHomeTool.ANAMORPHIC -> "Anamorphic"
 }
 
 // AGENT7 20.03.4.11 PERSISTENT CONNECTED SCREEN
@@ -670,57 +979,68 @@ private fun ConnectedTopTabs(
     selected: ConnectedTopTab,
     onSelected: (ConnectedTopTab) -> Unit
 ) {
-    BoxWithConstraints(
+    val firstRow = listOf(
+        ConnectedTopTab.REMOTE,
+        ConnectedTopTab.INPUT,
+        ConnectedTopTab.MONITOR,
+        ConnectedTopTab.AUDIO
+    )
+    val secondRow = listOf(
+        ConnectedTopTab.MEDIA,
+        ConnectedTopTab.OUTPUT,
+        ConnectedTopTab.SETTINGS
+    )
+
+    Column(
         Modifier
             .fillMaxWidth()
-            .background(Color(0xFF0A0D0F))
-            .padding(horizontal = 8.dp, vertical = 7.dp)
+            .background(Color(0xFF030B0E))
+            .padding(horizontal = 8.dp, vertical = 7.dp),
+        verticalArrangement = Arrangement.spacedBy(6.dp)
     ) {
-        val compact = maxWidth < 380.dp
-        val labelSize = if (compact) 8.5.sp else 9.5.sp
-        val tabHeight = if (compact) 36.dp else 40.dp
-        val rowGap = 6.dp
-        val firstRow = listOf(ConnectedTopTab.REMOTE, ConnectedTopTab.INPUT, ConnectedTopTab.MONITOR, ConnectedTopTab.AUDIO)
-        val secondRow = listOf(ConnectedTopTab.OUTPUT, ConnectedTopTab.MEDIA, ConnectedTopTab.SETTINGS)
-
-        Column(Modifier.fillMaxWidth(), verticalArrangement = Arrangement.spacedBy(rowGap)) {
-            listOf(firstRow, secondRow).forEach { rowTabs ->
-                Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                    rowTabs.forEach { tab ->
-                        val active = selected == tab
-                        Surface(
-                            modifier = Modifier
-                                .weight(1f)
-                                .height(tabHeight)
-                                .clickable { onSelected(tab) },
-                            shape = RoundedCornerShape(11.dp),
-                            color = if (active) Color(0xFF173331) else Color(0xFF101416),
-                            border = androidx.compose.foundation.BorderStroke(
-                                1.dp,
-                                if (active) AtomosCyan.copy(alpha = 0.72f) else Color(0xFF20272A)
+        listOf(firstRow, secondRow).forEach { rowTabs ->
+            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(5.dp)) {
+                rowTabs.forEach { tab ->
+                    val active = selected == tab
+                    Surface(
+                        modifier = Modifier
+                            .weight(1f)
+                            .height(38.dp)
+                            .clickable { onSelected(tab) },
+                        shape = RoundedCornerShape(10.dp),
+                        color = if (active) Color(0xFF0A2B30) else Color(0xFF081115),
+                        border = androidx.compose.foundation.BorderStroke(
+                            if (active) 1.5.dp else 1.dp,
+                            if (active) AtomosCyan else Color(0xFF1F343A)
+                        )
+                    ) {
+                        Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                            Text(
+                                tab.label.uppercase(),
+                                color = if (active) Color.White else Color(0xFF839499),
+                                fontSize = 8.2.sp,
+                                fontWeight = FontWeight.ExtraBold,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis
                             )
-                        ) {
-                            Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
-                                Text(
-                                    tab.label,
-                                    color = if (active) AtomosCyan else Color(0xFF9AA3A6),
-                                    fontSize = labelSize,
-                                    fontWeight = if (active) FontWeight.Black else FontWeight.Bold,
-                                    maxLines = 1,
-                                    overflow = TextOverflow.Ellipsis
-                                )
-                            }
                         }
                     }
                 }
+                repeat(4 - rowTabs.size) { Spacer(Modifier.weight(1f)) }
             }
         }
     }
 }
 
+@OptIn(ExperimentalMaterial3Api::class)
 @Composable
 private fun RemoteScreen(vm: AtomosViewModel) {
     val selected by vm.selected.collectAsState()
+    // WL-1: use the existing safe LAN discovery stack while Remote is open.
+    val networkStatus by vm.networkStatus.collectAsState()
+    val lanDevices by vm.lanDevices.collectAsState()
+    val networkServices by vm.networkServices.collectAsState()
+    val networkProbeResults by vm.networkProbeResults.collectAsState()
     val gattState by vm.gattState.collectAsState()
     val tcsPairing by vm.tcsPairingState.collectAsState()
     val remote by vm.tcsRemoteState.collectAsState()
@@ -760,8 +1080,6 @@ private fun RemoteScreen(vm: AtomosViewModel) {
     val codecProfile by vm.codecProfile.collectAsState()
     val codecBitDepth by vm.codecBitDepth.collectAsState()
     val codecHardwareProfile by vm.codecHardwareProfile.collectAsState()
-    val codecSupportedProfiles by vm.codecSupportedProfiles.collectAsState()
-    val codecSupportedBitDepths by vm.codecSupportedBitDepths.collectAsState()
     val inputFormatInfo by vm.inputFormatInfo.collectAsState()
     val inputCodecId by vm.inputCodecId.collectAsState()
     val inputCameraId by vm.inputCameraId.collectAsState()
@@ -774,6 +1092,123 @@ private fun RemoteScreen(vm: AtomosViewModel) {
     val connectedRecorderName by vm.connectedRecorderName.collectAsState()
     val commandStatus by vm.commandStatus.collectAsState()
     val transportUi by vm.remoteTransportUiState.collectAsState()
+
+    // NDI-06C: Remote-screen-only discovery. This NEVER transmits recorder TX controls
+    // or opens a media port. It reuses the proven 06A _ndi._tcp NSD implementation.
+    val ndi06Context = LocalContext.current
+    var ndi06Sources by remember(ndi06Context) { mutableStateOf<List<Ndi06DiscoveredSource>>(emptyList()) }
+    var ndi06Note by remember(ndi06Context) { mutableStateOf("Waiting for NDI discovery") }
+    val ndi06Discovery = remember(ndi06Context) {
+        NdiDiscovery(
+            ndi06Context,
+            onLog = { message -> ndi06Note = message },
+            onUpdate = { found -> ndi06Sources = found }
+        )
+    }
+    DisposableEffect(ndi06Discovery) {
+        ndi06Discovery.start()
+        onDispose { ndi06Discovery.stop() }
+    }
+    // V16.1: NDI discovery is multi-source. Do NOT auto-attach a SHOGUN source
+    // when the Bluetooth-selected device is a NINJA or another recorder.
+    // Stable explicit source binding is saved under the selected Bluetooth MAC.
+    val ndi16Prefs = remember(ndi06Context) {
+        ndi06Context.getSharedPreferences("ndi16_local_endpoint", android.content.Context.MODE_PRIVATE)
+    }
+    val ndi161BluetoothKey = selected?.address ?: "not_paired"
+    val ndi161BindingKey = "ndi161_source_for_" + ndi161BluetoothKey
+    var ndi161UserBoundName by remember(ndi161BluetoothKey) {
+        mutableStateOf(ndi16Prefs.getString(ndi161BindingKey, null))
+    }
+    // Never let a stale GATT display name from the previous recorder auto-bind
+    // the newly selected Bluetooth device to that previous sender.
+    val ndi161DeviceName = selected?.name?.trim()?.takeIf { it.isNotBlank() }
+        ?: connectedRecorderName.orEmpty()
+    val ndi161AutoMatches = if (selected == null) emptyList() else ndi06Sources.filter {
+        ndi161LikelySameRecorder(ndi161DeviceName, it.name)
+    }
+    val ndi161AutoName = ndi161AutoMatches.singleOrNull()?.name
+    // A uniquely identified auto-source is retained only within THIS BLE
+    // recorder session, to survive transient mDNS service-loss events.
+    var ndi161SessionAutoName by remember(ndi161BluetoothKey) { mutableStateOf<String?>(null) }
+    LaunchedEffect(ndi161AutoName, ndi161BluetoothKey) {
+        if (ndi161AutoName != null && ndi161SessionAutoName == null) {
+            ndi161SessionAutoName = ndi161AutoName
+            Log.i("AtomNdi161", "NDI161_AUTO_PIN ble=$ndi161BluetoothKey source=$ndi161AutoName")
+        }
+    }
+    // Explicit manual mapping always wins. It persists through brief mDNS gaps.
+    // Auto-matching is permitted only if ONE NDI sender matches recorder identity.
+    val ndi161ChosenName = ndi161UserBoundName ?: ndi161SessionAutoName ?: ndi161AutoName
+    val ndi06Source = ndi06Sources.singleOrNull { it.name == ndi161ChosenName }
+    var ndi161BindingNote by remember(ndi161BluetoothKey) { mutableStateOf("") }
+    LaunchedEffect(ndi161ChosenName, ndi161BluetoothKey) {
+        Log.i("AtomNdi161", "NDI161_BINDING ble=$ndi161BluetoothKey name=${ndi161ChosenName ?: "none"} auto=${ndi161UserBoundName == null && ndi161AutoName != null} candidates=${ndi06Sources.size}")
+    }
+    // Keep existing V16 hotspot preference identity keys so user's prior
+    // manual local-IP configuration is preserved, but NEVER trust V16's
+    // automatically cached SHOGUN source name as a recorder identity.
+    val ndi16IdentityKey = "verified_shogun_" + ndi161BluetoothKey
+    // Old V16 auto-cached IP/source may belong to Shogun from a previous
+    // session. Preserve the address but require an explicit V16.1 confirmation
+    // before restoring its DIRECT mode as a recorder identity.
+    val ndi161DirectAuthorizedKey = "ndi161_direct_authorized_" + ndi161BluetoothKey
+    var ndi16DirectMode by remember(ndi161BluetoothKey) {
+        mutableStateOf(ndi16Prefs.getBoolean("direct_" + ndi16IdentityKey, false) &&
+            ndi16Prefs.getBoolean(ndi161DirectAuthorizedKey, false))
+    }
+    var ndi16SavedHost by remember(ndi161BluetoothKey) {
+        mutableStateOf(ndi16Prefs.getString("host_" + ndi16IdentityKey, "") ?: "")
+    }
+    var ndi16SavedPort by remember(ndi161BluetoothKey) {
+        mutableIntStateOf(ndi16Prefs.getInt("port_" + ndi16IdentityKey, 5961))
+    }
+    var ndi16DraftHost by remember(ndi161BluetoothKey) { mutableStateOf(ndi16SavedHost) }
+    var ndi16DraftPort by remember(ndi161BluetoothKey) { mutableStateOf(ndi16SavedPort.toString()) }
+    var ndi16InputMessage by remember(ndi161BluetoothKey) { mutableStateOf("") }
+    val ndi16DirectValid = ndi16LocalIpv4(ndi16SavedHost) && ndi16SavedPort in 1..65535
+    val ndi16SelectedSourceName = if (ndi16DirectMode && ndi16DirectValid) {
+        val label = ndi161ChosenName ?: "Recorder NDI (direct local IP)"
+        "$label##NDI16_IP=$ndi16SavedHost:$ndi16SavedPort"
+    } else if (ndi16DirectMode) null else ndi161ChosenName
+    LaunchedEffect(ndi16DirectMode, ndi16SavedHost, ndi16SavedPort) {
+        Log.i("AtomNdi16", "NDI16_MODE direct=$ndi16DirectMode host=${if (ndi16DirectMode) ndi16SavedHost else "auto"} port=$ndi16SavedPort valid=$ndi16DirectValid")
+    }
+    // V14: local receiver ON/OFF only. Does not change Shogun NDI TX or license.
+    var ndi14PreviewActive by remember(selected?.address) { mutableStateOf(true) }
+    // NDI15 is Android receive/post-decode resolution only; never alters recorder TX.
+    val ndi15Prefs = remember(ndi06Context) {
+        ndi06Context.getSharedPreferences("ndi15_android_output", android.content.Context.MODE_PRIVATE)
+    }
+    var ndi15Height by remember(ndi15Prefs) {
+        val stored = ndi15Prefs.getInt("output_height", 720)
+        mutableStateOf(if (stored in setOf(230, 480, 720, 1080)) stored else 720)
+    }
+    var ndi15SettingsOpen by remember { mutableStateOf(false) }
+    // NDI16.2 UI-only: expandable automatically refreshed source picker and
+    // advanced local-IP controls. The underlying discovery starts on Remote entry.
+    var ndi162SourcePickerOpen by remember(ndi161BluetoothKey) { mutableStateOf(false) }
+    var ndi162AdvancedOpen by remember { mutableStateOf(false) }
+    var ndi163ResolutionMenuOpen by remember { mutableStateOf(false) }
+    LaunchedEffect(ndi162SourcePickerOpen, ndi161BluetoothKey) {
+        if (ndi162SourcePickerOpen && ndi06Sources.isEmpty()) {
+            // An empty picker refreshes existing NSD discovery automatically.
+            // Do not restart discovery while a sender is available/streaming.
+            ndi06Discovery.stop()
+            ndi06Discovery.start()
+            Log.i("AtomNdi162", "NDI162_PICKER_AUTO_SCAN ble=$ndi161BluetoothKey")
+        }
+    }
+    LaunchedEffect(ndi15Height) {
+        val applied = Ndi07Native.setAndroidOutputHeight(ndi15Height)
+        Log.i("AtomNdi15", "NDI15_ANDROID_PROCESS_HEIGHT height=$ndi15Height applied=$applied sender_unchanged=true")
+    }
+
+
+    DisposableEffect(Unit) {
+        vm.startNetworkDiscovery()
+        onDispose { vm.stopNetworkDiscovery() }
+    }
 
     val transientPacketLinkPhase = remote.phase in setOf(
         "sending", "awaiting-response", "awaiting-credit", "transport-ready", "bootstrapping"
@@ -843,13 +1278,89 @@ private fun RemoteScreen(vm: AtomosViewModel) {
         }
     }
 
-    val recorderName = selected?.let { vm.displayNameFor(it) }
+    val recorderName = connectedRecorderName?.trim()?.takeIf {
+        it.length > 3 && !it.equals("Unknown", true) &&
+            !it.equals("PC", true) && !it.equals("AG2", true)
+    } ?: selected?.let { vm.displayNameFor(it) }
         ?.takeIf { it.isNotBlank() && !it.equals("Unknown", true) }
-        ?: connectedRecorderName?.takeIf {
-            it.isNotBlank() && !it.equals("Unknown", true) && it.length > 3
-        }
         ?: "ATOMOS Recorder"
-    val recorderAddress = selected?.let { ad -> recorderModelCode(ad.name)?.let { "Model code: $it Â· ${ad.address}" } ?: ad.address } ?: "Bluetooth Remote"
+    val recorderAddress = selected?.let { ad -> recorderModelCode(ad.name)?.let { "Model code: $it | ${ad.address}" } ?: ad.address } ?: "Bluetooth Remote"
+    val sameNetworkRecorder = remember(lanDevices) {
+        lanDevices.firstOrNull { it.likelyAtomos }
+    }
+    val localIpv4 = networkStatus.localAddresses.firstOrNull { it.count { ch -> ch == '.' } == 3 }
+    val streamProbeTarget = remember(lanDevices, sameNetworkRecorder, localIpv4) {
+        sameNetworkRecorder ?: lanDevices.firstOrNull { device ->
+            device.host != localIpv4 &&
+                !device.host.endsWith(".1") &&
+                device.host.count { ch -> ch == '.' } == 3
+        }
+    }
+    val streamProbeTargetConfirmed = streamProbeTarget?.likelyAtomos == true
+    val sameNetworkReady = networkStatus.connected && sameNetworkRecorder != null
+    val wirelessFoundationStatus = when {
+        sameNetworkReady -> "SAME NETWORK RECORDER FOUND"
+        streamProbeTarget != null -> "LAN CANDIDATE FOUND"
+        networkStatus.connected -> "SAME NETWORK DISCOVERY"
+        else -> "WIFI NOT READY"
+    }
+    val wirelessFoundationDetail = when {
+        sameNetworkRecorder != null -> sameNetworkRecorder.host
+        streamProbeTarget != null -> streamProbeTarget.host
+        networkStatus.connected -> localIpv4 ?: networkStatus.transport
+        else -> "Connect phone and recorder to the same Wi-Fi"
+    }
+
+    val streamProbePorts = remember { "80,443,554,5960,8000,8080,8081,8554" }
+    LaunchedEffect(streamProbeTarget?.host) {
+        streamProbeTarget?.host?.let { host ->
+            val confidence = if (streamProbeTargetConfirmed) "atomos" else "candidate"
+            Log.d("AtomRemoteWL2", "WL22 TARGET host=$host confidence=$confidence evidence=${streamProbeTarget?.evidence}")
+            Log.d("AtomRemoteWL2", "WL22 AUTO PROBE host=$host ports=$streamProbePorts")
+            vm.probeNetwork(host, streamProbePorts)
+        }
+    }
+
+    LaunchedEffect(networkProbeResults, streamProbeTarget?.host, networkServices) {
+        val host = streamProbeTarget?.host ?: return@LaunchedEffect
+        if (networkProbeResults.isNotEmpty()) {
+            val open = networkProbeResults.filter { it.reachable }.joinToString(",") { it.port.toString() }
+            Log.d("AtomRemoteWL2", "WL2 PROBE RESULT host=$host openPorts=${if (open.isBlank()) "none" else open}")
+        }
+        val hostServices = networkServices.filter { it.host == host }
+        if (hostServices.isNotEmpty()) {
+            val svc = hostServices.joinToString("|") { "${it.serviceType}:${it.port ?: 0}" }
+            Log.d("AtomRemoteWL2", "WL2 SERVICES host=$host services=$svc")
+        }
+    }
+
+    val streamCandidateLabel = remember(networkProbeResults, networkServices, sameNetworkRecorder?.host) {
+        val host = streamProbeTarget?.host
+        val hostServices = networkServices.filter { it.host == host }
+        when {
+            hostServices.any { it.serviceType.contains("_ndi._tcp.", ignoreCase = true) } -> "NDI CANDIDATE"
+            hostServices.any { it.serviceType.contains("_rtsp._tcp.", ignoreCase = true) } -> "RTSP CANDIDATE"
+            networkProbeResults.any { it.port == 554 && it.reachable } -> "RTSP PORT OPEN"
+            networkProbeResults.any { it.port == 8554 && it.reachable } -> "RTSP ALT PORT OPEN"
+            networkProbeResults.any { it.reachable } -> "NETWORK SERVICE FOUND"
+            sameNetworkReady && networkProbeResults.isNotEmpty() -> "NO STREAM PORT FOUND"
+            sameNetworkReady -> "PROBING STREAM PORTS"
+            else -> "WAITING FOR SAME NETWORK"
+        }
+    }
+
+    val streamProbeDetail = remember(networkProbeResults, networkServices, sameNetworkRecorder?.host) {
+        val host = streamProbeTarget?.host
+        val openPorts = networkProbeResults.filter { it.reachable }.map { it.port }.sorted()
+        val hostServices = networkServices.filter { it.host == host }.map { it.serviceType }.distinct()
+        when {
+            hostServices.isNotEmpty() -> hostServices.joinToString(" Â· ")
+            openPorts.isNotEmpty() -> "Open: " + openPorts.joinToString(", ")
+            networkProbeResults.isNotEmpty() -> "No tested stream/service ports open"
+            host != null -> "Testing $streamProbePorts"
+            else -> "Same-network recorder not identified yet"
+        }
+    }
     val pairingCode = tcsPairing.pairingCode ?: selected?.advertisedPairingId
     val connectionTitle = when {
         hasSessionError -> "DISCONNECTED"
@@ -866,6 +1377,7 @@ private fun RemoteScreen(vm: AtomosViewModel) {
     BackHandler(enabled = true) { showDisconnectConfirmation = true }
 
     var activePanel by remember { mutableStateOf<RemotePanel?>(null) }
+    var activeTool by remember { mutableStateOf<RemoteHomeTool?>(null) }
     // 20.03.4.11: Connected modules are panels inside one persistent screen.
     // Changing tabs must not call vm.go(), restart GATT, or start a hardware refresh.
     var connectedTab by remember(selected?.address) { mutableStateOf(ConnectedTopTab.REMOTE) }
@@ -891,6 +1403,14 @@ private fun RemoteScreen(vm: AtomosViewModel) {
     }
 
     val remoteListState = rememberLazyListState()
+    val density = LocalDensity.current
+    val miniThresholdPx = with(density) { 120.dp.roundToPx() }
+    val ndiMiniPreview by remember(remoteListState, miniThresholdPx) {
+        derivedStateOf {
+            remoteListState.firstVisibleItemIndex > 0 ||
+                remoteListState.firstVisibleItemScrollOffset > miniThresholdPx
+        }
+    }
     LaunchedEffect(transportReady, selected?.address) {
         if (!transportReady) {
             vm.invalidateMonitorSessionCache("transport-not-ready")
@@ -908,13 +1428,19 @@ private fun RemoteScreen(vm: AtomosViewModel) {
         val monitorVisible =
             connectedTab == ConnectedTopTab.MONITOR ||
                 activePanel == RemotePanel.MONITOR_ASSIST ||
-                activePanel == RemotePanel.MONITORING
+                activePanel == RemotePanel.MONITORING ||
+                activePanel == RemotePanel.GUIDES ||
+                activePanel == RemotePanel.SCOPES ||
+                activePanel == RemotePanel.DISPLAY
 
         if (transportReady && monitorVisible) {
             vm.ensureMonitorSessionSnapshot(
                 reason = when {
                     connectedTab == ConnectedTopTab.MONITOR -> "monitor-tab"
                     activePanel == RemotePanel.MONITOR_ASSIST -> "monitor-assist-panel"
+                    activePanel == RemotePanel.GUIDES -> "monitor-guides-panel"
+                    activePanel == RemotePanel.SCOPES -> "monitor-scopes-panel"
+                    activePanel == RemotePanel.DISPLAY -> "monitor-display-panel"
                     else -> "monitor-mode-panel"
                 }
             )
@@ -932,8 +1458,8 @@ private fun RemoteScreen(vm: AtomosViewModel) {
             .navigationBarsPadding()
     ) {
         AppHeader(
-            title = "ATOMOS Remote",
-            subtitle = recorderName,
+            title = recorderName,
+            subtitle = if (transportReady) "Connected" else "Connecting",
             onBack = { showDisconnectConfirmation = true }
         )
 
@@ -990,24 +1516,38 @@ private fun RemoteScreen(vm: AtomosViewModel) {
         }
     }
 
+    Box(Modifier.weight(1f).fillMaxWidth()) {
     LazyColumn(
             state = remoteListState,
-            modifier = Modifier.weight(1f).fillMaxWidth(),
+            modifier = Modifier.fillMaxSize(),
             contentPadding = PaddingValues(horizontal = 16.dp, vertical = 14.dp),
             verticalArrangement = Arrangement.spacedBy(14.dp)
         ) {
+            // NDI-06C: exact same Remote tab and preview container. TX control
+            // remains locked until verified readback and official setter payload.
             item {
-                RemoteConnectionCard(
+                // Same LazyColumn item as the original hero, so existing scroll targets
+                // and tool-sheet indices do not change.
+                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    RemoteWirelessHomeHero(
                     recorderName = recorderName,
                     recorderAddress = recorderAddress,
-                    pairingCode = pairingCode,
-                    title = connectionTitle,
-                    subtitle = connectionSubtitle,
-                    phase = remote.phase,
                     transportReady = transportReady,
-                    commandInFlight = commandInFlight,
-                    hasError = hasSessionError
-                )
+                    inputLabel = inputFormatInfo ?: "HDMI",
+                    codecLabel = codecSummary(codecProfile),
+                    monitorLabel = monitorModeSummary(monitorDisplayMode),
+                    pairingCode = pairingCode,
+                    wirelessStatus = wirelessFoundationStatus,
+                    wirelessDetail = wirelessFoundationDetail,
+                    sameNetworkReady = sameNetworkReady,
+                    networkTransport = networkStatus.transport,
+                    networkHost = streamProbeTarget?.host,
+                    networkHostConfirmed = streamProbeTargetConfirmed,
+                    bleLinked = transportReady,
+                    streamCandidate = streamCandidateLabel,
+                    ndi06Source = ndi06Source
+                    )
+                }
             }
 
             val visibleRemoteMessage = when {
@@ -1035,140 +1575,14 @@ private fun RemoteScreen(vm: AtomosViewModel) {
             }
 
             item {
-                Card(
-                    modifier = Modifier.fillMaxWidth(),
-                    shape = RoundedCornerShape(22.dp),
-                    colors = CardDefaults.cardColors(containerColor = Color(0xFF0F1315))
-                ) {
-                    Column(Modifier.padding(14.dp)) {
-                        val startUiAction: (
-                            action: String,
-                            label: String,
-                            expectedLastCommand: String,
-                            dispatch: () -> Boolean
-                        ) -> Unit = { action, label, expectedLastCommand, dispatch ->
-                            val generation = vm.beginRemoteTransportUiAction(
-                                action = action,
-                                label = label,
-                                expectedLastCommand = expectedLastCommand
-                            )
-                            if (generation != null) {
-                                val accepted = dispatch()
-                                if (!accepted) {
-                                    vm.rejectRemoteTransportUiAction("$label could not be queued.")
-                                }
-                            }
-                        }
-
-                        val recordPending = transportUi.pendingAction in setOf(
-                            "record-start",
-                            "return-record-mode"
-                        )
-                        val recordLabel = when (transportUi.pendingAction) {
-                            "return-record-mode" -> "RETURNING..."
-                            "record-start" -> "RECORDING..."
-                            else -> "RECORD"
-                        }
-
-                        Button(
-                            onClick = {
-                                if (transportUi.mode != RemoteTransportUiController.Mode.RECORD) {
-                                    startUiAction(
-                                        "return-record-mode",
-                                        "Return to Record mode",
-                                        "Prepare Record Mode"
-                                    ) {
-                                        vm.returnToRecordModeOnlyFromUi()
-                                    }
-                                } else {
-                                    startUiAction(
-                                        "record-start",
-                                        "Record Start",
-                                        "Record Start"
-                                    ) {
-                                        vm.sendRecordStartConfirmedModeFromUi()
-                                    }
-                                }
-                            },
-                            enabled = transportButtonsEnabled,
-                            modifier = Modifier.fillMaxWidth().height(72.dp),
-                            shape = RoundedCornerShape(18.dp),
-                            colors = ButtonDefaults.buttonColors(
-                                containerColor = AtomosRed,
-                                contentColor = Color.White,
-                                disabledContainerColor = Color(0xFF291719),
-                                disabledContentColor = Color(0xFF72585B)
-                            )
-                        ) {
-                            if (recordPending) {
-                                CircularProgressIndicator(
-                                    modifier = Modifier.size(16.dp),
-                                    strokeWidth = 2.dp,
-                                    color = Color.White
-                                )
-                            } else {
-                                Box(Modifier.size(13.dp).background(Color.White, CircleShape))
-                            }
-                            Spacer(Modifier.width(11.dp))
-                            Text(
-                                recordLabel,
-                                fontSize = if (recordPending) 13.sp else 18.sp,
-                                fontWeight = FontWeight.Black,
-                                letterSpacing = 1.1.sp
-                            )
-                        }
-                        Spacer(Modifier.height(9.dp))
-                        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                            RemoteTransportButton(
-                                label = if (transportUi.pendingAction == "record-stop") "STOPPING..." else "STOP",
-                                enabled = transportButtonsEnabled,
-                                accent = Color(0xFFE7EAEB),
-                                modifier = Modifier.weight(1f),
-                                loading = transportUi.pendingAction == "record-stop"
-                            ) {
-                                startUiAction("record-stop", "Record Stop", "Record Stop") {
-                                    vm.sendRemoteTransportFromUi("record-stop")
-                                }
-                            }
-
-                            RemoteTransportButton(
-                                label = if (transportUi.pendingAction == "play") "PLAYING..." else "PLAY",
-                                enabled = transportButtonsEnabled,
-                                accent = AtomosCyan,
-                                modifier = Modifier.weight(1f),
-                                loading = transportUi.pendingAction == "play"
-                            ) {
-                                startUiAction("play", "Play", "Play") {
-                                    vm.sendRemoteTransportFromUi("play")
-                                }
-                            }
-
-                            RemoteTransportButton(
-                                label = if (transportUi.pendingAction == "pause") "PAUSING..." else "PAUSE",
-                                enabled = transportButtonsEnabled,
-                                accent = Color(0xFFE7EAEB),
-                                modifier = Modifier.weight(1f),
-                                loading = transportUi.pendingAction == "pause"
-                            ) {
-                                startUiAction("pause", "Pause", "Pause") {
-                                    vm.sendRemoteTransportFromUi("pause")
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-
-            item {
                 Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
                     Text("TOOLS", color = Color(0xFF8B9497), fontSize = 10.sp, fontWeight = FontWeight.Black, letterSpacing = 1.1.sp)
                     Spacer(Modifier.weight(1f))
                     Text(
                         if (transportReady) {
-                            "READY Â· INPUT ${inputCodecCollector.inputResponses}/${inputCodecCollector.inputExpected}" +
-                                if (inputCodecCollector.codecVerified) " Â· CODEC OK" else ""
+                            "READY" + if (inputCodecCollector.codecVerified) " | CODEC OK" else ""
                         } else "CONNECTING",
-                        color = if (transportReady) AtomosCyan else Color(0xFF6F787B),
+                        color = if (transportReady) RemoteMint else Color(0xFF6F787B),
                         fontSize = 9.sp,
                         fontWeight = FontWeight.Bold
                     )
@@ -1183,116 +1597,26 @@ private fun RemoteScreen(vm: AtomosViewModel) {
             }
 
             item {
-                Column(verticalArrangement = Arrangement.spacedBy(9.dp)) {
-                    Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(9.dp)) {
-                        RemoteFeatureTile(RemotePanel.MONITOR_ASSIST, monitorAssistSummary(monitorZoomLevel, monitorFocusAssist, monitorZebra, monitorFalseColor, monitorBlueOnly), transportReady, Modifier.weight(1f)) { activePanel = RemotePanel.MONITOR_ASSIST }
-                        RemoteFeatureTile(RemotePanel.SCOPES, if (scopeEnabled) "On" else "Off", transportReady, Modifier.weight(1f)) { activePanel = RemotePanel.SCOPES }
-                    }
-                    Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(9.dp)) {
-                        RemoteFeatureTile(RemotePanel.GUIDES, guidesSummary(frameGridEnabled, frameGuideEnabled, safeAreaMode), transportReady, Modifier.weight(1f)) { activePanel = RemotePanel.GUIDES }
-                        RemoteFeatureTile(RemotePanel.ANAMORPHIC, anamorphicSummary(anamorphicMode), transportReady, Modifier.weight(1f)) { activePanel = RemotePanel.ANAMORPHIC }
-                    }
-                    Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(9.dp)) {
-                        RemoteFeatureTile(RemotePanel.MONITORING, monitorModeSummary(monitorDisplayMode), transportReady, Modifier.weight(1f)) { activePanel = RemotePanel.MONITORING }
-                        RemoteFeatureTile(RemotePanel.CODEC, codecSummary(codecProfile), transportReady, Modifier.weight(1f)) { activePanel = RemotePanel.CODEC }
-                    }
-                    RemoteFeatureTile(RemotePanel.INPUT_FORMAT, inputFormatInfo ?: "Open full Input module", transportReady, Modifier.fillMaxWidth()) {
-                        connectedTab = ConnectedTopTab.INPUT
+                RemoteHomeToolsGrid(
+                    activeTool = activeTool,
+                    enabled = transportReady,
+                    ndi15Height = ndi15Height,
+                    onPreviewSettings = {
+                        activeTool = null
                         activePanel = null
+                        ndi15SettingsOpen = true
+                    },
+                    onTool = { tool ->
+                        ndi15SettingsOpen = false
+                        activeTool = tool
+                        activePanel = tool.panel
                     }
-                }
+                )
             }
 
 
-            if (activePanel != null) {
-                item {
-                    val panel = activePanel!!
-                    Column(Modifier.fillMaxWidth()) {
-                        Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
-                            Text(panel.title, color = Color.White, fontSize = 13.sp, fontWeight = FontWeight.Black)
-                            Spacer(Modifier.weight(1f))
-                            TextButton(onClick = { activePanel = null }) { Text("CLOSE", color = AtomosCyan, fontSize = 10.sp) }
-                        }
-                        when (panel) {
-                            RemotePanel.MONITOR_ASSIST -> RemoteMonitorAssistCard(
-                                enabled = transportReady, zoom = monitorZoom, zoomLevel = monitorZoomLevel,
-                                focusAssist = monitorFocusAssist, zebra = monitorZebra, falseColor = monitorFalseColor, blueOnly = monitorBlueOnly,
-                                zoomSupportedLevels = zoomSupportedLevels, zoomCapabilitiesKnown = zoomCapabilitiesKnown,
-                                zoomCore = monitorZoomCore,
-                                zoomViewport = monitorZoomViewport,
-                                focusState = monitorFocusAssistState,
-                                zebraState = monitorZebraState,
-                                effectsState = monitorAssistEffects,
-                                zoomBoxState = zoomBoxState,
-                                onZoomLevelChange = vm::setMonitorZoomLevel,
-                                onZoomRefresh = vm::refreshZoomState,
-                                onZoomViewportRefresh = vm::refreshZoomViewport,
-                                onZoomAnalogSessionChange = vm::setZoomAnalogSession,
-                                onFocusRefresh = vm::refreshFocusAssistState,
-                                onFocusType = vm::setFocusAssistType,
-                                onFocusThreshold = vm::setFocusAssistThreshold,
-                                onFocusColour = vm::setFocusAssistColour,
-                                onZebraThreshold = vm::setZebraThreshold,
-                                onEffectsRefresh = vm::refreshMonitorAssistEffects,
-                                onPan = vm::panZoomNormalized,
-                                onToggle = { control, checked -> vm.setMonitorAssistToggle(control, checked) }
-                            )
-                            RemotePanel.SCOPES -> RemoteScopesCard(
-                                enabled = transportReady,
-                                scopeState = monitorScopeState,
-                                onRefresh = vm::refreshScopeCore,
-                                onEnabledChange = vm::setScopeEnabled,
-                                onModeChange = vm::setScopeMode,
-                                onSizeChange = vm::setScopeSize,
-                                onOpacityChange = vm::setScopeOpacity,
-                                onBrightnessChange = vm::setScopeBrightness
-                            )
-                            RemotePanel.GUIDES -> RemoteGuidesCard(
-                                enabled = transportReady,
-                                guideState = monitorGuideState,
-                                safeAreaMode = safeAreaMode,
-                                onRefresh = vm::refreshGuidesState,
-                                onFrameGuideChange = vm::setFrameGuideEnabled,
-                                onFrameGuideFormat = vm::setFrameGuideFormat,
-                                onFrameGridChange = vm::setFrameGridEnabled,
-                                onSafeAreaRefresh = vm::refreshSafeAreaState,
-                                onSafeAreaMode = vm::setSafeAreaMode
-                            )
-                            RemotePanel.ANAMORPHIC -> RemoteAnamorphicCard(transportReady, monitorAnamorphicState, vm::refreshAnamorphicMode, vm::setAnamorphicMode)
-                            RemotePanel.MONITORING -> RemoteMonitoringCard(
-                                enabled = transportReady,
-                                mode = monitorDisplayMode,
-                                monitorCore = monitorCore,
-                                lutState = monitorLutState,
-                                onModeChange = vm::setMonitorDisplayMode,
-                                onLutRefresh = vm::refreshLutState,
-                                onLutSlot = vm::setLutSlot,
-                                onLutPreview = vm::setLutPreview,
-                                onLutRecord = vm::setLutDuringRecord,
-                                onLutOutput = vm::setLutDuringOutput
-                            )
-                            RemotePanel.CODEC -> RemoteCodecCard(
-                                enabled = transportReady,
-                                profile = codecProfile,
-                                bitDepth = codecBitDepth,
-                                confirmedProfile = codecHardwareProfile,
-                                supportedProfiles = codecSupportedProfiles,
-                                supportedBitDepths = codecSupportedBitDepths,
-                                onProfileChange = vm::selectCodecProfile,
-                                onBitDepthChange = vm::selectCodecBitDepth,
-                                onVerify = vm::verifyCodecProfile,
-                                onApply = vm::applyCodecProfile,
-                                onRestartApply = vm::activateCodecProfile
-                            )
-                            RemotePanel.INPUT_FORMAT -> RemoteInputFormatCard(
-                                enabled = transportReady, inputFormatInfo = inputFormatInfo, codecId = inputCodecId, cameraId = inputCameraId,
-                                gammaId = inputGammaId, gamutId = inputGamutId, outputInfo = outputInfo, outputHdrTypeId = outputHdrTypeId, outputGamutId = outputGamutId,
-                                rawHex = inputOutputRawHex, onRefresh = vm::refreshInputFormatSummary
-                            )
-                        }
-                    }
-                }
-            }
+
+
             if (hasSessionError) {
                 item {
                     Card(
@@ -1312,6 +1636,671 @@ private fun RemoteScreen(vm: AtomosViewModel) {
 
             item { Spacer(Modifier.height(4.dp)) }
         }
+
+        // NDI-07 V9: one persistent video view, outside LazyColumn.
+        // Scroll only changes its bounds. It does NOT dispose/start/stop native NDI.
+        // Leaving the REMOTE tab disposes the view and releases the receiver.
+        if (ndi16SelectedSourceName != null && Ndi07Native.available) {
+            val previewBounds = if (ndiMiniPreview) {
+                Modifier.align(Alignment.TopEnd)
+                    .padding(top = 50.dp, end = 14.dp)
+                    .width(188.dp)
+                    .height(108.dp)
+            } else {
+                Modifier.align(Alignment.TopCenter)
+                    .padding(top = 20.dp, start = 26.dp, end = 26.dp)
+                    .fillMaxWidth()
+                    .aspectRatio(16f / 9f)
+            }
+            Box(
+                modifier = previewBounds
+                    .zIndex(5f)
+                    .background(Color.Black, RoundedCornerShape(12.dp))
+                    .border(1.dp, AtomosCyan.copy(alpha = 0.72f), RoundedCornerShape(12.dp))
+                    .clip(RoundedCornerShape(12.dp))
+            ) {
+                Ndi07InlinePreview(
+                    sourceName = ndi16SelectedSourceName,
+                    enabled = ndi14PreviewActive,
+                    modifier = Modifier.fillMaxSize()
+                )
+                if (ndiMiniPreview) {
+                    Text(
+                        "RECORDER NDI",
+                        color = Color.White,
+                        fontSize = 9.sp,
+                        fontWeight = FontWeight.Bold,
+                        modifier = Modifier.align(Alignment.BottomStart)
+                            .padding(6.dp)
+                            .background(Color(0xCC031513), RoundedCornerShape(5.dp))
+                            .padding(horizontal = 6.dp, vertical = 3.dp)
+                    )
+                }
+            }
+        }
+
+    }
+
+            // UI 07.3.4: transport stays visible, remains above the gesture bar,
+            // and is rendered as a single horizontal icon dock.
+            Box(
+                Modifier
+                    .fillMaxWidth()
+                    .background(Color(0xFF02090B))
+                    .padding(horizontal = 14.dp, vertical = 8.dp)
+            ) {
+                Card(
+                    modifier = Modifier.fillMaxWidth(),
+                    shape = RoundedCornerShape(18.dp),
+                    colors = CardDefaults.cardColors(containerColor = Color(0xFF06110F)),
+                    border = androidx.compose.foundation.BorderStroke(1.dp, RemoteMint.copy(alpha = 0.70f))
+                ) {
+                    val startUiAction: (
+                        action: String,
+                        label: String,
+                        expectedLastCommand: String,
+                        dispatch: () -> Boolean
+                    ) -> Unit = { action, label, expectedLastCommand, dispatch ->
+                        val generation = vm.beginRemoteTransportUiAction(
+                            action = action,
+                            label = label,
+                            expectedLastCommand = expectedLastCommand
+                        )
+                        if (generation != null) {
+                            val accepted = dispatch()
+                            if (!accepted) {
+                                vm.rejectRemoteTransportUiAction("$label could not be queued.")
+                            }
+                        }
+                    }
+
+                    val recordPending = transportUi.pendingAction in setOf(
+                        "record-start",
+                        "return-record-mode"
+                    )
+                    val recordLabel = when (transportUi.pendingAction) {
+                        "return-record-mode" -> "RETURNING..."
+                        "record-start" -> "RECORDING..."
+                        else -> "RECORD"
+                    }
+
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(horizontal = 8.dp, vertical = 8.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        RemoteTransportDockButton(
+                            label = recordLabel,
+                            kind = "record",
+                            enabled = transportButtonsEnabled,
+                            accent = AtomosRed,
+                            loading = recordPending,
+                            modifier = Modifier.weight(1f)
+                        ) {
+                            if (transportUi.mode != RemoteTransportUiController.Mode.RECORD) {
+                                startUiAction(
+                                    "return-record-mode",
+                                    "Return to Record mode",
+                                    "Prepare Record Mode"
+                                ) {
+                                    vm.returnToRecordModeOnlyFromUi()
+                                }
+                            } else {
+                                startUiAction(
+                                    "record-start",
+                                    "Record Start",
+                                    "Record Start"
+                                ) {
+                                    vm.sendRecordStartConfirmedModeFromUi()
+                                }
+                            }
+                        }
+
+                        RemoteTransportDivider()
+
+                        RemoteTransportDockButton(
+                            label = if (transportUi.pendingAction == "record-stop") "STOPPING..." else "STOP",
+                            kind = "stop",
+                            enabled = transportButtonsEnabled,
+                            accent = Color(0xFFE7EAEB),
+                            loading = transportUi.pendingAction == "record-stop",
+                            modifier = Modifier.weight(1f)
+                        ) {
+                            startUiAction("record-stop", "Record Stop", "Record Stop") {
+                                vm.sendRemoteTransportFromUi("record-stop")
+                            }
+                        }
+
+                        RemoteTransportDivider()
+
+                        RemoteTransportDockButton(
+                            label = if (transportUi.pendingAction == "play") "PLAYING..." else "PLAY",
+                            kind = "play",
+                            enabled = transportButtonsEnabled,
+                            accent = Color.White,
+                            loading = transportUi.pendingAction == "play",
+                            modifier = Modifier.weight(1f)
+                        ) {
+                            startUiAction("play", "Play", "Play") {
+                                vm.sendRemoteTransportFromUi("play")
+                            }
+                        }
+
+                        RemoteTransportDivider()
+
+                        RemoteTransportDockButton(
+                            label = if (transportUi.pendingAction == "pause") "PAUSING..." else "PAUSE",
+                            kind = "pause",
+                            enabled = transportButtonsEnabled,
+                            accent = Color.White,
+                            loading = transportUi.pendingAction == "pause",
+                            modifier = Modifier.weight(1f)
+                        ) {
+                            startUiAction("pause", "Pause", "Pause") {
+                                vm.sendRemoteTransportFromUi("pause")
+                            }
+                        }
+                    }
+                }
+            }
+
+            // NDI16.2: all NDI receiver settings live in a single organized sheet.
+            // The BLE-recorded sender binding is applied automatically on reconnect;
+            // the picker is for choosing/repairing an ambiguous mapping once.
+            if (ndi15SettingsOpen) {
+                ModalBottomSheet(
+                    onDismissRequest = { ndi15SettingsOpen = false },
+                    containerColor = Color(0xFF071311),
+                    contentColor = Color.White,
+                    dragHandle = {
+                        Box(Modifier.padding(top = 10.dp, bottom = 8.dp)
+                            .size(width = 54.dp, height = 4.dp)
+                            .background(Color(0xFF607C74), RoundedCornerShape(99.dp)))
+                    }
+                ) {
+                    Column(
+                        Modifier.fillMaxWidth().fillMaxHeight(0.88f)
+                            .verticalScroll(rememberScrollState())
+                            .padding(start = 18.dp, end = 18.dp, bottom = 34.dp),
+                        verticalArrangement = Arrangement.spacedBy(12.dp)
+                    ) {
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            Surface(shape = RoundedCornerShape(12.dp), color = Color(0xFF11312B)) {
+                                Icon(painterResource(R.drawable.ui_remote_tool_live_preview),
+                                    contentDescription = null, tint = AtomosCyan,
+                                    modifier = Modifier.padding(9.dp).size(25.dp))
+                            }
+                            Spacer(Modifier.width(10.dp))
+                            Column(Modifier.weight(1f)) {
+                                Text("Live Preview", color = Color.White,
+                                    fontSize = 20.sp, fontWeight = FontWeight.Bold)
+                                Text("Android NDI receiver", color = Color(0xFF91AAA2), fontSize = 11.sp)
+                            }
+                            TextButton(onClick = { ndi15SettingsOpen = false }) {
+                                Text("DONE", color = AtomosCyan, fontWeight = FontWeight.Bold)
+                            }
+                        }
+
+                        Surface(shape = RoundedCornerShape(14.dp), color = Color(0xFF0D201D),
+                            border = androidx.compose.foundation.BorderStroke(1.dp, Color(0xFF284940))) {
+                            Row(Modifier.fillMaxWidth().padding(horizontal = 14.dp, vertical = 11.dp),
+                                verticalAlignment = Alignment.CenterVertically) {
+                                Column(Modifier.weight(1f)) {
+                                    Text("NDI Preview", fontSize = 14.sp, color = Color.White,
+                                        fontWeight = FontWeight.Bold)
+                                    Text(if (ndi14PreviewActive) "Receiver on" else "Receiver off",
+                                        color = if (ndi14PreviewActive) AtomosCyan else Color(0xFF91AAA2),
+                                        fontSize = 11.sp)
+                                }
+                                Switch(checked = ndi14PreviewActive, onCheckedChange = { enabled ->
+                                    ndi14PreviewActive = enabled
+                                    Log.i("AtomNdi162", "NDI162_PREVIEW_TOGGLE enabled=$enabled receiver_only=true")
+                                })
+                            }
+                        }
+
+                        // V16.3: compact dropdown anchored to the current recorder.
+                        // Discovery and per-BLE binding are unchanged from V16.2.
+                        Text("NDI SENDERS", color = AtomosCyan,
+                            fontSize = 12.sp, fontWeight = FontWeight.ExtraBold)
+                        BoxWithConstraints(Modifier.fillMaxWidth()) {
+                            val menuWidth = maxWidth
+                            Surface(
+                                modifier = Modifier.fillMaxWidth().clickable {
+                                    ndi162SourcePickerOpen = !ndi162SourcePickerOpen
+                                    ndi163ResolutionMenuOpen = false
+                                    Log.i("AtomNdi162", "NDI162_PICKER_OPEN=${ndi162SourcePickerOpen} source=${ndi161ChosenName ?: "none"}")
+                                },
+                                shape = RoundedCornerShape(12.dp),
+                                color = Color(0xFF0D2422),
+                                border = androidx.compose.foundation.BorderStroke(1.dp,
+                                    if (ndi161ChosenName != null) AtomosCyan.copy(alpha = 0.60f) else Color(0xFF345B53))
+                            ) {
+                                Row(Modifier.fillMaxWidth().padding(horizontal = 14.dp, vertical = 12.dp),
+                                    verticalAlignment = Alignment.CenterVertically) {
+                                    Column(Modifier.weight(1f)) {
+                                        Text(if (ndi16DirectMode && ndi16DirectValid) "Hotspot Direct IP" else
+                                            ndi06Source?.displayName ?: ndi161ChosenName ?: "Select NDI sender",
+                                            color = Color.White, fontSize = 13.sp, fontWeight = FontWeight.SemiBold,
+                                            maxLines = 1, overflow = TextOverflow.Ellipsis)
+                                        Text(when {
+                                            ndi16DirectMode && ndi16DirectValid -> "${ndi16SavedHost}:${ndi16SavedPort} • Manual endpoint"
+                                            ndi161UserBoundName != null -> "Saved for this Bluetooth recorder"
+                                            ndi161AutoName != null -> "Automatically matched to connected recorder"
+                                            ndi06Sources.isEmpty() -> "Discovering senders automatically..."
+                                            else -> "${ndi06Sources.size} available • Choose a sender"
+                                        }, color = Color(0xFF9DBDB3), fontSize = 10.sp,
+                                            maxLines = 1, overflow = TextOverflow.Ellipsis)
+                                    }
+                                    Spacer(Modifier.width(10.dp))
+                                    Text(if (ndi162SourcePickerOpen) "▴" else "▾",
+                                        color = AtomosCyan, fontSize = 21.sp, fontWeight = FontWeight.Bold)
+                                }
+                            }
+                            DropdownMenu(
+                                expanded = ndi162SourcePickerOpen,
+                                onDismissRequest = { ndi162SourcePickerOpen = false },
+                                modifier = Modifier.width(menuWidth).heightIn(max = 320.dp)
+                                    .background(Color(0xFF0B1D19))
+                            ) {
+                                if (ndi06Sources.isEmpty()) {
+                                    DropdownMenuItem(
+                                        text = {
+                                            Text("Searching for NDI senders on this network...",
+                                                color = Color(0xFFB6CAC2), fontSize = 12.sp)
+                                        },
+                                        onClick = {}, enabled = false
+                                    )
+                                }
+                                ndi06Sources.sortedWith(compareBy({ it.displayName.lowercase() }, { it.host })).forEach { source ->
+                                    // Keep V16.2 duplicate-name guard and exact saved BLE identity.
+                                    val nameUnique = ndi06Sources.count { it.name == source.name } == 1
+                                    val isCurrent = ndi161ChosenName == source.name && !ndi16DirectMode
+                                    DropdownMenuItem(
+                                        text = {
+                                            Column {
+                                                Text(source.displayName, color = Color.White,
+                                                    fontSize = 13.sp, fontWeight = FontWeight.SemiBold,
+                                                    maxLines = 1, overflow = TextOverflow.Ellipsis)
+                                                Text("${source.host}:${source.advertisedPort}" +
+                                                    if (!nameUnique) " • Duplicate sender name" else "",
+                                                    color = if (nameUnique) Color(0xFF91B2A7) else Color(0xFFE9C17D),
+                                                    fontSize = 10.sp)
+                                            }
+                                        },
+                                        trailingIcon = {
+                                            if (isCurrent) Text("✓", color = AtomosCyan,
+                                                fontSize = 16.sp, fontWeight = FontWeight.Bold)
+                                        },
+                                        enabled = nameUnique && selected != null,
+                                        onClick = {
+                                            ndi161UserBoundName = source.name
+                                            ndi161SessionAutoName = source.name
+                                            ndi16Prefs.edit().putString(ndi161BindingKey, source.name).apply()
+                                            ndi16DirectMode = false
+                                            ndi16Prefs.edit().putBoolean("direct_" + ndi16IdentityKey, false).apply()
+                                            ndi161BindingNote = "NDI sender saved for this Bluetooth recorder."
+                                            ndi162SourcePickerOpen = false
+                                            Log.i("AtomNdi162", "NDI162_SOURCE_BOUND ble=$ndi161BluetoothKey source=${source.name} host=${source.host}")
+                                        }
+                                    )
+                                }
+                            }
+                        }
+                        if (ndi161UserBoundName != null) {
+                            TextButton(onClick = {
+                                ndi161UserBoundName = null
+                                ndi161SessionAutoName = null
+                                ndi16Prefs.edit().remove(ndi161BindingKey).apply()
+                                ndi161BindingNote = "Saved association cleared; matching will retry automatically."
+                                Log.i("AtomNdi162", "NDI162_SOURCE_UNBOUND ble=$ndi161BluetoothKey")
+                            }) { Text("Forget saved sender", color = Color(0xFFB5C9BE), fontSize = 11.sp) }
+                        }
+                        if (selected == null) {
+                            Text("Connect a Bluetooth recorder to save its NDI sender.",
+                                color = Color(0xFFE9C17D), fontSize = 11.sp)
+                        }
+                        if (ndi161ChosenName == null && !ndi16DirectMode) {
+                            Text("No matching NDI sender yet. Choose one from the dropdown.",
+                                color = Color(0xFFE9C17D), fontSize = 11.sp)
+                        }
+                        if (ndi161BindingNote.isNotBlank()) {
+                            Text(ndi161BindingNote, color = Color(0xFF9DDBD4), fontSize = 11.sp)
+                        }
+
+                        // V16.3: resolution selection is a compact dropdown, not a radio list.
+                        Text("VIDEO RESOLUTION", color = AtomosCyan,
+                            fontSize = 12.sp, fontWeight = FontWeight.ExtraBold)
+                        BoxWithConstraints(Modifier.fillMaxWidth()) {
+                            val menuWidth = maxWidth
+                            Surface(
+                                modifier = Modifier.fillMaxWidth().clickable {
+                                    ndi163ResolutionMenuOpen = !ndi163ResolutionMenuOpen
+                                    ndi162SourcePickerOpen = false
+                                },
+                                shape = RoundedCornerShape(12.dp), color = Color(0xFF0D2422),
+                                border = androidx.compose.foundation.BorderStroke(1.dp, Color(0xFF345B53))
+                            ) {
+                                Row(Modifier.fillMaxWidth().padding(horizontal = 14.dp, vertical = 12.dp),
+                                    verticalAlignment = Alignment.CenterVertically) {
+                                    Column(Modifier.weight(1f)) {
+                                        Text("${ndi15Height}p" + if (ndi15Height == 720) "  •  Balanced" else "",
+                                            color = Color.White, fontSize = 13.sp,
+                                            fontWeight = FontWeight.SemiBold)
+                                        Text("Android decoded-frame processing", color = Color(0xFF9DBDB3), fontSize = 10.sp)
+                                    }
+                                    Spacer(Modifier.width(10.dp))
+                                    Text(if (ndi163ResolutionMenuOpen) "▴" else "▾",
+                                        color = AtomosCyan, fontSize = 21.sp, fontWeight = FontWeight.Bold)
+                                }
+                            }
+                            DropdownMenu(
+                                expanded = ndi163ResolutionMenuOpen,
+                                onDismissRequest = { ndi163ResolutionMenuOpen = false },
+                                modifier = Modifier.width(menuWidth).background(Color(0xFF0B1D19))
+                            ) {
+                                listOf(230, 480, 720, 1080).forEach { height ->
+                                    DropdownMenuItem(
+                                        text = {
+                                            Column {
+                                                Text("${height}p" + if (height == 720) "  •  Recommended" else "",
+                                                    color = Color.White, fontSize = 13.sp,
+                                                    fontWeight = FontWeight.SemiBold)
+                                                Text(when (height) {
+                                                    230 -> "Minimum processing load"
+                                                    480 -> "Low resource mode"
+                                                    720 -> "Balanced performance and detail"
+                                                    else -> "Higher preview detail"
+                                                }, color = Color(0xFF9DBDB3), fontSize = 10.sp)
+                                            }
+                                        },
+                                        trailingIcon = {
+                                            if (ndi15Height == height) Text("✓", color = AtomosCyan,
+                                                fontSize = 16.sp, fontWeight = FontWeight.Bold)
+                                        },
+                                        onClick = {
+                                            ndi15Height = height
+                                            ndi15Prefs.edit().putInt("output_height", height).apply()
+                                            ndi163ResolutionMenuOpen = false
+                                            Log.i("AtomNdi162", "NDI162_OUTPUT_HEIGHT=$height android_only=true")
+                                        }
+                                    )
+                                }
+                            }
+                        }
+                        Text("Android processing only. Recorder output remains unchanged.",
+                            color = Color(0xFF91AAA2), fontSize = 10.sp)
+
+                        HorizontalDivider(color = Color(0xFF24453F))
+                        Surface(
+                            modifier = Modifier.fillMaxWidth().clickable { ndi162AdvancedOpen = !ndi162AdvancedOpen },
+                            shape = RoundedCornerShape(11.dp), color = Color(0xFF0E1E1B)
+                        ) {
+                            Row(Modifier.fillMaxWidth().padding(12.dp), verticalAlignment = Alignment.CenterVertically) {
+                                Text("Hotspot / manual IP (advanced)", color = Color(0xFFD9EAE4),
+                                    fontWeight = FontWeight.SemiBold, fontSize = 12.sp,
+                                    modifier = Modifier.weight(1f))
+                                Text(if (ndi162AdvancedOpen) "HIDE" else "OPEN", color = AtomosCyan, fontSize = 11.sp)
+                            }
+                        }
+                        if (ndi162AdvancedOpen) {
+                            Row(verticalAlignment = Alignment.CenterVertically) {
+                                Text("Hotspot direct local IP", color = Color.White,
+                                    fontSize = 12.sp, modifier = Modifier.weight(1f))
+                                Switch(checked = ndi16DirectMode, onCheckedChange = { enable ->
+                                    if (!enable || ndi16DirectValid) {
+                                        ndi16DirectMode = enable
+                                        ndi16Prefs.edit().putBoolean("direct_" + ndi16IdentityKey, enable).apply()
+                                        ndi16InputMessage = if (enable) "Using saved local IP" else "Automatic NDI discovery"
+                                    } else {
+                                        ndi16InputMessage = "Enter and apply a valid private/local IPv4 first"
+                                    }
+                                })
+                            }
+                            Text("Auto discovery works on normal Wi-Fi and supported hotspots. Manual IP is a fallback when mDNS cannot discover the recorder.",
+                                color = Color(0xFF9BB6B1), fontSize = 10.sp)
+                            OutlinedTextField(
+                                value = ndi16DraftHost, onValueChange = { input ->
+                                    if (input.length <= 15) ndi16DraftHost = input.filter { it.isDigit() || it == '.' }
+                                }, label = { Text("Recorder private/local IPv4") },
+                                placeholder = { Text("10.69.210.243") }, singleLine = true,
+                                modifier = Modifier.fillMaxWidth()
+                            )
+                            OutlinedTextField(
+                                value = ndi16DraftPort, onValueChange = { input ->
+                                    if (input.length <= 5) ndi16DraftPort = input.filter { it.isDigit() }
+                                }, label = { Text("NDI service port") },
+                                placeholder = { Text("5961") }, singleLine = true,
+                                modifier = Modifier.fillMaxWidth()
+                            )
+                            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                                OutlinedButton(onClick = {
+                                    val port = ndi16DraftPort.toIntOrNull()
+                                    if (!ndi16LocalIpv4(ndi16DraftHost) || port == null || port !in 1..65535) {
+                                        ndi16InputMessage = "Invalid private/local IPv4 or port"
+                                    } else {
+                                        ndi16SavedHost = ndi16DraftHost
+                                        ndi16SavedPort = port
+                                        ndi16DirectMode = true
+                                        ndi16Prefs.edit()
+                                            .putString("host_" + ndi16IdentityKey, ndi16SavedHost)
+                                            .putInt("port_" + ndi16IdentityKey, ndi16SavedPort)
+                                            .putBoolean("direct_" + ndi16IdentityKey, true)
+                                            .putBoolean(ndi161DirectAuthorizedKey, true)
+                                            .apply()
+                                        ndi16InputMessage = "Direct local IP applied"
+                                        Log.i("AtomNdi162", "NDI162_DIRECT_IP_APPLIED host=$ndi16SavedHost port=$ndi16SavedPort")
+                                    }
+                                }) { Text("APPLY IP", color = AtomosCyan) }
+                                TextButton(onClick = {
+                                    ndi16DirectMode = false
+                                    ndi16Prefs.edit().putBoolean("direct_" + ndi16IdentityKey, false).apply()
+                                    ndi16InputMessage = "Auto discovery enabled"
+                                }) { Text("AUTO", color = AtomosCyan) }
+                            }
+                            if (ndi16InputMessage.isNotEmpty()) {
+                                Text(ndi16InputMessage, color = Color(0xFFE8C17D), fontSize = 11.sp)
+                            }
+                            Text("Local receiver routing only. Never changes recorder NDI TX or paid activation.",
+                                color = Color(0xFF91AAA2), fontSize = 10.sp)
+                        }
+                    }
+                }
+            }
+
+            if (activeTool != null && activePanel != null) {
+                ModalBottomSheet(
+                    onDismissRequest = {
+                        activeTool = null
+                        activePanel = null
+                    },
+                    containerColor = Color(0xFF071311),
+                    contentColor = Color.White,
+                    dragHandle = {
+                        Box(
+                            Modifier
+                                .padding(top = 8.dp, bottom = 7.dp)
+                                .size(width = 58.dp, height = 5.dp)
+                                .background(Color(0xFF63777C), RoundedCornerShape(99.dp))
+                        )
+                    }
+                ) {
+                    val tool = activeTool!!
+                    val panel = activePanel!!
+                    Column(
+                        Modifier
+                            .fillMaxWidth()
+                            .heightIn(max = 690.dp)
+                            .verticalScroll(rememberScrollState())
+                            .padding(start = 16.dp, end = 16.dp, bottom = 22.dp)
+                    ) {
+                        Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                            Icon(
+                                painter = painterResource(tool.iconRes),
+                                contentDescription = null,
+                                tint = RemoteMint,
+                                modifier = Modifier.size(34.dp)
+                            )
+                            Spacer(Modifier.width(10.dp))
+                            Text(
+                                tool.sheetTitle(),
+                                color = Color.White,
+                                fontSize = 18.sp,
+                                fontWeight = FontWeight.ExtraBold,
+                                modifier = Modifier.weight(1f)
+                            )
+                            TextButton(onClick = {
+                                activeTool = null
+                                activePanel = null
+                            }) {
+                                Text("CLOSE", color = RemoteMint, fontSize = 10.sp, fontWeight = FontWeight.Bold)
+                            }
+                        }
+                        Spacer(Modifier.height(10.dp))
+
+                        when (tool) {
+                            RemoteHomeTool.MONITOR -> RemoteMonitoringCard(
+                                enabled = transportReady,
+                                mode = monitorDisplayMode,
+                                monitorCore = monitorCore,
+                                lutState = monitorLutState,
+                                onModeChange = vm::setMonitorDisplayMode,
+                                onLutRefresh = vm::refreshLutState,
+                                onLutSlot = vm::setLutSlot,
+                                onLutPreview = vm::setLutPreview,
+                                onLutRecord = vm::setLutDuringRecord,
+                                onLutOutput = vm::setLutDuringOutput
+                            )
+
+                            RemoteHomeTool.WAVEFORM -> RemoteScopesCard(
+                                enabled = transportReady,
+                                scopeState = monitorScopeState,
+                                onRefresh = vm::refreshScopeCore,
+                                onEnabledChange = vm::setScopeEnabled,
+                                onModeChange = vm::setScopeMode,
+                                onSizeChange = vm::setScopeSize,
+                                onOpacityChange = vm::setScopeOpacity,
+                                onBrightnessChange = vm::setScopeBrightness
+                            )
+
+                            RemoteHomeTool.FOCUS -> RemoteFocusOnlyCard(
+                                enabled = transportReady,
+                                state = monitorFocusAssistState,
+                                onRefresh = vm::refreshFocusAssistState,
+                                onToggle = { checked -> vm.setMonitorAssistToggle("focus-assist", checked) },
+                                onType = vm::setFocusAssistType,
+                                onThreshold = vm::setFocusAssistThreshold,
+                                onColour = vm::setFocusAssistColour
+                            )
+
+                            RemoteHomeTool.ZEBRA -> RemoteZebraOnlyCard(
+                                enabled = transportReady,
+                                state = monitorZebraState,
+                                onRefresh = vm::refreshMonitorAssistEffects,
+                                onToggle = { checked -> vm.setMonitorAssistToggle("zebra", checked) },
+                                onThreshold = vm::setZebraThreshold
+                            )
+
+                            RemoteHomeTool.FALSE_COLOR -> RemoteFalseColorOnlyCard(
+                                enabled = transportReady,
+                                state = monitorAssistEffects,
+                                onRefresh = vm::refreshMonitorAssistEffects,
+                                onToggle = { checked -> vm.setMonitorAssistToggle("false-color", checked) }
+                            )
+
+                            RemoteHomeTool.BLUE_ONLY -> RemoteBlueOnlyCard(
+                                enabled = transportReady,
+                                state = monitorAssistEffects,
+                                onRefresh = vm::refreshMonitorAssistEffects,
+                                onToggle = { checked -> vm.setMonitorAssistToggle("blue-only", checked) }
+                            )
+
+                            RemoteHomeTool.LUT -> RemoteLutInnerCard(
+                                enabled = transportReady,
+                                mode = monitorDisplayMode,
+                                lutState = monitorLutState,
+                                onEnableLutMode = { vm.setMonitorDisplayMode(5) },
+                                onRefresh = vm::refreshLutState,
+                                onSlot = vm::setLutSlot,
+                                onPreview = vm::setLutPreview,
+                                onRecord = vm::setLutDuringRecord,
+                                onOutput = vm::setLutDuringOutput
+                            )
+
+                            RemoteHomeTool.FRAME_GUIDE -> RemoteFrameGuideOnlyCard(
+                                enabled = transportReady,
+                                guideState = monitorGuideState,
+                                onRefresh = vm::refreshGuidesState,
+                                onToggle = vm::setFrameGuideEnabled,
+                                onFormat = vm::setFrameGuideFormat
+                            )
+
+                            RemoteHomeTool.GRID -> RemoteGridOnlyCard(
+                                enabled = transportReady,
+                                guideState = monitorGuideState,
+                                onRefresh = vm::refreshGuidesState,
+                                onToggle = vm::setFrameGridEnabled
+                            )
+
+                            RemoteHomeTool.ZOOM -> RemoteZoomOnlyCard(
+                                enabled = transportReady,
+                                zoom = monitorZoom,
+                                zoomLevel = monitorZoomLevel,
+                                zoomSupportedLevels = zoomSupportedLevels,
+                                zoomCapabilitiesKnown = zoomCapabilitiesKnown,
+                                zoomCore = monitorZoomCore,
+                                zoomViewport = monitorZoomViewport,
+                                zoomBoxState = zoomBoxState,
+                                onZoomLevelChange = vm::setMonitorZoomLevel,
+                                onZoomRefresh = vm::refreshZoomState,
+                                onZoomViewportRefresh = vm::refreshZoomViewport,
+                                onZoomAnalogSessionChange = vm::setZoomAnalogSession,
+                                onPan = vm::panZoomNormalized
+                            )
+
+                            RemoteHomeTool.SAFE_AREA -> RemoteSafeAreaOnlyCard(
+                                enabled = transportReady,
+                                safeAreaMode = safeAreaMode,
+                                onRefresh = vm::refreshSafeAreaState,
+                                onMode = vm::setSafeAreaMode
+                            )
+
+                            RemoteHomeTool.DISPLAY -> RemoteDisplayCard(
+                                enabled = transportReady,
+                                state = monitorDisplayState,
+                                onRefresh = vm::refreshDisplayState,
+                                onBacklight = vm::setDisplayBacklight,
+                                onFlip = vm::setDisplayFlip,
+                                onTally = vm::setDisplayTally,
+                                onLift = vm::setDisplayYLift,
+                                onGamma = vm::setDisplayYGamma,
+                                onGain = vm::setDisplayYGain,
+                                onReset = vm::resetDisplayPicture
+                            )
+
+                            RemoteHomeTool.CODEC -> RemoteCodecCard(
+                                enabled = transportReady,
+                                profile = codecProfile,
+                                bitDepth = codecBitDepth,
+                                confirmedProfile = codecHardwareProfile,
+                                onProfileChange = vm::selectCodecProfile,
+                                onBitDepthChange = vm::selectCodecBitDepth,
+                                onVerify = vm::verifyCodecProfile,
+                                onApply = vm::applyCodecProfile,
+                                onRestartApply = vm::activateCodecProfile
+                            )
+
+                            RemoteHomeTool.ANAMORPHIC -> RemoteAnamorphicCard(
+                                transportReady,
+                                monitorAnamorphicState,
+                                vm::refreshAnamorphicMode,
+                                vm::setAnamorphicMode
+                            )
+                        }
+                    }
+                }
+            }
 
         } else {
             Box(Modifier.weight(1f).fillMaxWidth()) {
@@ -1401,22 +2390,6 @@ private fun RemoteScreen(vm: AtomosViewModel) {
                                     onGain = vm::setDisplayYGain,
                                     onReset = vm::resetDisplayPicture
                                 )
-                                // R16.1: same shared recorder-authoritative codec
-                                // controller/card used by Remote. No duplicate
-                                // Monitor-only codec state is introduced.
-                                RemoteCodecCard(
-                                    enabled = transportReady,
-                                    profile = codecProfile,
-                                    bitDepth = codecBitDepth,
-                                    confirmedProfile = codecHardwareProfile,
-                                    supportedProfiles = codecSupportedProfiles,
-                                    supportedBitDepths = codecSupportedBitDepths,
-                                    onProfileChange = vm::selectCodecProfile,
-                                    onBitDepthChange = vm::selectCodecBitDepth,
-                                    onVerify = vm::verifyCodecProfile,
-                                    onApply = vm::applyCodecProfile,
-                                    onRestartApply = vm::activateCodecProfile
-                                )
                                 Spacer(Modifier.height(8.dp))
                             }
                         }
@@ -1459,10 +2432,1212 @@ private fun RemoteScreen(vm: AtomosViewModel) {
     }
 }
 
+
+
+@Composable
+private fun RemoteFrameGuideOnlyCard(
+    enabled: Boolean,
+    guideState: MonitorGuideState,
+    onRefresh: () -> Unit,
+    onToggle: (Boolean) -> Unit,
+    onFormat: (Int) -> Unit
+) {
+    LaunchedEffect(Unit) { if (enabled) onRefresh() }
+
+    Card(
+        modifier = Modifier.fillMaxWidth(),
+        shape = RoundedCornerShape(18.dp),
+        colors = CardDefaults.cardColors(containerColor = Color(0xFF0B1517)),
+        border = androidx.compose.foundation.BorderStroke(1.dp, Color(0xFF244B45))
+    ) {
+        Column(Modifier.padding(16.dp)) {
+            Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                Column(Modifier.weight(1f)) {
+                    Text("Frame Guide", color = Color.White, fontSize = 15.sp, fontWeight = FontWeight.ExtraBold)
+                    Text("Independent frame guide control", color = Color(0xFF80938F), fontSize = 9.sp)
+                }
+                TextButton(onClick = onRefresh, enabled = enabled) {
+                    Text("SYNC", color = RemoteMint, fontSize = 9.sp, fontWeight = FontWeight.Black)
+                }
+            }
+            HorizontalDivider(color = Color(0xFF213432), modifier = Modifier.padding(vertical = 10.dp))
+
+            // Important recovery: do not permanently disable the switch from a stale UI pendingKey.
+            // The existing ViewModel queue remains the only command path.
+            RemoteMonitorToggle(
+                "Frame Guide",
+                guideState.frameGuideEnabled ?: false,
+                enabled,
+                onToggle
+            )
+
+            Text(
+                guideState.status,
+                color = if (guideState.pendingKey == "frame-guide") RemoteMint else Color(0xFF71817E),
+                fontSize = 8.5.sp,
+                lineHeight = 12.sp,
+                modifier = Modifier.padding(bottom = 10.dp)
+            )
+
+            val formats = listOf(
+                1 to "16:9",
+                5 to "1.85:1",
+                4 to "1.9:1",
+                2 to "1.91:1",
+                7 to "2.35:1",
+                3 to "2.41:1",
+                6 to "4:3",
+                8 to "1:1",
+                9 to "4:5",
+                10 to "9:16"
+            )
+            Text("FRAME RATIO", color = Color(0xFF6F817D), fontSize = 8.sp, fontWeight = FontWeight.Bold)
+            Spacer(Modifier.height(6.dp))
+            formats.chunked(2).forEach { row ->
+                Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(7.dp)) {
+                    row.forEach { (value, label) ->
+                        RemoteScopeChoiceButton(
+                            label,
+                            guideState.format == value,
+                            enabled && guideState.frameGuideEnabled == true && guideState.pendingKey != "format",
+                            Modifier.weight(1f)
+                        ) { onFormat(value) }
+                    }
+                    if (row.size == 1) Spacer(Modifier.weight(1f))
+                }
+                Spacer(Modifier.height(7.dp))
+            }
+        }
+    }
+}
+
+@Composable
+private fun RemoteGridOnlyCard(
+    enabled: Boolean,
+    guideState: MonitorGuideState,
+    onRefresh: () -> Unit,
+    onToggle: (Boolean) -> Unit
+) {
+    LaunchedEffect(Unit) { if (enabled) onRefresh() }
+    Card(
+        modifier = Modifier.fillMaxWidth(),
+        shape = RoundedCornerShape(18.dp),
+        colors = CardDefaults.cardColors(containerColor = Color(0xFF0B1517)),
+        border = androidx.compose.foundation.BorderStroke(1.dp, Color(0xFF244B45))
+    ) {
+        Column(Modifier.padding(16.dp)) {
+            Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                Column(Modifier.weight(1f)) {
+                    Text("9-Grid", color = Color.White, fontSize = 15.sp, fontWeight = FontWeight.ExtraBold)
+                    Text("Independent composition grid control", color = Color(0xFF80938F), fontSize = 9.sp)
+                }
+                TextButton(onClick = onRefresh, enabled = enabled) {
+                    Text("SYNC", color = RemoteMint, fontSize = 9.sp, fontWeight = FontWeight.Black)
+                }
+            }
+            HorizontalDivider(color = Color(0xFF213432), modifier = Modifier.padding(vertical = 10.dp))
+            RemoteMonitorToggle(
+                "9-Grid",
+                guideState.gridEnabled ?: false,
+                enabled && guideState.pendingKey != "grid",
+                onToggle
+            )
+            Text(guideState.status, color = Color(0xFF71817E), fontSize = 8.5.sp, lineHeight = 12.sp)
+        }
+    }
+}
+
+@Composable
+private fun RemoteSafeAreaOnlyCard(
+    enabled: Boolean,
+    safeAreaMode: Int,
+    onRefresh: () -> Unit,
+    onMode: (Int) -> Unit
+) {
+    LaunchedEffect(Unit) { if (enabled) onRefresh() }
+    Card(
+        modifier = Modifier.fillMaxWidth(),
+        shape = RoundedCornerShape(18.dp),
+        colors = CardDefaults.cardColors(containerColor = Color(0xFF0B1517)),
+        border = androidx.compose.foundation.BorderStroke(1.dp, Color(0xFF244B45))
+    ) {
+        Column(Modifier.padding(16.dp)) {
+            Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                Column(Modifier.weight(1f)) {
+                    Text("Safe Area", color = Color.White, fontSize = 15.sp, fontWeight = FontWeight.ExtraBold)
+                    Text("Independent title/action safe-area control", color = Color(0xFF80938F), fontSize = 9.sp)
+                }
+                TextButton(onClick = onRefresh, enabled = enabled) {
+                    Text("SYNC", color = RemoteMint, fontSize = 9.sp, fontWeight = FontWeight.Black)
+                }
+            }
+            HorizontalDivider(color = Color(0xFF213432), modifier = Modifier.padding(vertical = 10.dp))
+            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(7.dp)) {
+                RemoteScopeChoiceButton("OFF", safeAreaMode == 0, enabled, Modifier.weight(1f)) { onMode(0) }
+                RemoteScopeChoiceButton("ACTION", safeAreaMode == 1, enabled, Modifier.weight(1f)) { onMode(1) }
+                RemoteScopeChoiceButton("TITLE", safeAreaMode == 2, enabled, Modifier.weight(1f)) { onMode(2) }
+            }
+        }
+    }
+}
+
+// REMOTE-HOME-NORMAL-FIX-20261008
+@Composable
+private fun RemoteFocusOnlyCard(
+    enabled: Boolean,
+    state: MonitorFocusAssistState,
+    onRefresh: () -> Unit,
+    onToggle: (Boolean) -> Unit,
+    onType: (Int) -> Unit,
+    onThreshold: (Int) -> Unit,
+    onColour: (Int) -> Unit
+) {
+    var uiEnabled by remember { mutableStateOf(state.enabled ?: false) }
+    var uiType by remember { mutableStateOf(state.type) }
+    var uiColour by remember { mutableStateOf(state.colour) }
+    var thresholdDraft by remember {
+        mutableFloatStateOf((state.threshold ?: 50).toFloat().coerceIn(0f, 100f))
+    }
+    var enabledTouched by remember { mutableStateOf(false) }
+    var typeTouched by remember { mutableStateOf(false) }
+    var colourTouched by remember { mutableStateOf(false) }
+    var thresholdTouched by remember { mutableStateOf(false) }
+
+    fun requestFreshState() {
+        enabledTouched = false
+        typeTouched = false
+        colourTouched = false
+        thresholdTouched = false
+        onRefresh()
+    }
+
+    LaunchedEffect(Unit) {
+        if (enabled) requestFreshState()
+    }
+    LaunchedEffect(state.enabled, state.pendingKey) {
+        if (!enabledTouched && state.pendingKey == null && state.enabled != null) uiEnabled = state.enabled
+    }
+    LaunchedEffect(state.type, state.pendingKey) {
+        if (!typeTouched && state.pendingKey == null && state.type != null) uiType = state.type
+    }
+    LaunchedEffect(state.colour, state.pendingKey) {
+        if (!colourTouched && state.pendingKey == null && state.colour != null) uiColour = state.colour
+    }
+    LaunchedEffect(state.threshold, state.pendingKey) {
+        if (!thresholdTouched && state.pendingKey == null && state.threshold != null) {
+            thresholdDraft = state.threshold.toFloat().coerceIn(0f, 100f)
+        }
+    }
+
+    Card(
+        modifier = Modifier.fillMaxWidth(),
+        shape = RoundedCornerShape(18.dp),
+        colors = CardDefaults.cardColors(containerColor = Color(0xFF0B1517)),
+        border = androidx.compose.foundation.BorderStroke(1.dp, Color(0xFF244B45))
+    ) {
+        Column(Modifier.padding(16.dp)) {
+            Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                Text("Focus Peaking", color = Color.White, fontSize = 15.sp, fontWeight = FontWeight.ExtraBold)
+                Spacer(Modifier.weight(1f))
+                TextButton(onClick = { requestFreshState() }, enabled = enabled) {
+                    Text("REFRESH", color = AtomosCyan, fontSize = 9.sp, fontWeight = FontWeight.Bold)
+                }
+            }
+
+            Text(
+                state.status,
+                color = Color(0xFF71817E),
+                fontSize = 8.5.sp,
+                lineHeight = 11.sp,
+                modifier = Modifier.padding(top = 2.dp, bottom = 8.dp)
+            )
+
+            RemoteMonitorToggle("Focus Peaking", uiEnabled, enabled) { checked ->
+                enabledTouched = true
+                uiEnabled = checked
+                onToggle(checked)
+            }
+
+            Spacer(Modifier.height(8.dp))
+            Text("TYPE", color = Color(0xFF6F817D), fontSize = 8.sp, fontWeight = FontWeight.Bold)
+            Row(
+                Modifier.fillMaxWidth().padding(top = 6.dp),
+                horizontalArrangement = Arrangement.spacedBy(7.dp)
+            ) {
+                listOf(1 to "THIN", 2 to "MEDIUM", 3 to "THICK").forEach { (value, label) ->
+                    RemoteScopeChoiceButton(
+                        label,
+                        uiType == value,
+                        enabled && uiEnabled,
+                        Modifier.weight(1f)
+                    ) {
+                        typeTouched = true
+                        uiType = value
+                        onType(value)
+                    }
+                }
+            }
+
+            Spacer(Modifier.height(10.dp))
+            Text("COLOUR", color = Color(0xFF6F817D), fontSize = 8.sp, fontWeight = FontWeight.Bold)
+            val colours = listOf(
+                1 to "WHITE", 2 to "RED", 3 to "GREEN", 4 to "BLUE",
+                5 to "YELLOW", 6 to "CYAN", 7 to "MAGENTA"
+            )
+            Column(
+                Modifier.fillMaxWidth().padding(top = 6.dp),
+                verticalArrangement = Arrangement.spacedBy(6.dp)
+            ) {
+                colours.chunked(3).forEach { row ->
+                    Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(7.dp)) {
+                        row.forEach { (value, label) ->
+                            RemoteScopeChoiceButton(
+                                label,
+                                uiColour == value,
+                                enabled && uiEnabled,
+                                Modifier.weight(1f)
+                            ) {
+                                colourTouched = true
+                                uiColour = value
+                                onColour(value)
+                            }
+                        }
+                        repeat(3 - row.size) { Spacer(Modifier.weight(1f)) }
+                    }
+                }
+            }
+
+            Spacer(Modifier.height(10.dp))
+            Text("THRESHOLD", color = Color(0xFF6F817D), fontSize = 8.sp, fontWeight = FontWeight.Bold)
+            Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                Slider(
+                    value = thresholdDraft,
+                    onValueChange = {
+                        thresholdTouched = true
+                        thresholdDraft = it
+                    },
+                    onValueChangeFinished = { onThreshold(thresholdDraft.toInt()) },
+                    valueRange = 0f..100f,
+                    enabled = enabled && uiEnabled,
+                    modifier = Modifier.weight(1f)
+                )
+                Text(
+                    "${thresholdDraft.toInt()}%",
+                    color = AtomosCyan,
+                    fontSize = 10.sp,
+                    fontWeight = FontWeight.Black,
+                    modifier = Modifier.width(58.dp)
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun RemoteZebraOnlyCard(
+    enabled: Boolean,
+    state: MonitorZebraState,
+    onRefresh: () -> Unit,
+    onToggle: (Boolean) -> Unit,
+    onThreshold: (Int) -> Unit
+) {
+    var uiEnabled by remember { mutableStateOf(state.enabled ?: false) }
+    var thresholdDraft by remember {
+        mutableFloatStateOf((state.threshold ?: 90).toFloat().coerceIn(0f, 100f))
+    }
+    var enabledTouched by remember { mutableStateOf(false) }
+    var thresholdTouched by remember { mutableStateOf(false) }
+
+    LaunchedEffect(Unit) { if (enabled) onRefresh() }
+    LaunchedEffect(state.enabled, state.pendingKey) {
+        if (!enabledTouched && state.pendingKey == null && state.enabled != null) uiEnabled = state.enabled
+    }
+    LaunchedEffect(state.threshold, state.pendingKey) {
+        if (!thresholdTouched && state.pendingKey == null && state.threshold != null) {
+            thresholdDraft = state.threshold.toFloat().coerceIn(0f, 100f)
+        }
+    }
+
+    Card(
+        modifier = Modifier.fillMaxWidth(),
+        shape = RoundedCornerShape(18.dp),
+        colors = CardDefaults.cardColors(containerColor = Color(0xFF0B1517)),
+        border = androidx.compose.foundation.BorderStroke(1.dp, Color(0xFF244B45))
+    ) {
+        Column(Modifier.padding(16.dp)) {
+            Text("Zebra", color = Color.White, fontSize = 15.sp, fontWeight = FontWeight.ExtraBold)
+            RemoteMonitorToggle("Zebra", uiEnabled, enabled) { checked ->
+                enabledTouched = true
+                uiEnabled = checked
+                onToggle(checked)
+            }
+            Text("THRESHOLD ${thresholdDraft.toInt()}%", color = Color(0xFF8FA19D), fontSize = 9.sp)
+            Slider(
+                value = thresholdDraft,
+                onValueChange = {
+                    thresholdTouched = true
+                    thresholdDraft = it
+                },
+                onValueChangeFinished = { onThreshold(thresholdDraft.toInt()) },
+                valueRange = 0f..100f,
+                enabled = enabled && uiEnabled
+            )
+            Text(state.status, color = Color(0xFF71817E), fontSize = 8.5.sp)
+        }
+    }
+}
+
+@Composable
+private fun RemoteBlueOnlyCard(
+    enabled: Boolean,
+    state: MonitorAssistEffectsState,
+    onRefresh: () -> Unit,
+    onToggle: (Boolean) -> Unit
+) {
+    var uiEnabled by remember { mutableStateOf(state.blueOnlyEnabled ?: false) }
+    var touched by remember { mutableStateOf(false) }
+
+    fun requestFreshState() {
+        touched = false
+        onRefresh()
+    }
+
+    LaunchedEffect(Unit) { if (enabled) requestFreshState() }
+    LaunchedEffect(state.blueOnlyEnabled, state.pendingKey) {
+        if (!touched && state.pendingKey == null && state.blueOnlyEnabled != null) {
+            uiEnabled = state.blueOnlyEnabled
+        }
+    }
+
+    Card(
+        modifier = Modifier.fillMaxWidth(),
+        shape = RoundedCornerShape(18.dp),
+        colors = CardDefaults.cardColors(containerColor = Color(0xFF0B1517)),
+        border = androidx.compose.foundation.BorderStroke(1.dp, Color(0xFF244B45))
+    ) {
+        Column(Modifier.padding(16.dp)) {
+            Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                Text("Blue Only", color = Color.White, fontSize = 15.sp, fontWeight = FontWeight.ExtraBold)
+                Spacer(Modifier.weight(1f))
+                TextButton(onClick = { requestFreshState() }, enabled = enabled) {
+                    Text("REFRESH", color = AtomosCyan, fontSize = 9.sp, fontWeight = FontWeight.Bold)
+                }
+            }
+
+            Text(
+                state.status,
+                color = Color(0xFF71817E),
+                fontSize = 8.5.sp,
+                lineHeight = 11.sp,
+                modifier = Modifier.padding(top = 2.dp, bottom = 8.dp)
+            )
+
+            RemoteMonitorToggle(
+                "Blue Only",
+                uiEnabled,
+                enabled && state.settingsChangeable != false
+            ) { checked ->
+                touched = true
+                uiEnabled = checked
+                onToggle(checked)
+            }
+        }
+    }
+}
+
+@Composable
+private fun RemoteFalseColorOnlyCard(
+    enabled: Boolean,
+    state: MonitorAssistEffectsState,
+    onRefresh: () -> Unit,
+    onToggle: (Boolean) -> Unit
+) {
+    var uiEnabled by remember { mutableStateOf(state.falseColourEnabled ?: false) }
+    var touched by remember { mutableStateOf(false) }
+
+    LaunchedEffect(Unit) { if (enabled) onRefresh() }
+    LaunchedEffect(state.falseColourEnabled, state.pendingKey) {
+        if (!touched && state.pendingKey == null && state.falseColourEnabled != null) {
+            uiEnabled = state.falseColourEnabled
+        }
+    }
+
+    Card(
+        modifier = Modifier.fillMaxWidth(),
+        shape = RoundedCornerShape(18.dp),
+        colors = CardDefaults.cardColors(containerColor = Color(0xFF0B1517)),
+        border = androidx.compose.foundation.BorderStroke(1.dp, Color(0xFF244B45))
+    ) {
+        Column(Modifier.padding(16.dp)) {
+            Text("False Color", color = Color.White, fontSize = 15.sp, fontWeight = FontWeight.ExtraBold)
+            RemoteMonitorToggle("False Color", uiEnabled, enabled) { checked ->
+                touched = true
+                uiEnabled = checked
+                onToggle(checked)
+            }
+            Text(state.status, color = Color(0xFF71817E), fontSize = 8.5.sp, lineHeight = 12.sp)
+        }
+    }
+}
+
+@Composable
+private fun RemoteZoomOnlyCard(
+    enabled: Boolean,
+    zoom: Boolean,
+    zoomLevel: Int,
+    zoomSupportedLevels: List<Int>,
+    zoomCapabilitiesKnown: Boolean,
+    zoomCore: MonitorZoomCoreState,
+    zoomViewport: MonitorZoomViewportState,
+    zoomBoxState: ZoomBoxState?,
+    onZoomLevelChange: (Int) -> Unit,
+    onZoomRefresh: () -> Unit,
+    onZoomViewportRefresh: () -> Unit,
+    onZoomAnalogSessionChange: (Boolean) -> Unit,
+    onPan: (Float, Float) -> Unit
+) {
+    LaunchedEffect(Unit) {
+        if (enabled) {
+            onZoomRefresh()
+            onZoomViewportRefresh()
+        }
+    }
+
+    Card(
+        modifier = Modifier.fillMaxWidth(),
+        shape = RoundedCornerShape(18.dp),
+        colors = CardDefaults.cardColors(containerColor = Color(0xFF0B1517)),
+        border = androidx.compose.foundation.BorderStroke(1.dp, Color(0xFF244B45))
+    ) {
+        Column(Modifier.padding(16.dp)) {
+            Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                Column(Modifier.weight(1f)) {
+                    Text("Analog Zoom", color = Color.White, fontSize = 15.sp, fontWeight = FontWeight.ExtraBold)
+                    Text(
+                        "Recorder monitor zoom",
+                        color = Color(0xFF80938F),
+                        fontSize = 9.sp
+                    )
+                }
+                TextButton(onClick = onZoomRefresh, enabled = enabled) {
+                    Text("SYNC", color = RemoteMint, fontSize = 9.sp, fontWeight = FontWeight.Black)
+                }
+            }
+
+            HorizontalDivider(color = Color(0xFF213432), modifier = Modifier.padding(vertical = 10.dp))
+
+            RemoteMonitorToggle(
+                "Analog Zoom",
+                zoom,
+                enabled,
+                onZoomAnalogSessionChange
+            )
+
+            Spacer(Modifier.height(8.dp))
+            Text("ZOOM LEVEL", color = Color(0xFF6F817D), fontSize = 8.sp, fontWeight = FontWeight.Bold)
+            Spacer(Modifier.height(6.dp))
+
+            var zoomAnalogOpen by remember { mutableStateOf(false) }
+
+            val supported = if (zoomSupportedLevels.isNotEmpty()) {
+                zoomSupportedLevels.distinct().sorted()
+            } else {
+                listOf(1, 2)
+            }
+
+            val currentLevel = zoomCore.currentLevel ?: zoomLevel
+            val analogEligible = enabled && zoom && currentLevel >= 2
+
+            Row(
+                Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                RemoteScopeChoiceButton(
+                    label = "OFF",
+                    selected = !zoom || currentLevel <= 0,
+                    enabled = enabled,
+                    modifier = Modifier.weight(1f)
+                ) {
+                    zoomAnalogOpen = false
+                    onZoomAnalogSessionChange(false)
+                    onZoomLevelChange(0)
+                }
+                RemoteScopeChoiceButton(
+                    label = "1:1",
+                    selected = currentLevel == 1,
+                    enabled = enabled && 1 in supported,
+                    modifier = Modifier.weight(1f)
+                ) {
+                    zoomAnalogOpen = false
+                    onZoomAnalogSessionChange(false)
+                    onZoomLevelChange(1)
+                }
+                RemoteScopeChoiceButton(
+                    label = "2:1",
+                    selected = currentLevel == 2,
+                    enabled = enabled && 2 in supported,
+                    modifier = Modifier.weight(1f)
+                ) {
+                    onZoomLevelChange(2)
+                }
+            }
+
+            Spacer(Modifier.height(8.dp))
+
+            if (currentLevel >= 2 && zoom) {
+                RemoteScopeChoiceButton(
+                    label = "ANALOG",
+                    selected = zoomAnalogOpen,
+                    enabled = analogEligible,
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    zoomAnalogOpen = !zoomAnalogOpen
+                    onZoomAnalogSessionChange(zoomAnalogOpen)
+                }
+                Spacer(Modifier.height(10.dp))
+            }
+
+            Surface(
+                modifier = Modifier.fillMaxWidth(),
+                shape = RoundedCornerShape(12.dp),
+                color = Color(0xFF071310),
+                border = androidx.compose.foundation.BorderStroke(1.dp, Color(0xFF203B37))
+            ) {
+                Row(
+                    Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 10.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Column(Modifier.weight(1f)) {
+                        Text(
+                            if (zoom) "Zoom active" else "Zoom off",
+                            color = if (zoom) RemoteMint else Color(0xFFB4C0BD),
+                            fontSize = 10.sp,
+                            fontWeight = FontWeight.Bold
+                        )
+                        Text(
+                            if (zoomCapabilitiesKnown) {
+                                "Current: " + if (currentLevel <= 0) "OFF" else "${currentLevel}x"
+                            } else {
+                                "Waiting for recorder zoom capability readback"
+                            },
+                            color = Color(0xFF72837F),
+                            fontSize = 8.5.sp
+                        )
+                    }
+                    Text(
+                        if (zoom && currentLevel > 0) "${currentLevel}x" else "OFF",
+                        color = RemoteMint,
+                        fontSize = 13.sp,
+                        fontWeight = FontWeight.Black
+                    )
+                }
+            }
+
+            if (zoomAnalogOpen && currentLevel >= 2 && zoom) {
+                Spacer(Modifier.height(10.dp))
+                RemoteZoomAnalogDialog(
+                    enabled = analogEligible,
+                    zoomLevel = currentLevel,
+                    zoomBox = zoomBoxState,
+                    viewportState = zoomViewport,
+                    onRefresh = onZoomViewportRefresh,
+                    onPan = onPan,
+                    onDismiss = {
+                        zoomAnalogOpen = false
+                        onZoomAnalogSessionChange(false)
+                    }
+                )
+            }
+
+            @Suppress("UNUSED_VARIABLE")
+            val preserveExistingPanCallback = onPan
+
+            @Suppress("UNUSED_VARIABLE")
+            val preserveZoomBoxReadback = zoomBoxState
+
+            @Suppress("UNUSED_VARIABLE")
+            val preserveViewportReadback = zoomViewport
+        }
+    }
+}
+
+
+
+/**
+ * NDI-06C. Remote tab header immediately ABOVE the existing Live Preview hero.
+ * A discovered sender is NOT a verified recorder TX ON/OFF state.
+ * The displayed toggle is deliberately disabled, not an OFF indication.
+ * Never send LiveModeSet, GATT writes, NDI control commands or media connects here.
+ */
+@Composable
+private fun RemoteNdiTxStatusHeader(
+    source: Ndi06DiscoveredSource?,
+    discoveredCount: Int,
+    lastEvent: String,
+    onRescan: () -> Unit
+) {
+    Surface(
+        modifier = Modifier.fillMaxWidth(),
+        shape = RoundedCornerShape(14.dp),
+        color = Color(0xFF071A18),
+        border = androidx.compose.foundation.BorderStroke(1.dp, Color(0xFF1C4740))
+    ) {
+        Column(Modifier.padding(horizontal = 12.dp, vertical = 10.dp)) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Column(Modifier.weight(1f)) {
+                    Text("NDI TX", color = Color.White, fontSize = 11.sp, fontWeight = FontWeight.ExtraBold)
+                    Text(
+                        "TX STATE UNKNOWN | CONTROL LOCKED",
+                        color = Color(0xFFEDC982),
+                        fontSize = 8.sp,
+                        fontWeight = FontWeight.Bold
+                    )
+                }
+                // OFF would be a false claim when the recorder is already yellow/red.
+                // Status UNKNOWN is shown regardless of this disabled switch graphic.
+                Switch(
+                    checked = false,
+                    onCheckedChange = null,
+                    enabled = false
+                )
+            }
+            Spacer(Modifier.height(4.dp))
+            Text(
+                when {
+                    source != null -> "NDI SOURCE: ${source.name} (${source.host})"
+                    discoveredCount > 1 -> "${discoveredCount} sources detected; recorder not auto-selected"
+                    else -> "Searching for recorder NDI sender on Wi-Fi"
+                },
+                color = if (source != null) AtomosCyan else Color(0xFF9DAEAB),
+                fontSize = 8.5.sp,
+                maxLines = 2,
+                overflow = TextOverflow.Ellipsis
+            )
+            Text(
+                lastEvent.take(90),
+                color = Color(0xFF748984),
+                fontSize = 7.sp,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis
+            )
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Text(
+                    "Live video will appear in the SAME preview box when an NDI decoder is integrated.",
+                    color = Color(0xFF879C95),
+                    fontSize = 7.5.sp,
+                    modifier = Modifier.weight(1f)
+                )
+                TextButton(onClick = onRescan) {
+                    Text("RESCAN", color = AtomosCyan, fontSize = 9.sp)
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun RemoteWirelessHomeHero(
+    recorderName: String,
+    recorderAddress: String?,
+    transportReady: Boolean,
+    inputLabel: String,
+    codecLabel: String,
+    monitorLabel: String,
+    pairingCode: String?,
+    wirelessStatus: String,
+    wirelessDetail: String,
+    sameNetworkReady: Boolean,
+    networkTransport: String,
+    networkHost: String?,
+    networkHostConfirmed: Boolean,
+    bleLinked: Boolean,
+    streamCandidate: String,
+    ndi06Source: Ndi06DiscoveredSource?
+) {
+    Surface(
+        modifier = Modifier.fillMaxWidth(),
+        shape = RoundedCornerShape(18.dp),
+        color = Color(0xFF061311),
+        border = androidx.compose.foundation.BorderStroke(
+            1.dp,
+            AtomosCyan.copy(alpha = 0.62f)
+        )
+    ) {
+        Column(Modifier.padding(10.dp)) {
+            Box(
+                Modifier
+                    .fillMaxWidth()
+                    .aspectRatio(16f / 9f)
+                    .background(Color(0xFF020807), RoundedCornerShape(14.dp))
+            ) {
+                Canvas(Modifier.fillMaxSize().padding(12.dp)) {
+                    drawRect(
+                        AtomosCyan.copy(alpha = 0.16f),
+                        style = Stroke(width = 1.4f)
+                    )
+                    drawLine(
+                        AtomosCyan.copy(alpha = 0.07f),
+                        Offset(size.width / 3f, 0f),
+                        Offset(size.width / 3f, size.height),
+                        1f
+                    )
+                    drawLine(
+                        AtomosCyan.copy(alpha = 0.07f),
+                        Offset(size.width * 2f / 3f, 0f),
+                        Offset(size.width * 2f / 3f, size.height),
+                        1f
+                    )
+                    drawLine(
+                        AtomosCyan.copy(alpha = 0.07f),
+                        Offset(0f, size.height / 2f),
+                        Offset(size.width, size.height / 2f),
+                        1f
+                    )
+                }
+
+
+                if (!Ndi07Native.available || ndi06Source == null) {
+                    Column(
+                        Modifier.align(Alignment.Center).padding(horizontal = 20.dp),
+                        horizontalAlignment = Alignment.CenterHorizontally
+                    ) {
+                        Image(
+                            painter = painterResource(R.drawable.atom_remote_brand_mark),
+                            contentDescription = null,
+                            modifier = Modifier.size(42.dp)
+                        )
+                        Text(
+                            if (ndi06Source == null) "Waiting for Recorder NDI" else "NDI decoder unavailable",
+                            color = AtomosCyan,
+                            fontSize = 10.sp,
+                            fontWeight = FontWeight.Bold,
+                            modifier = Modifier.padding(top = 8.dp)
+                        )
+                        if (ndi06Source != null) Text(
+                            Ndi07Native.loadDiagnostic.take(120),
+                            color = Color(0xFFB1BDBA),
+                            fontSize = 9.sp,
+                            modifier = Modifier.padding(top = 6.dp)
+                        )
+                    }
+                }
+            }
+        }
+    }
+}
+
+
+@Composable
+private fun RemoteWirelessHeroMetric(
+    label: String,
+    value: String,
+    modifier: Modifier = Modifier,
+    active: Boolean
+) {
+    Column(
+        modifier = modifier.padding(horizontal = 2.dp, vertical = 2.dp),
+        horizontalAlignment = Alignment.Start
+    ) {
+        Text(
+            label,
+            color = if (active) AtomosCyan else Color(0xFF61716D),
+            fontSize = 6.3.sp,
+            fontWeight = FontWeight.Black,
+            letterSpacing = 0.45.sp
+        )
+        Text(
+            value,
+            color = if (active) Color.White else Color(0xFF87938F),
+            fontSize = 7.4.sp,
+            fontWeight = FontWeight.ExtraBold,
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis,
+            modifier = Modifier.padding(top = 2.dp)
+        )
+    }
+}
+
+
+@Composable
+private fun RemoteHomeOverlayChip(text: String) {
+    Surface(
+        shape = RoundedCornerShape(7.dp),
+        color = Color(0xD8071110),
+        border = androidx.compose.foundation.BorderStroke(
+            1.dp,
+            Color(0xFF213B37)
+        )
+    ) {
+        Text(
+            text,
+            color = Color.White,
+            fontSize = 8.sp,
+            fontWeight = FontWeight.ExtraBold,
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis,
+            modifier = Modifier.padding(horizontal = 8.dp, vertical = 5.dp)
+        )
+    }
+}
+
+@Composable
+private fun RemoteWirelessStreamProbeCard(
+    enabled: Boolean,
+    host: String?,
+    candidate: String,
+    detail: String,
+    onProbe: () -> Unit
+) {
+    Surface(
+        modifier = Modifier.fillMaxWidth(),
+        shape = RoundedCornerShape(14.dp),
+        color = Color(0xFF06110F),
+        border = androidx.compose.foundation.BorderStroke(
+            1.dp,
+            if (enabled) AtomosCyan.copy(alpha = 0.55f) else Color(0xFF243A40)
+        )
+    ) {
+        Column(Modifier.padding(horizontal = 12.dp, vertical = 10.dp)) {
+            Row(
+                Modifier.fillMaxWidth(),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Column(Modifier.weight(1f)) {
+                    Text(
+                        "WIRELESS FEED CHECK",
+                        color = AtomosCyan,
+                        fontSize = 8.sp,
+                        fontWeight = FontWeight.Black,
+                        letterSpacing = 0.7.sp
+                    )
+                    Text(
+                        candidate,
+                        color = Color.White,
+                        fontSize = 11.sp,
+                        fontWeight = FontWeight.ExtraBold,
+                        modifier = Modifier.padding(top = 3.dp)
+                    )
+                    Text(
+                        host ?: "Waiting for recorder LAN IP",
+                        color = Color(0xFF83938F),
+                        fontSize = 8.5.sp,
+                        modifier = Modifier.padding(top = 2.dp)
+                    )
+                }
+                OutlinedButton(
+                    onClick = onProbe,
+                    enabled = enabled,
+                    shape = RoundedCornerShape(10.dp),
+                    border = androidx.compose.foundation.BorderStroke(
+                        1.dp,
+                        if (enabled) AtomosCyan else Color(0xFF344144)
+                    ),
+                    contentPadding = PaddingValues(horizontal = 10.dp, vertical = 0.dp)
+                ) {
+                    Text(
+                        "PROBE",
+                        color = if (enabled) AtomosCyan else Color(0xFF687578),
+                        fontSize = 8.sp,
+                        fontWeight = FontWeight.Black
+                    )
+                }
+            }
+            Spacer(Modifier.height(7.dp))
+            Text(
+                detail,
+                color = Color(0xFF70817D),
+                fontSize = 8.5.sp,
+                lineHeight = 11.sp
+            )
+            Text(
+                "Live video starts only after a real recorder stream transport is confirmed.",
+                color = Color(0xFF52645F),
+                fontSize = 7.5.sp,
+                lineHeight = 10.sp,
+                modifier = Modifier.padding(top = 4.dp)
+            )
+        }
+    }
+}
+
+@Composable
+private fun RemoteWirelessSummaryStrip(
+    codec: String,
+    monitor: String,
+    linked: Boolean,
+    networkStatus: String,
+    networkHost: String?
+) {
+    Row(
+        Modifier.fillMaxWidth(),
+        horizontalArrangement = Arrangement.spacedBy(7.dp)
+    ) {
+        RemoteWirelessSummaryItem(
+            "NETWORK",
+            networkHost ?: networkStatus,
+            Modifier.weight(1f)
+        )
+        RemoteWirelessSummaryItem("CODEC", codec, Modifier.weight(1f))
+        RemoteWirelessSummaryItem("MONITOR", monitor, Modifier.weight(1f))
+        RemoteWirelessSummaryItem(
+            "BLE LINK",
+            if (linked) "CONNECTED" else "WAIT",
+            Modifier.weight(1f)
+        )
+    }
+}
+
+@Composable
+private fun RemoteWirelessSummaryItem(
+    label: String,
+    value: String,
+    modifier: Modifier = Modifier
+) {
+    Surface(
+        modifier = modifier,
+        shape = RoundedCornerShape(11.dp),
+        color = Color(0xFF071310),
+        border = androidx.compose.foundation.BorderStroke(
+            1.dp,
+            Color(0xFF203B37)
+        )
+    ) {
+        Column(
+            Modifier.padding(horizontal = 8.dp, vertical = 9.dp)
+        ) {
+            Text(
+                label,
+                color = RemoteMint,
+                fontSize = 7.5.sp,
+                fontWeight = FontWeight.Black
+            )
+            Text(
+                value,
+                color = Color.White,
+                fontSize = 8.7.sp,
+                fontWeight = FontWeight.SemiBold,
+                maxLines = 2,
+                overflow = TextOverflow.Ellipsis,
+                modifier = Modifier.padding(top = 2.dp)
+            )
+        }
+    }
+}
+
+// WL-3.2.6: Remote Home Monitor parity - Focus Peaking + Blue Only restored
+@Composable
+private fun RemoteHomeToolsGrid(
+    activeTool: RemoteHomeTool?,
+    enabled: Boolean,
+    ndi15Height: Int,
+    onPreviewSettings: () -> Unit,
+    onTool: (RemoteHomeTool) -> Unit
+) {
+    // V15.1: Live Preview is FIRST, not appended inside the final row.
+    // All established monitor tools follow in their exact original order.
+    // This receiver-only tile is accessible even without Bluetooth transport.
+    val tools: List<RemoteHomeTool?> = listOf(null) + RemoteHomeTool.entries
+    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+        tools.chunked(4).forEach { rowTools ->
+            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                rowTools.forEach { tool ->
+                    if (tool == null) {
+                        Surface(
+                            modifier = Modifier.weight(1f).height(98.dp)
+                                .clickable(onClick = onPreviewSettings),
+                            shape = RoundedCornerShape(14.dp),
+                            color = Color(0xFF0B211F),
+                            border = androidx.compose.foundation.BorderStroke(1.dp, AtomosCyan)
+                        ) {
+                            Column(Modifier.fillMaxSize().padding(4.dp),
+                                horizontalAlignment = Alignment.CenterHorizontally,
+                                verticalArrangement = Arrangement.Center) {
+                                Icon(painterResource(R.drawable.ui_remote_tool_live_preview),
+                                    contentDescription = "Live Preview settings", tint = AtomosCyan,
+                                    modifier = Modifier.size(34.dp))
+                                Text("LIVE PREVIEW", color = Color.White, fontSize = 8.2.sp,
+                                    fontWeight = FontWeight.ExtraBold,
+                                    textAlign = androidx.compose.ui.text.style.TextAlign.Center)
+                                Text("${ndi15Height}p", color = AtomosCyan, fontSize = 9.sp)
+                            }
+                        }
+                    } else {
+                        val active = activeTool == tool
+                        Surface(
+                            modifier = Modifier.weight(1f).height(98.dp)
+                                .clickable(enabled = enabled) { onTool(tool) },
+                            shape = RoundedCornerShape(14.dp),
+                            color = if (active) Color(0xFF0A2E32) else Color(0xFF071115),
+                            border = androidx.compose.foundation.BorderStroke(
+                                if (active) 1.5.dp else 1.dp,
+                                if (active) RemoteMint else Color(0xFF243A40)
+                            )
+                        ) {
+                            Column(Modifier.fillMaxSize().padding(horizontal = 4.dp, vertical = 9.dp),
+                                horizontalAlignment = Alignment.CenterHorizontally,
+                                verticalArrangement = Arrangement.Center) {
+                                Icon(painter = painterResource(tool.iconRes),
+                                    contentDescription = tool.label,
+                                    tint = if (enabled) AtomosCyan else Color(0xFF52615E),
+                                    modifier = Modifier.size(39.dp))
+                                Text(tool.label,
+                                    color = if (enabled) Color.White else Color(0xFF5A686C),
+                                    fontSize = 8.2.sp,
+                                    lineHeight = 10.sp,
+                                    fontWeight = FontWeight.ExtraBold,
+                                    textAlign = androidx.compose.ui.text.style.TextAlign.Center,
+                                    maxLines = 2,
+                                    modifier = Modifier.padding(top = 7.dp))
+                            }
+                        }
+                    }
+                }
+                repeat(4 - rowTools.size) { Spacer(Modifier.weight(1f)) }
+            }
+        }
+    }
+}
+
+@Composable
+private fun RemoteLutInnerCard(
+    enabled: Boolean,
+    mode: Int,
+    lutState: MonitorLutState,
+    onEnableLutMode: () -> Unit,
+    onRefresh: () -> Unit,
+    onSlot: (Int) -> Unit,
+    onPreview: (Boolean) -> Unit,
+    onRecord: (Boolean) -> Unit,
+    onOutput: (Boolean) -> Unit
+) {
+    Card(
+        modifier = Modifier.fillMaxWidth(),
+        shape = RoundedCornerShape(18.dp),
+        colors = CardDefaults.cardColors(containerColor = Color(0xFF0F1315))
+    ) {
+        Column(Modifier.padding(16.dp)) {
+            Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                Column(Modifier.weight(1f)) {
+                    Text("LUT", color = Color.White, fontSize = 15.sp, fontWeight = FontWeight.ExtraBold)
+                    Text(
+                        if (mode == 5) "LUT monitoring active" else "LUT controls available. Enable LUT monitor mode to preview.",
+                        color = if (mode == 5) AtomosCyan else Color(0xFF8B989C),
+                        fontSize = 9.5.sp,
+                        modifier = Modifier.padding(top = 3.dp)
+                    )
+                }
+                TextButton(onClick = onRefresh, enabled = enabled && lutState.pendingKey != "refresh") {
+                    Text("SYNC", color = AtomosCyan, fontSize = 9.sp, fontWeight = FontWeight.Bold)
+                }
+            }
+
+            if (mode != 5) {
+                Button(
+                    onClick = onEnableLutMode,
+                    enabled = enabled,
+                    modifier = Modifier.fillMaxWidth().padding(top = 8.dp)
+                ) {
+                    Text("ENABLE LUT MONITOR MODE")
+                }
+            }
+
+            Spacer(Modifier.height(10.dp))
+            Text("LUT SLOT", color = Color(0xFF687174), fontSize = 8.sp, fontWeight = FontWeight.Bold)
+            Text(
+                lutState.currentLabel(),
+                color = AtomosCyan,
+                fontSize = 11.sp,
+                fontWeight = FontWeight.Black,
+                modifier = Modifier.padding(top = 4.dp, bottom = 8.dp)
+            )
+
+            (1..8).toList().chunked(4).forEach { row ->
+                Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(7.dp)) {
+                    row.forEach { slot ->
+                        RemoteScopeChoiceButton(
+                            label = slot.toString(),
+                            selected = lutState.shownSlot == slot,
+                            enabled = enabled && lutState.pendingKey != "slot",
+                            modifier = Modifier.weight(1f)
+                        ) { onSlot(slot) }
+                    }
+                }
+                Spacer(Modifier.height(7.dp))
+            }
+
+            HorizontalDivider(color = Color(0xFF202628))
+            Spacer(Modifier.height(8.dp))
+
+            RemoteLutSwitchRow(
+                title = "Preview / Compare",
+                checked = lutState.shownPreviewEnabled == true,
+                available = lutState.previewAvailable,
+                enabled = enabled && lutState.pendingKey != "preview",
+                onCheckedChange = onPreview
+            )
+            RemoteLutSwitchRow(
+                title = "During Record",
+                checked = lutState.shownRecordBurnInEnabled == true,
+                available = lutState.recordBurnInAvailable,
+                enabled = enabled && lutState.pendingKey != "record",
+                onCheckedChange = onRecord
+            )
+            RemoteLutSwitchRow(
+                title = "During Output",
+                checked = lutState.shownOutputLutEnabled == true,
+                available = lutState.outputLutAvailable,
+                enabled = enabled && lutState.pendingKey != "output",
+                onCheckedChange = onOutput
+            )
+
+            Text(
+                lutState.status,
+                color = Color(0xFF747E81),
+                fontSize = 8.5.sp,
+                lineHeight = 12.sp,
+                modifier = Modifier.padding(top = 8.dp)
+            )
+        }
+    }
+}
+
+@Composable
+private fun RemoteLutSwitchRow(
+    title: String,
+    checked: Boolean,
+    available: Boolean?,
+    enabled: Boolean,
+    onCheckedChange: (Boolean) -> Unit
+) {
+    Row(
+        Modifier.fillMaxWidth().padding(vertical = 5.dp),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        Column(Modifier.weight(1f)) {
+            Text(title, color = Color.White, fontSize = 11.sp, fontWeight = FontWeight.Bold)
+            Text(
+                when (available) {
+                    true -> if (checked) "On" else "Off"
+                    false -> "Not available on current recorder state"
+                    null -> "State not reported yet"
+                },
+                color = Color(0xFF7F898C),
+                fontSize = 8.sp
+            )
+        }
+        Switch(
+            checked = checked,
+            onCheckedChange = onCheckedChange,
+            enabled = enabled && available != false
+        )
+    }
+}
+
+
 private fun monitorAssistSummary(zoomLevel: Int, focus: Boolean, zebra: Boolean, falseColor: Boolean, blueOnly: Boolean): String {
     val active = listOf(focus, zebra, falseColor, blueOnly).count { it }
     return when {
-        zoomLevel > 0 -> "Zoom ${if (zoomLevel == 2) "2:1" else "1:1"}${if (active > 0) " · $active active" else ""}"
+        zoomLevel > 0 -> "Zoom ${if (zoomLevel == 2) "2:1" else "1:1"}${if (active > 0) " Â· $active active" else ""}"
         active > 0 -> "$active active"
         else -> "Ready"
     }
@@ -1474,7 +3649,7 @@ private fun guidesSummary(grid: Boolean, guide: Boolean, safe: Int): String {
     if (guide) active += "Guide"
     if (safe == 1) active += "Action"
     if (safe == 2) active += "Title"
-    return active.joinToString(" Â· ").ifBlank { "Ready" }
+    return active.joinToString(" | ").ifBlank { "Ready" }
 }
 
 private fun anamorphicSummary(mode: Int): String = when (mode) {
@@ -1496,13 +3671,6 @@ private fun codecSummary(profile: Int): String = when (profile) {
     6 -> "DNx LB"; 7 -> "DNx SQ"; 8 -> "DNx HQ"; 9 -> "DNx HQX"; 10 -> "CinemaDNG"
     11 -> "ProRes RAW"; 12 -> "ProRes RAW HQ"; 13 -> "H.264 LQ"; 14 -> "H.264 MQ"; 15 -> "H.264 HQ"
     16 -> "H.265 LQ"; 17 -> "H.265 MQ"; 18 -> "H.265 HQ"; 19 -> "H.265 XQ"; else -> "Select profile"
-}
-
-private fun codecBitDepthSummary(bitDepth: Int): String = when (bitDepth) {
-    0 -> "10-bit 4:2:2"
-    1 -> "8-bit 4:2:2"
-    2 -> "8-bit 4:2:0"
-    else -> "Unknown bit depth"
 }
 
 @Composable
@@ -1746,6 +3914,7 @@ private fun RemoteMonitorAssistCard(
 ) {
     var zoomAnalogOpen by remember { mutableStateOf(false) }
 
+
     Card(
         modifier = Modifier.fillMaxWidth(),
         shape = RoundedCornerShape(18.dp),
@@ -1827,7 +3996,7 @@ private fun RemoteMonitorAssistCard(
                     )
                     if (zoomCore.capabilitiesKnown && zoomCore.supportedLevels.isNotEmpty()) {
                         Text(
-                            "Available: " + zoomCore.supportedLevels.joinToString(" · ") { zoomCore.label(it) },
+                            "Available: " + zoomCore.supportedLevels.joinToString(" Â· ") { zoomCore.label(it) },
                             color = Color(0xFF8C9699),
                             fontSize = 9.sp,
                             modifier = Modifier.padding(top = 2.dp)
@@ -1882,7 +4051,7 @@ private fun RemoteMonitorAssistCard(
             RemoteMonitorToggle(
                 "Focus Peaking",
                 focusState.enabled ?: focusAssist,
-                enabled && focusState.pendingKey != "enabled"
+                enabled
             ) { onToggle("focus-assist", it) }
 
             Text(
@@ -1902,7 +4071,7 @@ private fun RemoteMonitorAssistCard(
                     RemoteScopeChoiceButton(
                         label.uppercase(),
                         focusState.type == value,
-                        enabled && focusState.pendingKey != "type",
+                        enabled && (focusState.enabled ?: focusAssist),
                         Modifier.weight(1f)
                     ) { onFocusType(value) }
                 }
@@ -1929,7 +4098,7 @@ private fun RemoteMonitorAssistCard(
                             RemoteScopeChoiceButton(
                                 label.uppercase(),
                                 focusState.colour == value,
-                                enabled && focusState.pendingKey != "colour",
+                                enabled && (focusState.enabled ?: focusAssist),
                                 Modifier.weight(1f)
                             ) { onFocusColour(value) }
                         }
@@ -1951,14 +4120,14 @@ private fun RemoteMonitorAssistCard(
                     value = focusThresholdDraft,
                     onValueChange = { focusThresholdDraft = it },
                     onValueChangeFinished = {
-                        if (focusReportedThreshold != null) onFocusThreshold(focusThresholdDraft.toInt())
+                        onFocusThreshold(focusThresholdDraft.toInt())
                     },
                     valueRange = 0f..100f,
-                    enabled = enabled && focusReportedThreshold != null && focusState.pendingKey != "threshold",
+                    enabled = enabled && (focusState.enabled ?: focusAssist),
                     modifier = Modifier.weight(1f)
                 )
                 Text(
-                    if (focusReportedThreshold != null) "${focusThresholdDraft.toInt()}%" else "READING",
+                    "${focusThresholdDraft.toInt()}%",
                     color = if (focusReportedThreshold != null) AtomosCyan else Color(0xFF6F797C),
                     fontSize = 10.sp,
                     fontWeight = FontWeight.Black,
@@ -1974,7 +4143,7 @@ private fun RemoteMonitorAssistCard(
             RemoteMonitorToggle(
                 "Zebra",
                 zebraState.enabled ?: zebra,
-                enabled && zebraState.pendingKey != "enabled"
+                enabled
             ) { onToggle("zebra", it) }
 
             Text(
@@ -1998,14 +4167,14 @@ private fun RemoteMonitorAssistCard(
                     value = zebraThresholdDraft,
                     onValueChange = { zebraThresholdDraft = it },
                     onValueChangeFinished = {
-                        if (zebraReportedThreshold != null) onZebraThreshold(zebraThresholdDraft.toInt())
+                        onZebraThreshold(zebraThresholdDraft.toInt())
                     },
                     valueRange = 0f..100f,
-                    enabled = enabled && zebraReportedThreshold != null && zebraState.pendingKey != "threshold",
+                    enabled = enabled && (zebraState.enabled ?: zebra),
                     modifier = Modifier.weight(1f)
                 )
                 Text(
-                    if (zebraReportedThreshold != null) "${zebraThresholdDraft.toInt()}%" else "READING",
+                    "${zebraThresholdDraft.toInt()}%",
                     color = if (zebraReportedThreshold != null) AtomosCyan else Color(0xFF6F797C),
                     fontSize = 10.sp,
                     fontWeight = FontWeight.Black,
@@ -2027,13 +4196,13 @@ private fun RemoteMonitorAssistCard(
             RemoteMonitorToggle(
                 "False Colour",
                 effectsState.falseColourEnabled ?: falseColor,
-                enabled && effectsState.settingsChangeable != false && effectsState.pendingKey != "false-colour"
+                enabled && effectsState.settingsChangeable != false
             ) { onToggle("false-color", it) }
 
             RemoteMonitorToggle(
                 "Blue Only",
                 effectsState.blueOnlyEnabled ?: blueOnly,
-                enabled && effectsState.settingsChangeable != false && effectsState.pendingKey != "blue-only"
+                enabled && effectsState.settingsChangeable != false
             ) { onToggle("blue-only", it) }
 
             Text(
@@ -2293,19 +4462,19 @@ private fun RemoteZoomAnalogDialog(
                     Column(Modifier.weight(1f), horizontalAlignment = Alignment.CenterHorizontally) {
                         Text("FINE MOVE", color = Color(0xFF8F999C), fontSize = 9.sp, fontWeight = FontWeight.Bold)
                         Spacer(Modifier.height(6.dp))
-                        RemoteAnalogArrow("▲", canPan) { commit(ny = (yFraction - 0.08f).coerceAtLeast(0f)) }
+                        RemoteAnalogArrow("â–²", canPan) { commit(ny = (yFraction - 0.08f).coerceAtLeast(0f)) }
                         Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                            RemoteAnalogArrow("◀", canPan) { commit(nx = (xFraction - 0.08f).coerceAtLeast(0f)) }
-                            RemoteAnalogArrow("●", canPan) { commit(0.5f, 0.5f) }
-                            RemoteAnalogArrow("▶", canPan) { commit(nx = (xFraction + 0.08f).coerceAtMost(1f)) }
+                            RemoteAnalogArrow("â—€", canPan) { commit(nx = (xFraction - 0.08f).coerceAtLeast(0f)) }
+                            RemoteAnalogArrow("â—", canPan) { commit(0.5f, 0.5f) }
+                            RemoteAnalogArrow("â–¶", canPan) { commit(nx = (xFraction + 0.08f).coerceAtMost(1f)) }
                         }
-                        RemoteAnalogArrow("▼", canPan) { commit(ny = (yFraction + 0.08f).coerceAtMost(1f)) }
+                        RemoteAnalogArrow("â–¼", canPan) { commit(ny = (yFraction + 0.08f).coerceAtMost(1f)) }
                     }
                 }
 
                 Spacer(Modifier.height(10.dp))
                 Text(
-                    "X ${(xFraction * 100).toInt()}%  ·  Y ${(yFraction * 100).toInt()}%",
+                    "X ${(xFraction * 100).toInt()}%  Â·  Y ${(yFraction * 100).toInt()}%",
                     color = Color(0xFF778286), fontSize = 9.sp, modifier = Modifier.align(Alignment.CenterHorizontally)
                 )
             }
@@ -2720,7 +4889,7 @@ private fun RemoteGuidesCard(
             RemoteMonitorToggle(
                 "Frame Guide",
                 guideState.frameGuideEnabled ?: false,
-                enabled,
+                enabled && guideState.pendingKey != "frame-guide",
                 onFrameGuideChange
             )
 
@@ -2766,7 +4935,7 @@ private fun RemoteGuidesCard(
                                 RemoteScopeChoiceButton(
                                     label,
                                     guideState.format == value,
-                                    enabled,
+                                    enabled && guideState.pendingKey != "format",
                                     Modifier.weight(1f)
                                 ) { onFrameGuideFormat(value) }
                             }
@@ -2777,7 +4946,7 @@ private fun RemoteGuidesCard(
 
             } else {
                 Text(
-                    if (guideState.pendingKey == "frame-guide") "Turning Frame Guide on; syncing recorder..." else "Turn Frame Guide on, then choose a frame ratio below",
+                    if (guideState.pendingKey == "frame-guide") "Activating Frame Guide..." else "Turn Frame Guide on to choose a frame ratio",
                     color = Color(0xFF8C9699),
                     fontSize = 9.sp,
                     modifier = Modifier.padding(top = 4.dp, bottom = 4.dp)
@@ -2793,7 +4962,7 @@ private fun RemoteGuidesCard(
 
             if (guideState.format == 12) {
                 Text(
-                    "Custom guide detected · ratio ${guideState.customRatio ?: 13}. Custom ratio editing will be added only after the exact recorder scale is verified.",
+                    "Custom guide detected Â· ratio ${guideState.customRatio ?: 13}. Custom ratio editing will be added only after the exact recorder scale is verified.",
                     color = Color(0xFF8C9699),
                     fontSize = 8.sp,
                     lineHeight = 12.sp,
@@ -2841,7 +5010,7 @@ private fun RemoteGuidesCard(
             Text(
                 when (safeAreaMode) {
                     1 -> "Action Safe Area selected"
-                    2 -> "Title Safe Area selected · recorder should show the Title/Action double-frame state when supported by the active format"
+                    2 -> "Title Safe Area selected Â· recorder should show the Title/Action double-frame state when supported by the active format"
                     else -> "Safe Area Off"
                 },
                 color = if (safeAreaMode in 1..2) AtomosCyan else Color(0xFF747E81),
@@ -2885,7 +5054,7 @@ private fun RemoteAnamorphicCard(
             HorizontalDivider(color = Color(0xFF202628))
 
             Text(
-                "CURRENT · ${MonitorAnamorphicState.label(state.currentMode)}",
+                "CURRENT Â· ${MonitorAnamorphicState.label(state.currentMode)}",
                 color = AtomosCyan,
                 fontSize = 10.sp,
                 fontWeight = FontWeight.Black,
@@ -3146,8 +5315,6 @@ private fun RemoteCodecCard(
     profile: Int,
     bitDepth: Int,
     confirmedProfile: Pair<Int, Int>?,
-    supportedProfiles: List<Int>,
-    supportedBitDepths: List<Int>,
     onProfileChange: (Int) -> Unit,
     onBitDepthChange: (Int) -> Unit,
     onVerify: () -> Unit,
@@ -3155,14 +5322,6 @@ private fun RemoteCodecCard(
     onRestartApply: () -> Unit = {}
 ) {
     var showRestartConfirm by remember { mutableStateOf(false) }
-    fun profileAvailable(id: Int): Boolean = supportedProfiles.isEmpty() || id in supportedProfiles
-    fun bitDepthAvailable(id: Int): Boolean = supportedBitDepths.isEmpty() || id in supportedBitDepths
-    val recorderStateReady = confirmedProfile != null
-    // R16.8 CURRENT-FIRST: do not let the Android draft invent recorder
-    // state. The user can edit/apply only after the official macOS state pair
-    // RecordPage(0x0643) + InputOutputSummary(0x0648) has produced a current
-    // codec + bit-depth tuple.
-    val editEnabled = enabled && recorderStateReady
     val family = when (profile) {
         in 1..5 -> "ProRes"
         in 6..9 -> "DNxHD"
@@ -3172,7 +5331,6 @@ private fun RemoteCodecCard(
         12 -> "ProRes RAW"
         else -> "ProRes"
     }
-    val proResDepthLocked = family == "ProRes"
 
     fun selectProfile(id: Int) {
         onProfileChange(id)
@@ -3210,24 +5368,18 @@ private fun RemoteCodecCard(
             Divider(color = Color(0xFF202628))
             Spacer(Modifier.height(10.dp))
 
-            if (!recorderStateReady) {
-                Text(
-                    "SYNC CURRENT FROM RECORDER first. Codec, compression and bit depth stay locked until recorder state is read successfully.",
-                    color = Color(0xFF9AA3A6), fontSize = 9.sp, lineHeight = 13.sp, modifier = Modifier.padding(bottom = 10.dp)
-                )
-            }
             Text("CODEC", color = Color(0xFF687174), fontSize = 8.sp, fontWeight = FontWeight.Bold, letterSpacing = 0.8.sp)
             Spacer(Modifier.height(7.dp))
             Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                RemoteScopeChoiceButton("ProRes", family == "ProRes", editEnabled, Modifier.weight(1f)) { selectFamily("ProRes") }
-                RemoteScopeChoiceButton("DNxHD", family == "DNxHD", editEnabled, Modifier.weight(1f)) { selectFamily("DNxHD") }
-                RemoteScopeChoiceButton("CinemaDNG", family == "CinemaDNG", editEnabled, Modifier.weight(1f)) { selectFamily("CinemaDNG") }
+                RemoteScopeChoiceButton("ProRes", family == "ProRes", enabled, Modifier.weight(1f)) { selectFamily("ProRes") }
+                RemoteScopeChoiceButton("DNxHD", family == "DNxHD", enabled, Modifier.weight(1f)) { selectFamily("DNxHD") }
+                RemoteScopeChoiceButton("CinemaDNG", family == "CinemaDNG", enabled, Modifier.weight(1f)) { selectFamily("CinemaDNG") }
             }
             Spacer(Modifier.height(6.dp))
             Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                RemoteScopeChoiceButton("H.264", family == "H.264", editEnabled, Modifier.weight(1f)) { selectFamily("H.264") }
-                RemoteScopeChoiceButton("H.265", family == "H.265", editEnabled, Modifier.weight(1f)) { selectFamily("H.265") }
-                RemoteScopeChoiceButton("ProRes RAW", family == "ProRes RAW", editEnabled, Modifier.weight(1f)) { selectFamily("ProRes RAW") }
+                RemoteScopeChoiceButton("H.264", family == "H.264", enabled, Modifier.weight(1f)) { selectFamily("H.264") }
+                RemoteScopeChoiceButton("H.265", family == "H.265", enabled, Modifier.weight(1f)) { selectFamily("H.265") }
+                RemoteScopeChoiceButton("ProRes RAW", family == "ProRes RAW", enabled, Modifier.weight(1f)) { selectFamily("ProRes RAW") }
             }
 
             Spacer(Modifier.height(13.dp))
@@ -3236,41 +5388,41 @@ private fun RemoteCodecCard(
             when (family) {
                 "ProRes" -> {
                     Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                        RemoteScopeChoiceButton("Proxy", profile == 1, editEnabled && profileAvailable(1), Modifier.weight(1f)) { selectProfile(1) }
-                        RemoteScopeChoiceButton("LT", profile == 2, editEnabled && profileAvailable(2), Modifier.weight(1f)) { selectProfile(2) }
-                        RemoteScopeChoiceButton("422", profile == 3, editEnabled && profileAvailable(3), Modifier.weight(1f)) { selectProfile(3) }
+                        RemoteScopeChoiceButton("Proxy", profile == 1, enabled, Modifier.weight(1f)) { selectProfile(1) }
+                        RemoteScopeChoiceButton("LT", profile == 2, enabled, Modifier.weight(1f)) { selectProfile(2) }
+                        RemoteScopeChoiceButton("422", profile == 3, enabled, Modifier.weight(1f)) { selectProfile(3) }
                     }
                     Spacer(Modifier.height(6.dp))
                     Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                        RemoteScopeChoiceButton("HQ", profile == 4, editEnabled && profileAvailable(4), Modifier.weight(1f)) { selectProfile(4) }
-                        RemoteScopeChoiceButton("4444", profile == 5, editEnabled && profileAvailable(5), Modifier.weight(1f)) { selectProfile(5) }
+                        RemoteScopeChoiceButton("HQ", profile == 4, enabled, Modifier.weight(1f)) { selectProfile(4) }
+                        RemoteScopeChoiceButton("4444", profile == 5, enabled, Modifier.weight(1f)) { selectProfile(5) }
                         Spacer(Modifier.weight(1f))
                     }
                 }
                 "DNxHD" -> Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                    RemoteScopeChoiceButton("LB", profile == 6, editEnabled && profileAvailable(6), Modifier.weight(1f)) { selectProfile(6) }
-                    RemoteScopeChoiceButton("SQ", profile == 7, editEnabled && profileAvailable(7), Modifier.weight(1f)) { selectProfile(7) }
-                    RemoteScopeChoiceButton("HQ", profile == 8, editEnabled && profileAvailable(8), Modifier.weight(1f)) { selectProfile(8) }
-                    RemoteScopeChoiceButton("HQX", profile == 9, editEnabled && profileAvailable(9), Modifier.weight(1f)) { selectProfile(9) }
+                    RemoteScopeChoiceButton("LB", profile == 6, enabled, Modifier.weight(1f)) { selectProfile(6) }
+                    RemoteScopeChoiceButton("SQ", profile == 7, enabled, Modifier.weight(1f)) { selectProfile(7) }
+                    RemoteScopeChoiceButton("HQ", profile == 8, enabled, Modifier.weight(1f)) { selectProfile(8) }
+                    RemoteScopeChoiceButton("HQX", profile == 9, enabled, Modifier.weight(1f)) { selectProfile(9) }
                 }
                 "CinemaDNG" -> Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                    RemoteScopeChoiceButton("CinemaDNG", profile == 10, editEnabled && profileAvailable(10), Modifier.weight(1f)) { selectProfile(10) }
+                    RemoteScopeChoiceButton("CinemaDNG", profile == 10, enabled, Modifier.weight(1f)) { selectProfile(10) }
                     Spacer(Modifier.weight(3f))
                 }
                 "H.264" -> Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                    RemoteScopeChoiceButton("LQ", profile == 13, editEnabled && profileAvailable(13), Modifier.weight(1f)) { selectProfile(13) }
-                    RemoteScopeChoiceButton("MQ", profile == 14, editEnabled && profileAvailable(14), Modifier.weight(1f)) { selectProfile(14) }
-                    RemoteScopeChoiceButton("HQ", profile == 15, editEnabled && profileAvailable(15), Modifier.weight(1f)) { selectProfile(15) }
+                    RemoteScopeChoiceButton("LQ", profile == 13, enabled, Modifier.weight(1f)) { selectProfile(13) }
+                    RemoteScopeChoiceButton("MQ", profile == 14, enabled, Modifier.weight(1f)) { selectProfile(14) }
+                    RemoteScopeChoiceButton("HQ", profile == 15, enabled, Modifier.weight(1f)) { selectProfile(15) }
                     Spacer(Modifier.weight(1f))
                 }
                 "H.265" -> Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                    RemoteScopeChoiceButton("LQ", profile == 16, editEnabled && profileAvailable(16), Modifier.weight(1f)) { selectProfile(16) }
-                    RemoteScopeChoiceButton("MQ", profile == 17, editEnabled && profileAvailable(17), Modifier.weight(1f)) { selectProfile(17) }
-                    RemoteScopeChoiceButton("HQ", profile == 18, editEnabled && profileAvailable(18), Modifier.weight(1f)) { selectProfile(18) }
-                    RemoteScopeChoiceButton("XQ", profile == 19, editEnabled && profileAvailable(19), Modifier.weight(1f)) { selectProfile(19) }
+                    RemoteScopeChoiceButton("LQ", profile == 16, enabled, Modifier.weight(1f)) { selectProfile(16) }
+                    RemoteScopeChoiceButton("MQ", profile == 17, enabled, Modifier.weight(1f)) { selectProfile(17) }
+                    RemoteScopeChoiceButton("HQ", profile == 18, enabled, Modifier.weight(1f)) { selectProfile(18) }
+                    RemoteScopeChoiceButton("XQ", profile == 19, enabled, Modifier.weight(1f)) { selectProfile(19) }
                 }
                 else -> Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                    RemoteScopeChoiceButton("RAW HQ", profile == 12, editEnabled && profileAvailable(12), Modifier.weight(1f)) { selectProfile(12) }
+                    RemoteScopeChoiceButton("RAW HQ", profile == 12, enabled, Modifier.weight(1f)) { selectProfile(12) }
                     Spacer(Modifier.weight(3f))
                 }
             }
@@ -3279,22 +5431,9 @@ private fun RemoteCodecCard(
             Text("BIT DEPTH / CHROMA", color = Color(0xFF687174), fontSize = 8.sp, fontWeight = FontWeight.Bold, letterSpacing = 0.8.sp)
             Spacer(Modifier.height(7.dp))
             Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                RemoteScopeChoiceButton("10b 4:2:2", bitDepth == 0, editEnabled && bitDepthAvailable(0), Modifier.weight(1f)) { onBitDepthChange(0) }
-                RemoteScopeChoiceButton("8b 4:2:2", bitDepth == 1, editEnabled && !proResDepthLocked && bitDepthAvailable(1), Modifier.weight(1f)) { onBitDepthChange(1) }
-                RemoteScopeChoiceButton("8b 4:2:0", bitDepth == 2, editEnabled && !proResDepthLocked && bitDepthAvailable(2), Modifier.weight(1f)) { onBitDepthChange(2) }
-            }
-            if (proResDepthLocked) {
-                Text("ProRes profile changes use the official macOS recorder-managed codec tuple; the wire setter carries its codec-depth sentinel automatically.", color = Color(0xFF687174), fontSize = 8.sp, modifier = Modifier.padding(top = 6.dp))
-            }
-
-            Spacer(Modifier.height(10.dp))
-            if (supportedProfiles.isNotEmpty() || supportedBitDepths.isNotEmpty()) {
-                val supportedCodecText = if (supportedProfiles.isEmpty()) "waiting" else supportedProfiles.joinToString { codecSummary(it) }
-                val supportedDepthText = if (supportedBitDepths.isEmpty()) "waiting" else supportedBitDepths.joinToString { codecBitDepthSummary(it) }
-                Text(
-                    "Recorder supported: $supportedCodecText · $supportedDepthText",
-                    color = Color(0xFF687174), fontSize = 8.sp, lineHeight = 11.sp
-                )
+                RemoteScopeChoiceButton("10b 4:2:2", bitDepth == 0, enabled, Modifier.weight(1f)) { onBitDepthChange(0) }
+                RemoteScopeChoiceButton("8b 4:2:2", bitDepth == 1, enabled, Modifier.weight(1f)) { onBitDepthChange(1) }
+                RemoteScopeChoiceButton("8b 4:2:0", bitDepth == 2, enabled, Modifier.weight(1f)) { onBitDepthChange(2) }
             }
 
             Spacer(Modifier.height(13.dp))
@@ -3310,7 +5449,7 @@ private fun RemoteCodecCard(
                     Column(Modifier.weight(1f)) {
                         Text("RECORDER READBACK", color = Color(0xFF687174), fontSize = 8.sp, fontWeight = FontWeight.Bold)
                         Text(
-                            confirmedProfile?.let { "${codecSummary(it.first)} · ${codecBitDepthSummary(it.second)}" } ?: "Waiting for recorder state",
+                            confirmedProfile?.let { codecSummary(it.first) } ?: "Waiting for recorder state",
                             color = if (confirmedProfile != null) Color(0xFFC4CBCE) else Color(0xFF7A8386),
                             fontSize = 10.sp,
                             fontWeight = FontWeight.Bold,
@@ -3326,21 +5465,21 @@ private fun RemoteCodecCard(
             Spacer(Modifier.height(10.dp))
             OutlinedButton(
                 onClick = onVerify,
-                enabled = enabled,
+                enabled = enabled && profile in 1..19,
                 modifier = Modifier.fillMaxWidth().height(44.dp),
                 shape = RoundedCornerShape(12.dp)
             ) {
-                Text("SYNC CURRENT FROM RECORDER", fontSize = 10.sp, fontWeight = FontWeight.Bold)
+                Text("VERIFY CURRENT SELECTION", fontSize = 10.sp, fontWeight = FontWeight.Bold)
             }
             Text(
-                "Reads the official macOS current-state pair: RecordPage 0x0643 + InputOutputSummary 0x0648. Apply remains locked until both pages produce recorder state.",
+                "Codec enum/raw mapping is recovered from the latest macOS SwiftProtobuf metadata. VERIFY uses the exact mapped codec + bit-depth tuple.",
                 color = Color(0xFF687174), fontSize = 9.sp, lineHeight = 13.sp, modifier = Modifier.padding(top = 6.dp)
             )
 
             Spacer(Modifier.height(10.dp))
             Button(
                 onClick = onApply,
-                enabled = editEnabled && recorderStateReady && profile in 1..19 && profile != 11 && bitDepth in 0..2,
+                enabled = enabled && profile in 1..19,
                 modifier = Modifier.fillMaxWidth().height(50.dp),
                 shape = RoundedCornerShape(12.dp),
                 colors = ButtonDefaults.buttonColors(
@@ -3353,14 +5492,14 @@ private fun RemoteCodecCard(
                 Text("APPLY CODEC", fontSize = 11.sp, fontWeight = FontWeight.Black, letterSpacing = 0.7.sp)
             }
             Text(
-                "Normal Apply uses macOS NonRebootCodecProfileSet 0x013F. Recorder state, not the draft button, decides when the change is confirmed.",
+                "Normal Apply uses macOS NonRebootCodecProfileSet 0x013F with the recovered raw codec enum. A separate 0x013A tuple readback confirms the result.",
                 color = Color(0xFF687174), fontSize = 9.sp, lineHeight = 13.sp, modifier = Modifier.padding(top = 8.dp)
             )
 
             Spacer(Modifier.height(8.dp))
             OutlinedButton(
                 onClick = { showRestartConfirm = true },
-                enabled = editEnabled && profile in 1..19 && profile != 11 && bitDepth in 0..2,
+                enabled = enabled && profile in 1..19,
                 modifier = Modifier.fillMaxWidth().height(46.dp),
                 shape = RoundedCornerShape(12.dp)
             ) {
@@ -3700,29 +5839,34 @@ private fun ModuleShell(
         gattState.startsWith("error:") || gattState.startsWith("service-error:")
     val linked = pairing.acceptWritten && remote.available && !hardDisconnected
 
+    val pageBody: @Composable ColumnScope.() -> Unit = {
+        ModulePageHero(title = title, recorder = subtitle, current = current, linked = linked)
+        ModuleSessionStrip(
+            linked = linked,
+            statePages = stateSnapshot.receivedPages,
+            expectedStatePages = stateSnapshot.expectedPages,
+            stateComplete = stateSnapshot.cycleComplete
+        )
+        content()
+        Text(
+            "Only recorder-backed state and existing controls are shown. Unsupported values remain unavailable.",
+            color = Color(0xFF586C71),
+            fontSize = 8.5.sp,
+            lineHeight = 12.sp,
+            modifier = Modifier.padding(horizontal = 4.dp, vertical = 4.dp)
+        )
+    }
+
     if (LocalConnectedModuleEmbedded.current) {
         Column(
             Modifier
                 .fillMaxSize()
-                .background(Color(0xFF07090A))
+                .background(Color(0xFF02090C))
                 .verticalScroll(rememberScrollState())
-                .padding(horizontal = 16.dp, vertical = 12.dp),
+                .padding(horizontal = 14.dp, vertical = 12.dp),
             verticalArrangement = Arrangement.spacedBy(10.dp)
         ) {
-            ModuleSessionStrip(
-                linked = linked,
-                statePages = stateSnapshot.receivedPages,
-                expectedStatePages = stateSnapshot.expectedPages,
-                stateComplete = stateSnapshot.cycleComplete
-            )
-            content()
-            Text(
-                "Available controls and values depend on the connected recorder and firmware.",
-                color = Color(0xFF596266),
-                fontSize = 9.sp,
-                lineHeight = 13.sp,
-                modifier = Modifier.padding(horizontal = 4.dp, vertical = 4.dp)
-            )
+            pageBody()
         }
         return
     }
@@ -3731,38 +5875,77 @@ private fun ModuleShell(
     Column(
         Modifier
             .fillMaxSize()
-            .background(Color(0xFF07090A))
+            .background(Color(0xFF02090C))
             .navigationBarsPadding()
     ) {
-        AppHeader(
-            title = title,
-            subtitle = subtitle,
-            onBack = { vm.go(AtomosViewModel.Screen.REMOTE) }
-        )
+        AppHeader(title = title, subtitle = subtitle, onBack = { vm.go(AtomosViewModel.Screen.REMOTE) })
         Column(
             Modifier
                 .weight(1f)
                 .fillMaxWidth()
                 .verticalScroll(rememberScrollState())
-                .padding(horizontal = 16.dp, vertical = 12.dp),
+                .padding(horizontal = 14.dp, vertical = 12.dp),
             verticalArrangement = Arrangement.spacedBy(10.dp)
         ) {
-            ModuleSessionStrip(
-                linked = linked,
-                statePages = stateSnapshot.receivedPages,
-                expectedStatePages = stateSnapshot.expectedPages,
-                stateComplete = stateSnapshot.cycleComplete
-            )
-            content()
-            Text(
-                "Available controls and values depend on the connected recorder and firmware.",
-                color = Color(0xFF596266),
-                fontSize = 9.sp,
-                lineHeight = 13.sp,
-                modifier = Modifier.padding(horizontal = 4.dp, vertical = 4.dp)
-            )
+            pageBody()
         }
         RemoteModuleNavBar(vm = vm, current = current)
+    }
+}
+
+@Composable
+private fun ModulePageHero(
+    title: String,
+    recorder: String,
+    current: AtomosViewModel.Screen,
+    linked: Boolean
+) {
+    val code = when (current) {
+        AtomosViewModel.Screen.INPUT -> "IN"
+        AtomosViewModel.Screen.AUDIO -> "AU"
+        AtomosViewModel.Screen.MEDIA -> "MD"
+        AtomosViewModel.Screen.OUTPUT -> "OUT"
+        AtomosViewModel.Screen.SETTINGS -> "SET"
+        else -> "AR"
+    }
+    val description = when (current) {
+        AtomosViewModel.Screen.INPUT -> "Source, signal, HDR and recorder input state"
+        AtomosViewModel.Screen.AUDIO -> "Recorder-backed audio routing and channel state"
+        AtomosViewModel.Screen.MEDIA -> "Recording media and recorder storage state"
+        AtomosViewModel.Screen.OUTPUT -> "Recorder output signal and supported output state"
+        AtomosViewModel.Screen.SETTINGS -> "Recorder identity, synchronization and device settings"
+        else -> "Recorder module"
+    }
+
+    Surface(
+        modifier = Modifier.fillMaxWidth(),
+        shape = RoundedCornerShape(18.dp),
+        color = Color(0xFF051519),
+        border = androidx.compose.foundation.BorderStroke(1.dp, AtomosCyan.copy(alpha = 0.48f))
+    ) {
+        Row(Modifier.fillMaxWidth().padding(14.dp), verticalAlignment = Alignment.CenterVertically) {
+            Box(
+                Modifier
+                    .size(44.dp)
+                    .background(Color(0xFF08272C), RoundedCornerShape(12.dp))
+                    .border(1.dp, AtomosCyan.copy(alpha = 0.55f), RoundedCornerShape(12.dp)),
+                contentAlignment = Alignment.Center
+            ) {
+                Text(code, color = AtomosCyan, fontSize = 10.sp, fontWeight = FontWeight.Black)
+            }
+            Spacer(Modifier.width(11.dp))
+            Column(Modifier.weight(1f)) {
+                Text(title.uppercase(), color = AtomosCyan, fontSize = 8.5.sp, fontWeight = FontWeight.Black, letterSpacing = 0.9.sp)
+                Text(description, color = Color.White, fontSize = 12.sp, fontWeight = FontWeight.Bold)
+                Text(recorder, color = Color(0xFF667C81), fontSize = 8.5.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
+            }
+            Text(
+                if (linked) "LIVE" else "WAIT",
+                color = if (linked) Color(0xFF57E8BE) else Color(0xFF89979A),
+                fontSize = 8.sp,
+                fontWeight = FontWeight.Black
+            )
+        }
     }
 }
 
@@ -3776,8 +5959,8 @@ private fun ModuleSessionStrip(
     Surface(
         modifier = Modifier.fillMaxWidth(),
         shape = RoundedCornerShape(14.dp),
-        color = Color(0xFF0D1113),
-        border = androidx.compose.foundation.BorderStroke(1.dp, Color(0xFF20272A))
+        color = Color(0xFF071317),
+        border = androidx.compose.foundation.BorderStroke(1.dp, Color(0xFF19383F))
     ) {
         Row(
             Modifier.fillMaxWidth().padding(horizontal = 13.dp, vertical = 10.dp),
@@ -3818,15 +6001,20 @@ private fun ModuleSection(
 ) {
     Card(
         modifier = Modifier.fillMaxWidth(),
-        shape = RoundedCornerShape(18.dp),
-        colors = CardDefaults.cardColors(containerColor = Color(0xFF0F1315))
+        shape = RoundedCornerShape(16.dp),
+        colors = CardDefaults.cardColors(containerColor = Color(0xFF071216)),
+        border = androidx.compose.foundation.BorderStroke(1.dp, Color(0xFF1A353C))
     ) {
         Column(Modifier.padding(14.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-            Text(title, color = Color(0xFFE9EDEE), fontSize = 14.sp, fontWeight = FontWeight.ExtraBold)
-            if (subtitle != null) {
-                Text(subtitle, color = Color(0xFF7D878A), fontSize = 9.sp, lineHeight = 13.sp)
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Box(Modifier.width(3.dp).height(22.dp).background(AtomosCyan, RoundedCornerShape(99.dp)))
+                Spacer(Modifier.width(9.dp))
+                Text(title, color = Color.White, fontSize = 13.sp, fontWeight = FontWeight.ExtraBold)
             }
-            Divider(color = Color(0xFF202628))
+            if (subtitle != null) {
+                Text(subtitle, color = Color(0xFF758B90), fontSize = 9.sp, lineHeight = 13.sp)
+            }
+            Divider(color = Color(0xFF173238))
             content()
         }
     }
@@ -3839,20 +6027,25 @@ private fun ModuleValueRow(label: String, value: String, accent: Boolean = false
         value.startsWith("Awaiting", ignoreCase = true) ||
         value == "Not active" || value == "None"
     Row(
-        Modifier.fillMaxWidth().padding(vertical = 2.dp),
-        horizontalArrangement = Arrangement.spacedBy(12.dp),
+        Modifier
+            .fillMaxWidth()
+            .background(Color(0xFF09171B), RoundedCornerShape(10.dp))
+            .padding(horizontal = 10.dp, vertical = 9.dp),
+        horizontalArrangement = Arrangement.spacedBy(10.dp),
         verticalAlignment = Alignment.CenterVertically
     ) {
-        Text(label, color = Color(0xFF7F898C), fontSize = 10.sp, modifier = Modifier.weight(0.44f))
+        Text(label, color = Color(0xFF7D9297), fontSize = 9.5.sp, modifier = Modifier.weight(0.44f))
         Text(
             value,
             color = when {
                 accent -> AtomosCyan
-                pending -> Color(0xFF747E81)
-                else -> Color(0xFFC8CFD1)
+                pending -> Color(0xFF6F8085)
+                else -> Color(0xFFDCE5E6)
             },
-            fontSize = 10.sp,
-            fontWeight = if (accent) FontWeight.Bold else FontWeight.SemiBold,
+            fontSize = 9.5.sp,
+            fontWeight = if (accent) FontWeight.ExtraBold else FontWeight.SemiBold,
+            maxLines = 3,
+            overflow = TextOverflow.Ellipsis,
             modifier = Modifier.weight(0.56f)
         )
     }
@@ -3896,13 +6089,13 @@ private fun semanticHdrState(raw:String?):String {
     return when(id){
         0 -> "Off"
         1 -> "On"
-        else -> raw.substringBefore(" · raw ").substringBefore(" Ã‚Â· raw ").ifBlank { "Not reported" }
+        else -> raw.substringBefore(" Â· raw ").substringBefore(" Ãƒâ€š| raw ").ifBlank { "Not reported" }
     }
 }
 
 private fun semanticDeviceName(raw:String?, fallback:String):String {
     if (raw.isNullOrBlank()) return fallback
-    val parts = raw.split(" · ", " Ã‚Â· ")
+    val parts = raw.split(" Â· ", " Ãƒâ€š| ")
     val printable = parts.firstOrNull { part ->
         part.isNotBlank() &&
         !part.startsWith("type 0x", ignoreCase=true) &&
@@ -3912,6 +6105,7 @@ private fun semanticDeviceName(raw:String?, fallback:String):String {
     return printable?.trim()?.takeIf { it.isNotBlank() } ?: fallback
 }
 
+@OptIn(ExperimentalMaterial3Api::class)
 @Composable
 private fun InputModuleScreen(vm: AtomosViewModel) {
     DisposableEffect(Unit) {
@@ -3950,6 +6144,16 @@ private fun InputModuleScreen(vm: AtomosViewModel) {
             // Fallback only if the connect-time prefetch was delayed. This call
             // is session-idempotent and does nothing when the snapshot is ready.
             vm.ensureInputSessionSnapshot("input-tab-fallback")
+        }
+    }
+
+    // INPUT18: temporary UI-only transition loader; never fabricates GATT data.
+    var input18EntryLoader by remember(selected?.address) { mutableStateOf(true) }
+    LaunchedEffect(ready, selected?.address) {
+        input18EntryLoader = true
+        if (ready) {
+            delay(2400L)
+            input18EntryLoader = false
         }
     }
 
@@ -4050,463 +6254,159 @@ private fun InputModuleScreen(vm: AtomosViewModel) {
     val finalRawInput = InputFinalPresenter.current(extendedView.rawInput)
     val finalCameraMetadata = InputFinalPresenter.current(extendedView.cameraMetadata)
 
-    // AGENT7 20.03.5.3 CONSOLIDATED FROZEN INPUT\n    // 20.03.5.0 semantic display + 20.03.5.1 menu/cache + 20.03.5.2 frozen-core correction.
-    // Keep the official Input menu families permanently visible at the top.
-    // Switching these inner tabs is Compose-local only and never touches BLE.
-    var inputPage by remember { mutableStateOf("Source") }
-    val pages = listOf("Source", "Image", "Record Trigger", "SDI")
-
+    // INPUT UI REDESIGN ONLY: all device state and setters are supplied by the unchanged VM.
+    // Do not optimistically overwrite recorder readback when an option is selected.
+    var inputSheet by remember { mutableStateOf<String?>(null) }
+    // INPUT05C.1: Background GET collectors do not disable Input option sheets.
+    // A real pending SET still blocks conflicting writes until confirmed/failed.
+    val canEdit = ready && !inputSetter.busy
+    val unknown = "Not reported by recorder"
+    fun clean(v: String): String = if (v.isBlank() || v == unknown || v == "Not reported") "Not available" else v
+    val rows = listOf(
+        Triple("Input Source", clean(source), "source"),
+        Triple("Source Name", clean(signalView.format), "signal"),
+        Triple("Input Range", clean(finalInputRange.text), "range"),
+        Triple("HDR", clean(hdrView.hdr), "hdr"),
+        Triple("Record Trigger", clean(finalTriggerEnabled.text), "trigger"),
+        Triple("Device Name", clean(deviceName), "device"),
+        Triple("HDMI Standard", clean(finalHdmiStandard.text), "hdmi"),
+        Triple("Image / Camera", clean(finalCamera.text), "camera"),
+        Triple("Gamma", clean(finalGamma.text), "gamma"),
+        Triple("Gamut", clean(finalGamut.text), "gamut"),
+        Triple("SDI Input", clean(finalActiveSdi.text), "sdi"),
+        Triple("RAW Input", clean(finalRawInput.text), "raw"),
+        Triple("Camera Metadata", clean(finalCameraMetadata.text), "metadata")
+    )
     ModuleShell(
         vm = vm,
         current = AtomosViewModel.Screen.INPUT,
         title = "Input",
         subtitle = recorderName
     ) {
-        if (inputPreparing) {
-            ModuleSection("Input Status", null) {
-            ModuleValueRow(
-                "Status",
-                when {
-                    inputSession.ready && !collector.running && !extendedInput.running -> "Ready"
-                    inputPreparing -> "Refreshing recorder settings... existing values remain visible"
-                    ready -> "Refreshing recorder settings..."
-                    else -> "Recorder not connected"
-                },
-                accent = inputSession.ready
+        // INPUT18: one Input-only status for core and details.
+        Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+            Text("INPUT STATUS", color = Color(0xFF8B9497), fontSize = 10.sp, fontWeight = FontWeight.Bold)
+            Spacer(Modifier.weight(1f))
+            Text(
+                if (!ready) "CONNECTING" else
+                    "${collector.inputResponses}/${collector.inputExpected}  ·  ${extendedInput.completed}/${extendedInput.expected} details" +
+                        if (collector.running || extendedInput.running || inputPreparing) "  ·  SYNCING" else "  ·  READY",
+                color = if (ready) AtomosCyan else Color(0xFF93A6AA),
+                fontSize = 11.sp, fontWeight = FontWeight.SemiBold
             )
-            OutlinedButton(
-                onClick = { vm.refreshInputSessionSnapshotFromUi() },
-                enabled = ready && !collector.running && !extendedInput.running && !inputSetter.busy,
-                modifier = Modifier.fillMaxWidth(),
-                shape = RoundedCornerShape(11.dp),
-                border = androidx.compose.foundation.BorderStroke(1.dp, Color(0xFF314044))
+        }
+        if (ready && input18EntryLoader) {
+            RecorderSettingsLoader("Loading Input settings", "Syncing Source, HDR and Details")
+        }
+        // No additional reads on row taps. Prefetch/cached states remain unchanged.
+        if (!ready) {
+            Text("Recorder not connected", color = Color(0xFF9CAFB4), fontSize = 12.sp)
+        } else if (inputPreparing) {
+            Text("Syncing recorder values · showing available readings", color = Color(0xFF93A6AA), fontSize = 11.sp)
+        }
+        if (!input18EntryLoader) rows.forEachIndexed { index, entry ->
+            val (label, value, key) = entry
+            Row(
+                Modifier.fillMaxWidth()
+                    .padding(bottom = 7.dp)
+                    .border(
+                        width = if (index == 0) 1.5.dp else 1.dp,
+                        color = if (index == 0) AtomosCyan else Color(0xFF30474E),
+                        shape = RoundedCornerShape(12.dp)
+                    )
+                    .background(Color(0xFF06161B), RoundedCornerShape(12.dp))
+                    .clickable { inputSheet = key }
+                    .padding(horizontal = 16.dp, vertical = 18.dp),
+                verticalAlignment = Alignment.CenterVertically
             ) {
-                Text(
-                    "REFRESH",
-                    fontSize = 9.sp,
-                    fontWeight = FontWeight.Black
-                )
+                Text("◇", color = AtomosCyan, fontSize = 21.sp)
+                Spacer(Modifier.width(15.dp))
+                Text(label, color = Color.White, fontSize = 14.sp, fontWeight = FontWeight.SemiBold,
+                    modifier = Modifier.weight(1f))
+                Text(value, color = if (index == 0) AtomosCyan else Color(0xFFCBD8DC),
+                    fontSize = 12.sp, maxLines = 1, overflow = TextOverflow.Ellipsis,
+                    modifier = Modifier.widthIn(max = 150.dp))
+                Spacer(Modifier.width(10.dp))
+                Text("›", color = Color.White, fontSize = 24.sp)
             }
         }
+        // Manual user refresh is explicit: no duplicated auto-polling from this UI.
+        TextButton(
+            onClick = { vm.refreshInputSessionSnapshotFromUi() },
+            enabled = canEdit,
+            modifier = Modifier.fillMaxWidth()
+        ) { Text("Refresh input readings", color = AtomosCyan, fontSize = 12.sp) }
+    }
 
-        ModuleSection(
-            "Input Status",
-            "Live recorder values from the official RemoteApi read path."
+    if (inputSheet != null) {
+        val key = inputSheet!!
+        val row = rows.firstOrNull { it.third == key }
+        val options: List<InputEditCatalog.Option> = when (key) {
+            "source" -> InputEditCatalog.sourceOptions
+            "range" -> InputEditCatalog.inputRangeOptions
+            "hdr" -> listOf(InputEditCatalog.Option(0, "Off"), InputEditCatalog.Option(1, "On"))
+            "trigger" -> listOf(InputEditCatalog.Option(0, "Off"), InputEditCatalog.Option(1, "On"))
+            "hdmi" -> InputEditCatalog.hdmiStandardOptions
+            "camera" -> InputEditCatalog.hdrCameraOptions
+            "gamma" -> InputEditCatalog.hdrGammaOptions
+            "gamut" -> InputEditCatalog.hdrGamutOptions
+            "sdi" -> InputEditCatalog.sdiSourceOptions
+            else -> emptyList()
+        }
+        val permitted = when (key) {
+            "hdmi" -> canEdit && source.contains("HDMI", ignoreCase = true)
+            "hdr" -> canEdit && hdrView.control == "Available"
+            else -> canEdit
+        }
+        ModalBottomSheet(
+            onDismissRequest = { inputSheet = null },
+            containerColor = Color(0xFF06161B),
+            contentColor = Color.White
         ) {
-            ModuleValueRow("Connection", if (ready) "Connected" else "Waiting for recorder", accent = ready)
-            ModuleValueRow("Source", source, accent = source != "Not reported")
-            ModuleValueRow("HDR", hdrState, accent = hdrState != "Not reported")
-            ModuleValueRow("Device", deviceName, accent = deviceName != "Not reported")
-            ModuleValueRow(
-                "Readback",
-                if (collector.running) {
-                    "Reading ${collector.inputResponses}/${collector.inputExpected}"
-                } else if (collector.inputExpected > 0) {
-                    "${collector.inputResponses}/${collector.inputExpected} confirmed"
+            Column(Modifier.fillMaxWidth().padding(start = 20.dp, end = 20.dp, bottom = 28.dp)) {
+                Text(row?.first ?: "Input", color = Color.White,
+                    fontSize = 19.sp, fontWeight = FontWeight.Bold)
+                Spacer(Modifier.height(6.dp))
+                Text("Current: ${row?.second ?: "Not available"}", color = AtomosCyan, fontSize = 12.sp)
+                Spacer(Modifier.height(14.dp))
+                if (options.isEmpty()) {
+                    Text("Recorder information (read-only)", color = Color(0xFFB0C2C6), fontSize = 13.sp)
                 } else {
-                    "Not read yet"
-                },
-                accent = collector.inputResponses >= 3
-            )
-
-                    }
-
-        ModuleSection("Recorder", null) {
-            ModuleValueRow(
-                "Model",
-                recorderName,
-                accent = recorderName != "ATOMOS Recorder"
-            )
-            if (
-                identityView.deviceName.isNotBlank() &&
-                identityView.deviceName != recorderName &&
-                identityView.deviceName.length > 3 &&
-                !identityView.deviceName.equals("Unknown", true)
-            ) {
-                ModuleValueRow("Device Name", identityView.deviceName)
-            }
-        }
-
-        ModuleSection(
-            "HDR",
-            "HDR state is read-only in this batch. No HDR setter is sent."
-        ) {
-            ModuleValueRow("HDR", hdrView.hdr, accent = hdrView.confirmed)
-            ModuleValueRow(
-                "HDR Control",
-                hdrView.control,
-                accent = hdrView.control == "Available"
-            )
-            ModuleValueRow(
-                "HDR Auto",
-                hdrAutoValue,
-                accent = hdrAutoValue != "Not reported by recorder"
-            )
-            ModuleValueRow(
-                "Camera",
-                hdrCamera,
-                accent = hdrCamera != "Not reported by recorder"
-            )
-        }
-
-        ModuleSection(
-            "Current Signal + Input Format",
-            "Read-only existing recorder snapshot. Opening Input or changing an Input panel sends no new PacketLink command."
-        ) {
-            ModuleValueRow(
-                "Signal / Format",
-                signalView.format,
-                accent = signalView.available
-            )
-        }
-
-        ModuleSection(
-            "Synchronization",
-            "Input state loads once per recorder session and remains cached while you navigate the app. Sync Again is optional."
-        ) {
-            Button(
-                onClick = {
-                    vm.invalidateInputAutoSyncCache()
-                    vm.refreshInputSessionSnapshotFromUi()
-                },
-                enabled = ready && !collector.running && !extendedInput.running && !inputSetter.busy,
-                modifier = Modifier.fillMaxWidth().height(40.dp),
-                shape = RoundedCornerShape(12.dp),
-                colors = ButtonDefaults.buttonColors(
-                    containerColor = Color(0xFF223438),
-                    contentColor = AtomosCyan,
-                    disabledContainerColor = Color(0xFF1A2426),
-                    disabledContentColor = Color(0xFF657174)
-                )
-            ) {
-                Text("REFRESH", fontSize = 10.sp, fontWeight = FontWeight.Black)
-            }
-        }
-
-        ModuleSection("Input Range", "20.03.6.11. Read-only recorder state.") {
-            ModuleValueRow("Range", finalInputRange.text, accent = finalInputRange.text != "Not reported by recorder")
-        }
-
-        ModuleSection("RAW + Camera Metadata", "20.03.6.12. Read-only recorder state.") {
-            ModuleValueRow("RAW Input", finalRawInput.text, accent = finalRawInput.text != "Not reported by recorder")
-            ModuleValueRow("Camera Metadata", finalCameraMetadata.text, accent = finalCameraMetadata.text != "Not reported by recorder")
-        }
-
-        ModuleSection("Input State", "20.03.6.13. Change-aware safe refresh. Internal Change ID is never shown.") {
-            ModuleValueRow("State", extendedView.stateStatus, accent = extendedView.stateStatus == "Current" || extendedView.stateStatus == "Updated")
-            ModuleValueRow(
-                "Readback",
-                if (extendedInput.running) "Reading..." else if (extendedInput.completed > 0) "${extendedInput.completed}/${extendedInput.expected} recorder responses" else "Not refreshed",
-                accent = extendedInput.completed > 0
-            )
-        }
-
-        ModuleSection(
-            "Input Menu",
-            "Source, Image, Record Trigger and SDI are local UI panels. Opening or switching them never sends a PacketLink command."
-        ) {
-            pages.chunked(2).forEach { row ->
-                Row(
-                    Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.spacedBy(8.dp)
-                ) {
-                    row.forEach { page ->
-                        val active = inputPage == page
-                        OutlinedButton(
-                            onClick = { inputPage = page },
-                            modifier = Modifier.weight(1f),
-                            shape = RoundedCornerShape(10.dp),
-                            border = androidx.compose.foundation.BorderStroke(
-                                1.dp,
-                                if (active) AtomosCyan else Color(0xFF314044)
-                            )
+                    options.forEach { option ->
+                        val active = when (key) {
+                            "hdr" -> readOnlyBooleanMatch(hdrView.hdr) == option.label
+                            "trigger" -> readOnlyBooleanMatch(finalTriggerEnabled.text) == option.label
+                            else -> readOnlyMatch(row?.second.orEmpty(), listOf(option.label)) != null
+                        }
+                        Row(
+                            Modifier.fillMaxWidth().padding(bottom = 8.dp)
+                                .border(1.dp, if (active) AtomosCyan else Color(0xFF30474E), RoundedCornerShape(10.dp))
+                                .clickable(enabled = permitted && !active) {
+                                    when (key) {
+                                        "source", "sdi" -> vm.setInputSource(option.value, option.label)
+                                        "range" -> vm.setInputRange(option.value, option.label)
+                                        "hdr" -> vm.setInputHdrEnabled(option.value == 1)
+                                        "trigger" -> vm.setInputTriggerEnabled(option.value == 1)
+                                        "hdmi" -> vm.setInputHdmiStandard(option.value, option.label)
+                                        "camera" -> vm.setInputHdrCamera(option.value, option.label)
+                                        "gamma" -> vm.setInputHdrGamma(option.value, option.label)
+                                        "gamut" -> vm.setInputHdrGamut(option.value, option.label)
+                                    }
+                                    inputSheet = null
+                                }
+                                .padding(horizontal = 17.dp, vertical = 17.dp),
+                            verticalAlignment = Alignment.CenterVertically
                         ) {
-                            Text(
-                                page,
-                                color = if (active) AtomosCyan else Color(0xFFB8C0C2),
-                                fontSize = 10.sp,
-                                maxLines = 1
-                            )
+                            Text(if (active) "◉" else "○", color = if (active) AtomosCyan else Color.LightGray, fontSize = 22.sp)
+                            Spacer(Modifier.width(15.dp))
+                            Text(option.label, color = if (permitted) Color.White else Color.Gray,
+                                fontSize = 15.sp, modifier = Modifier.weight(1f))
                         }
                     }
-                    if (row.size == 1) Spacer(Modifier.weight(1f))
+                    if (!permitted) Text("Selection unavailable until recorder is ready / current operation finishes.",
+                        color = Color(0xFF93A6AA), fontSize = 11.sp)
                 }
             }
-        }
-
-        when (inputPage) {
-            "Source" -> {
-                val rawSource = values["source"]
-                val sourceOptions = InputSourceCatalog.protocolFamily.map { it.label }
-                val cachedHdmiStandard = InputHdmiStandardCatalog.normalize(values["hdmiStandard"])
-                val hdmiStandard =
-                    if (finalHdmiStandard.verified) {
-                        finalHdmiStandard.text
-                    } else {
-                        cachedHdmiStandard
-                    }
-
-                ModuleSection(
-                    "Input Source",
-                    "Choose an official Input source. Current Source always remains recorder readback, never the last tapped option."
-                ) {
-                    ModuleValueRow("Current Source", source, accent = source != "Not reported")
-                    ModuleValueRow(
-                        "Readback",
-                        if (collector.inputResponses >= 3) "Recorder confirmed" else "Waiting for stable Input snapshot",
-                        accent = collector.inputResponses >= 3
-                    )
-                    EditableInputOptions(
-                        options = InputEditCatalog.sourceOptions,
-                        active = source.takeIf { it in sourceOptions },
-                        enabled = ready && !inputSetter.busy && !collector.running && !extendedInput.running,
-                        onSelect = { option -> vm.setInputSource(option.value, option.label) }
-                    )
-                    InputSetterStatusRow(inputSetter.status, inputSetter.busy, inputSetter.confirmed)
-                }
-
-                ModuleSection(
-                    "HDMI Standard",
-                    "HDMI Standard is editable when the current source is HDMI. Confirmation requires recorder readback."
-                ) {
-                    ModuleValueRow(
-                        "Current Standard",
-                        hdmiStandard,
-                        accent = hdmiStandard != "Not reported by recorder"
-                    )
-                    EditableInputOptions(
-                        options = InputEditCatalog.hdmiStandardOptions,
-                        active = readOnlyMatch(
-                            hdmiStandard,
-                            InputEditCatalog.hdmiStandardOptions.map { it.label }
-                        ),
-                        enabled = ready &&
-                            source.contains("HDMI", ignoreCase = true) &&
-                            !inputSetter.busy &&
-                            !collector.running &&
-                            !extendedInput.running,
-                        onSelect = { option -> vm.setInputHdmiStandard(option.value, option.label) }
-                    )
-                    ModuleValueRow(
-                        "Supported Standards",
-                        finalHdmiOptions.text,
-                        accent = finalHdmiOptions.text != "Not reported by recorder"
-                    )
-                    Text(
-                        "Choose a standard to send the official setter. The selected value becomes current only after recorder GET readback confirms it.",
-                        color = Color(0xFF747E81),
-                        fontSize = 9.sp,
-                        lineHeight = 13.sp
-                    )
-                }
-
-                ModuleSection(
-                    "HDR + Range",
-                    "HDR and HDR Auto are editable in 20.03.7.3. Current values change only after recorder readback confirms them."
-                ) {
-                    ModuleValueRow("HDR", hdrView.hdr, accent = hdrView.confirmed)
-                    EditableInputOptions(
-                        options = listOf(
-                            InputEditCatalog.Option(0, "Off"),
-                            InputEditCatalog.Option(1, "On")
-                        ),
-                        active = readOnlyBooleanMatch(hdrView.hdr),
-                        enabled = ready &&
-                            hdrView.control == "Available" &&
-                            !inputSetter.busy &&
-                            !collector.running &&
-                            !extendedInput.running,
-                        onSelect = { option -> vm.setInputHdrEnabled(option.value == 1) }
-                    )
-                    Spacer(Modifier.height(6.dp))
-                    ModuleValueRow("HDR Auto", hdrAutoValue, accent = hdrAutoValue != "Not reported by recorder")
-                    EditableInputOptions(
-                        options = listOf(
-                            InputEditCatalog.Option(0, "Off"),
-                            InputEditCatalog.Option(1, "On")
-                        ),
-                        active = readOnlyBooleanMatch(hdrAutoValue),
-                        enabled = ready &&
-                            !inputSetter.busy &&
-                            !collector.running &&
-                            !extendedInput.running,
-                        onSelect = { option -> vm.setInputHdrAuto(option.value == 1) }
-                    )
-                    ModuleValueRow("Input Range", finalInputRange.text, accent = finalInputRange.text != "Not reported by recorder")
-                    EditableInputDropdown(
-                        title = "Change Input Range",
-                        options = InputEditCatalog.inputRangeOptions,
-                        active = readOnlyMatch(
-                            finalInputRange.text,
-                            InputEditCatalog.inputRangeOptions.map { it.label }
-                        ),
-                        enabled = ready && !inputSetter.busy && !collector.running && !extendedInput.running,
-                        onSelect = { option -> vm.setInputRange(option.value, option.label) }
-                    )
-                    InputSetterStatusRow(inputSetter.status, inputSetter.busy, inputSetter.confirmed)
-                }
-            }
-
-            "Image" -> {
-                val currentCamera =
-                    if (extendedView.camera != "Not reported by recorder") extendedView.camera else hdrCapabilities.camera
-                val currentGamma =
-                    if (extendedView.gamma != "Not reported by recorder") extendedView.gamma else hdrCapabilities.gamma
-                val currentGamut =
-                    if (extendedView.gamut != "Not reported by recorder") extendedView.gamut else hdrCapabilities.gamut
-
-                ModuleSection(
-                    "HDR Image Conversion",
-                    "Camera, Gamma and Gamut update only after recorder readback confirms the selection."
-                ) {
-                    ModuleValueRow(
-                        "Camera",
-                        currentCamera,
-                        accent = currentCamera != "Not reported by recorder"
-                    )
-                    EditableInputDropdown(
-                        title = "Change Camera",
-                        options = InputEditCatalog.hdrCameraOptions,
-                        active = readOnlyMatch(
-                            currentCamera,
-                            InputEditCatalog.hdrCameraOptions.map { it.label }
-                        ),
-                        enabled = ready && !inputSetter.busy && !collector.running && !extendedInput.running,
-                        onSelect = { option -> vm.setInputHdrCamera(option.value, option.label) }
-                    )
-                    Spacer(Modifier.height(6.dp))
-                    ModuleValueRow(
-                        "Gamma",
-                        currentGamma,
-                        accent = currentGamma != "Not reported by recorder"
-                    )
-                    EditableInputDropdown(
-                        title = "Change Gamma",
-                        options = InputEditCatalog.hdrGammaOptions,
-                        active = readOnlyMatch(
-                            currentGamma,
-                            InputEditCatalog.hdrGammaOptions.map { it.label }
-                        ),
-                        enabled = ready && !inputSetter.busy && !collector.running && !extendedInput.running,
-                        onSelect = { option -> vm.setInputHdrGamma(option.value, option.label) }
-                    )
-                    Spacer(Modifier.height(6.dp))
-                    ModuleValueRow(
-                        "Gamut",
-                        currentGamut,
-                        accent = currentGamut != "Not reported by recorder"
-                    )
-                    EditableInputDropdown(
-                        title = "Change Gamut",
-                        options = InputEditCatalog.hdrGamutOptions,
-                        active = readOnlyMatch(
-                            currentGamut,
-                            InputEditCatalog.hdrGamutOptions.map { it.label }
-                        ),
-                        enabled = ready && !inputSetter.busy && !collector.running && !extendedInput.running,
-                        onSelect = { option -> vm.setInputHdrGamut(option.value, option.label) }
-                    )
-                    InputSetterStatusRow(inputSetter.status, inputSetter.busy, inputSetter.confirmed)
-                }
-
-                val cameraCapability =
-                    if (finalCameraOptions.text != "Not reported by recorder") finalCameraOptions.text else hdrCapabilities.cameraOptions
-                val gammaCapability =
-                    if (finalGammaOptions.text != "Not reported by recorder") finalGammaOptions.text else hdrCapabilities.gammaOptions
-                val gamutCapability =
-                    if (finalGamutOptions.text != "Not reported by recorder") finalGamutOptions.text else hdrCapabilities.gamutOptions
-
-                if (
-                    cameraCapability != "Not reported by recorder" ||
-                    gammaCapability != "Not reported by recorder" ||
-                    gamutCapability != "Not reported by recorder"
-                ) {
-                    ModuleSection("Recorder Capabilities", null) {
-                        if (cameraCapability != "Not reported by recorder") {
-                            ModuleValueRow("Camera", cameraCapability)
-                        }
-                        if (gammaCapability != "Not reported by recorder") {
-                            ModuleValueRow("Gamma", gammaCapability)
-                        }
-                        if (gamutCapability != "Not reported by recorder") {
-                            ModuleValueRow("Gamut", gamutCapability)
-                        }
-                    }
-                }
-            }
-
-            "Record Trigger" -> {
-                ModuleSection(
-                    "Record Trigger",
-                    "Trigger controls are editable. Current values change only after recorder readback confirms the requested setting."
-                ) {
-                    ModuleValueRow("Trigger Source", finalTriggerSource.text, accent = finalTriggerSource.text != "Not reported by recorder")
-                    EditableInputOptions(
-                        options = InputEditCatalog.triggerSourceOptions,
-                        active = readOnlyMatch(
-                            finalTriggerSource.text,
-                            InputEditCatalog.triggerSourceOptions.map { it.label }
-                        ),
-                        enabled = ready && !inputSetter.busy && !collector.running && !extendedInput.running,
-                        onSelect = { option -> vm.setInputTriggerSource(option.value, option.label) }
-                    )
-                    Spacer(Modifier.height(6.dp))
-                    ModuleValueRow("Trigger Enabled", finalTriggerEnabled.text, accent = finalTriggerEnabled.text != "Not reported by recorder")
-                    EditableInputOptions(
-                        options = listOf(
-                            InputEditCatalog.Option(0, "Off"),
-                            InputEditCatalog.Option(1, "On")
-                        ),
-                        active = readOnlyBooleanMatch(finalTriggerEnabled.text),
-                        enabled = ready && !inputSetter.busy && !collector.running && !extendedInput.running,
-                        onSelect = { option -> vm.setInputTriggerEnabled(option.value == 1) }
-                    )
-                    InputSetterStatusRow(inputSetter.status, inputSetter.busy, inputSetter.confirmed)
-                }
-
-                Text(
-                    "Protocol details remain internal. A transmitted command alone is never treated as confirmation.",
-                    color = Color(0xFF747E81),
-                    fontSize = 9.sp,
-                    lineHeight = 13.sp
-                )
-            }
-
-            "SDI" -> {
-                ModuleSection("SDI Input", null) {
-                    ModuleValueRow("Current Input", source, accent = source != "Not reported")
-                    EditableInputDropdown(
-                        title = "Change SDI Input",
-                        options = InputEditCatalog.sdiSourceOptions,
-                        active = readOnlyMatch(
-                            source,
-                            InputEditCatalog.sdiSourceOptions.map { it.label }
-                        ),
-                        enabled = ready &&
-                            !inputSetter.busy &&
-                            !collector.running &&
-                            !extendedInput.running,
-                        onSelect = { option -> vm.setInputSource(option.value, option.label) }
-                    )
-
-                    if (finalSdiLink.text != "Not reported by recorder") {
-                        ModuleValueRow("Link Capability", finalSdiLink.text)
-                    }
-                    if (finalActiveSdi.text != "Not reported by recorder") {
-                        ModuleValueRow("Source Capability", finalActiveSdi.text)
-                    }
-
-                    Text(
-                        "SDI A/B/Dual/Quad selection uses Input Source. Link/active-source data is capability readback only.",
-                        color = Color(0xFF747E81),
-                        fontSize = 9.sp,
-                        lineHeight = 13.sp
-                    )
-                    InputSetterStatusRow(inputSetter.status, inputSetter.busy, inputSetter.confirmed)
-                }
-            }
-        }
-
         }
     }
 }
@@ -4778,123 +6678,388 @@ private fun ReadOnlyInputOptions(
 // No setter, command ID, PacketLink rule or pairing behavior is added here.
 
 
+// AUDIO R26: macOS and recorder screenshot parity, guarded read-only baseline.
+// Neither paired transport nor Output/Input/Monitor code is changed.
+@OptIn(ExperimentalMaterial3Api::class)
 @Composable
 private fun AudioModuleScreen(vm: AtomosViewModel) {
     val selected by vm.selected.collectAsState()
     val recorderName = selected?.let { vm.displayNameFor(it) } ?: "ATOMOS Recorder"
-    var selectedChannel by remember { mutableStateOf(1) }
+    val pairing by vm.tcsPairingState.collectAsState()
+    val remote by vm.tcsRemoteState.collectAsState()
+    val gattState by vm.gattState.collectAsState()
+    val snapshot by vm.remoteStateSnapshot.collectAsState()
+    val audioReadback by vm.audioR26Live.collectAsState()
+    val linked = pairing.acceptWritten && remote.available &&
+        gattState != "idle" && gattState != "disconnected" &&
+        !gattState.startsWith("error:") && !gattState.startsWith("service-error:")
+    // R26.11.3: only a linked recorder's typed 0x8647 state page can claim readback.
+    // The UI does NOT map protobuf field numbers to audio options or dB values.
+    val meters = if (linked) snapshot.pages[0x0647] else null
+    val wireInspection = remember(meters?.rawHex) { AudioR26WireInspector.inspect(meters?.rawHex.orEmpty()) }
+    val haveMeterPayload = linked && meters?.responseType == 0x8647 &&
+        !meters?.rawHex.isNullOrEmpty() && wireInspection.status == "RAW_PARSED_UNMAPPED" &&
+        wireInspection.fields.isNotEmpty()
+    var pane by remember(selected?.address) { mutableStateOf("AUDIO") }
+    var sheetKey by remember(selected?.address) { mutableStateOf<String?>(null) }
+    var refreshGeneration by remember(selected?.address) { mutableIntStateOf(0) }
+    var lastRequestQueued by remember(selected?.address) { mutableStateOf<Boolean?>(null) }
+    // R26.12: no Save A/B, no non-local diagnostic buttons in the normal Audio UI.
 
-    LaunchedEffect(recorderName, selectedChannel) {
-        Log.d(
-            "AtomRemoteUI",
-            "TCS19.12.8 TAB AUDIO recorder=$recorderName selectedChannel=$selectedChannel liveData=NOT_WIRED uiState=PLACEHOLDER"
-        )
+    // Raw evidence logging is keyed to a changed, strictly parsed readback.
+    LaunchedEffect(linked, meters?.rawHex) {
+        if (haveMeterPayload) {
+            Log.i("AtomRemoteAudioR26Map",
+                "PAGE_8647_VERIFIED size=${meters?.rawHex?.length?.div(2) ?: 0} " +
+                    "fields=${wireInspection.fields.size} " +
+                    wireInspection.fields.joinToString(";") { "f${it.number}/w${it.wireType}=${it.detail}" })
+        }
+    }
+
+    // R26.13: actual recovered GET opcodes, one sequential collector per screen/refresh.
+    // Collector itself waits for MTU and other feature owners; no Save A/B.
+    LaunchedEffect(selected?.address, linked, refreshGeneration) {
+        if (linked) vm.refreshRecoveredAudioR26()
+    }
+
+    DisposableEffect(vm, selected?.address) {
+        onDispose { vm.stopRecoveredAudioR26() }
     }
 
     ModuleShell(vm, AtomosViewModel.Screen.AUDIO, "Audio", recorderName) {
-        ModuleSection(
-            "Audio Meters",
-            "Select a channel to view its recorder-reported audio state."
+        Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+            Text("AUDIO STATUS", color = Color(0xFF91A4A8), fontSize = 10.sp, fontWeight = FontWeight.Bold)
+            Spacer(Modifier.weight(1f))
+            Text(
+                when {
+                    !linked -> "CONNECTING"
+                    audioReadback.values.values.any { it.status == "TYPED_RX" } -> "LIVE AUDIO GET RX"
+                    audioReadback.running -> "READING AUDIO SETTINGS"
+                    haveMeterPayload -> "AUDIO PAGE VERIFIED"
+                    else -> "CURRENT READBACK PENDING"
+                },
+                color = if (haveMeterPayload) AtomosCyan else Color(0xFF91A4A8),
+                fontSize = 10.sp, fontWeight = FontWeight.Bold
+            )
+        }
+        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            listOf("AUDIO" to "Audio", "MIC_LINE" to "Mic / Line").forEach { (key, label) ->
+                Surface(
+                    modifier = Modifier.weight(1f).clickable { pane = key; sheetKey = null },
+                    shape = RoundedCornerShape(10.dp),
+                    color = if (pane == key) Color(0xFF134044) else Color(0xFF101A1D),
+                    border = androidx.compose.foundation.BorderStroke(
+                        1.dp, if (pane == key) AtomosCyan else Color(0xFF30474E)
+                    )
+                ) {
+                    Box(Modifier.padding(vertical = 14.dp), contentAlignment = Alignment.Center) {
+                        Text(label, color = if (pane == key) AtomosCyan else Color(0xFFBBC9CA),
+                            fontSize = 13.sp, fontWeight = FontWeight.Bold)
+                    }
+                }
+            }
+        }
+        AudioR26VerifiedPagePanel(haveMeterPayload, meters?.rawHex.orEmpty(), wireInspection)
+        if (haveMeterPayload) {
+            Text("Live recorder Audio page is available. Named values below use macOS Swift metadata and inferred protobuf tag mapping; dB/channel meanings remain unverified.",
+                color = Color(0xFFD5B47C), fontSize = 10.sp, lineHeight = 15.sp)
+        }
+        Text("macOS recovered GET collector: ${audioReadback.status}",
+            color = AtomosCyan, fontSize = 11.sp)
+        Text("Audio GET audit: ${audioReadback.values.size} / " +
+            "${com.atomosremote.nativeapp.audio.AudioR26RecoveredMap.auditCandidates.size + 1} checked; " +
+            "RX=${audioReadback.values.values.count { it.status == "TYPED_RX" }} " +
+            "rejected=${audioReadback.values.values.count { it.status.startsWith("RECORDER_REJECT") }} " +
+            "skipped=${audioReadback.values.values.count { it.status.startsWith("SKIPPED_") }}",
+            color = Color(0xFF95B9BC), fontSize = 10.sp)
+        var showKeyAudit by remember { mutableStateOf(false) }
+        Text(if (showKeyAudit) "33 macOS Audio keys (tap to hide)" else "33 macOS Audio keys (tap to expand)",
+            color = AtomosCyan, fontSize = 11.sp,
+            modifier = Modifier.fillMaxWidth().clickable { showKeyAudit = !showKeyAudit }.padding(vertical = 8.dp))
+        if (showKeyAudit) {
+            com.atomosremote.nativeapp.audio.AudioR26RecoveredMap.allKeys.forEach { key ->
+                val observed = audioReadback.values[key.method]?.status
+                val result = when {
+                    key.kind == "SET" -> "SET LOCKED"
+                    observed != null -> observed
+                    key.kind != "GET" -> "NOT A GET"
+                    key.requiresArguments -> "ARGUMENT SCHEMA PENDING"
+                    key.confidence != "DIRECT_BINARY" -> "UNVERIFIED OPCODE"
+                    else -> "PENDING"
+                }
+                Text("${key.method}  ${if (key.opcode > 0) "0x${key.opcode.toString(16)}" else "?"}  $result",
+                    fontSize = 10.sp, color = Color(0xFF9FB6B9),
+                    modifier = Modifier.fillMaxWidth().padding(vertical = 2.dp))
+            }
+        }
+
+        if (pane == "AUDIO") {
+            Text("AUDIO METERS", color = Color(0xFF91A4A8), fontSize = 11.sp,
+                fontWeight = FontWeight.Bold, modifier = Modifier.padding(top = 8.dp))
+            AudioR26MetersPlaceholder(haveMeterPayload, meters?.rawHex.orEmpty(), wireInspection)
+            Text("MONITOR & RECORD", color = Color(0xFF91A4A8), fontSize = 11.sp,
+                fontWeight = FontWeight.Bold, modifier = Modifier.padding(top = 12.dp))
+            AudioR26Catalog.settings.filter { it.pane == "AUDIO" && it.key in listOf(
+                "phones", "analogMonitor", "analogRecord", "ch12", "ch34", "ch56", "ch78", "ch910", "ch1112"
+            ) }.forEach { spec -> AudioR26SettingRow(spec, audioReadback.values, meters?.rawHex.orEmpty()) { sheetKey = spec.key } }
+            Text("ROUTING & METER SETTINGS", color = Color(0xFF91A4A8), fontSize = 11.sp,
+                fontWeight = FontWeight.Bold, modifier = Modifier.padding(top = 12.dp))
+            AudioR26Catalog.settings.filter { it.pane == "AUDIO" && it.key in listOf(
+                "embed", "orientation", "fill", "speaker", "speakerMute", "dropouts"
+            ) }.forEach { spec -> AudioR26SettingRow(spec, audioReadback.values, meters?.rawHex.orEmpty()) { sheetKey = spec.key } }
+        } else {
+            Text("MIC / LINE INPUT", color = Color(0xFF91A4A8), fontSize = 11.sp,
+                fontWeight = FontWeight.Bold, modifier = Modifier.padding(top = 8.dp))
+            AudioR26Catalog.forPane("MIC_LINE").forEach { spec ->
+                AudioR26SettingRow(spec, audioReadback.values, meters?.rawHex.orEmpty()) { sheetKey = spec.key }
+            }
+        }
+        Text(
+            if (haveMeterPayload) "AudioMetersPage GET 0x0647 / response 0x8647 verified. Named scalar/list readbacks are inferred from official macOS reflection; controls and SET remain locked."
+            else "Audio page readback not available in this connection. Retry Refresh after pairing and MTU negotiation.",
+            color = Color(0xFF91A4A8), fontSize = 11.sp, lineHeight = 16.sp
+        )
+        Text(
+            "R26.04 protocol inspection: ${wireInspection.status}. " +
+                "${wireInspection.fields.size} top-level protobuf wire fields detected; " +
+                "names inferred from macOS metadata; not verified as writable recorder controls.",
+            color = Color(0xFF91A4A8), fontSize = 10.sp, lineHeight = 15.sp
+        )
+
+        TextButton(
+            onClick = { refreshGeneration += 1 },
+            enabled = linked,
+            modifier = Modifier.fillMaxWidth()
         ) {
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.spacedBy(8.dp)
+            Text("Refresh audio readback", color = if (linked) AtomosCyan else Color.Gray,
+                fontSize = 12.sp, fontWeight = FontWeight.Bold)
+        }
+        HorizontalDivider(color = Color(0xFF254048))
+        Text("LIVE DEVICE READBACK", color = AtomosCyan,
+            fontSize = 11.sp, fontWeight = FontWeight.Bold)
+        Text(
+            "Recorder GET 0x0647 / typed response 0x8647 is enabled after pairing " +
+                "and successful MTU negotiation. Busy requests retry while this Audio " +
+                "screen is open. Unverified individual GET payload candidates are disabled after four AG2 hardware timeouts. Gain, Mic/Line and Speaker need official request/response schemas.",
+            color = Color(0xFFB7C4C6), fontSize = 11.sp, lineHeight = 16.sp
+        )
+        Text("Audio SET commands remain locked. Remote, Input, Output and Monitor are unchanged.",
+            color = Color(0xFFD5B47C), fontSize = 10.sp, lineHeight = 15.sp)
+    }
+    if (sheetKey != null) {
+        val spec = AudioR26Catalog.find(sheetKey.orEmpty())
+        if (spec != null) {
+            ModalBottomSheet(
+                onDismissRequest = { sheetKey = null },
+                containerColor = Color(0xFF06161B),
+                contentColor = Color.White
             ) {
-                (1..4).forEach { channel ->
-                    FilterChip(
-                        selected = selectedChannel == channel,
-                        onClick = { selectedChannel = channel },
-                        label = { Text("CH $channel") },
-                        modifier = Modifier.weight(1f)
+                Column(
+                    modifier = Modifier.fillMaxWidth().verticalScroll(rememberScrollState())
+                        .padding(horizontal = 20.dp, vertical = 6.dp),
+                    verticalArrangement = Arrangement.spacedBy(12.dp)
+                ) {
+                    Text(spec.label, fontSize = 19.sp, color = Color.White, fontWeight = FontWeight.Bold)
+                    Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                        Text("CURRENT VALUE", modifier = Modifier.weight(1f),
+                            color = Color(0xFF92A6AA), fontSize = 10.sp, fontWeight = FontWeight.Bold)
+                        Text(AudioR26ReadbackLabel(spec, audioReadback.values, meters?.rawHex.orEmpty()),
+                            color = Color(0xFFCCDBDE), fontSize = 12.sp)
+                    }
+                    HorizontalDivider(color = Color(0xFF254048))
+                    Text("DEVICE UI OPTIONS", color = Color(0xFF91A4A8),
+                        fontSize = 10.sp, fontWeight = FontWeight.Bold)
+                    if (spec.deviceOptions.isEmpty()) {
+                        Text("Available values/range must be read from the recorder.",
+                            fontSize = 12.sp, color = Color(0xFFB4C0C3))
+                    } else {
+                        spec.deviceOptions.forEach { option ->
+                            Surface(
+                                shape = RoundedCornerShape(11.dp),
+                                color = Color(0xFF0A1B20),
+                                border = androidx.compose.foundation.BorderStroke(1.dp, Color(0xFF30474E))
+                            ) {
+                                Row(Modifier.fillMaxWidth().padding(horizontal = 14.dp, vertical = 14.dp),
+                                    verticalAlignment = Alignment.CenterVertically) {
+                                    Text("○", color = Color(0xFF78888C), fontSize = 18.sp)
+                                    Spacer(Modifier.width(13.dp))
+                                    Text(option, color = Color(0xFFB6C2C5), fontSize = 14.sp)
+                                    Spacer(Modifier.weight(1f))
+                                    Text("LOCKED", color = Color(0xFF637980), fontSize = 9.sp)
+                                }
+                            }
+                        }
+                    }
+                    Text("OFFICIAL macOS AUDIO KEYS", color = Color(0xFF91A4A8),
+                        fontSize = 10.sp, fontWeight = FontWeight.Bold)
+                    if (spec.macMethods.isEmpty()) {
+                        Text("Exact method not established from supplied RemoteApi class list.",
+                            color = Color(0xFFB5C3C6), fontSize = 11.sp)
+                    } else {
+                        spec.macMethods.forEach { name ->
+                            Text("Audio.$name", color = AtomosCyan, fontSize = 11.sp)
+                        }
+                    }
+                    val part2Plans = AudioR26Part2Plan.forKey(spec.key)
+                    if (part2Plans.isNotEmpty()) {
+                        HorizontalDivider(color = Color(0xFF254048))
+                        Text("PART 2 IMPLEMENTATION GATES", color = AtomosCyan,
+                            fontSize = 10.sp, fontWeight = FontWeight.Bold)
+                        part2Plans.forEach { plan ->
+                            Text("${plan.phase} - ${plan.title}", color = Color.White,
+                                fontSize = 12.sp, fontWeight = FontWeight.Bold)
+                            Text(plan.acceptance, color = Color(0xFF9BB0B5),
+                                fontSize = 11.sp, lineHeight = 16.sp)
+                        }
+                    }
+                    Text(AudioR26Part2Plan.readiness(spec.key),
+                        color = Color(0xFFD5B47C), fontSize = 10.sp)
+                    Text(spec.evidenceNote, color = Color(0xFF91A4A8), fontSize = 11.sp)
+                    Text(
+                        "Read-only until exact command/response IDs, payload schema and AG2 readback are proven. " +
+                            "Options shown above come from device/macOS screenshots; tapping cannot send a SET.",
+                        color = Color(0xFFD5B47C), fontSize = 11.sp, lineHeight = 16.sp
                     )
+                    TextButton(onClick = { sheetKey = null }, modifier = Modifier.fillMaxWidth()) {
+                        Text("CLOSE", color = AtomosCyan, fontWeight = FontWeight.Bold)
+                    }
+                    Spacer(Modifier.height(10.dp))
                 }
             }
-            Spacer(Modifier.height(10.dp))
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.spacedBy(8.dp)
-            ) {
-                (5..8).forEach { channel ->
-                    FilterChip(
-                        selected = selectedChannel == channel,
-                        onClick = { selectedChannel = channel },
-                        label = { Text("CH $channel") },
-                        modifier = Modifier.weight(1f)
-                    )
+        }
+    }
+}
+
+// R26.11.3: Live wire evidence only. Do not silently rename fields to Phone/REC/Gain.
+@Composable
+private fun AudioR26VerifiedPagePanel(
+    verified: Boolean,
+    rawHex: String,
+    inspection: com.atomosremote.nativeapp.audio.AudioR26WireInspector.Inspection
+) {
+    Card(
+        modifier = Modifier.fillMaxWidth(),
+        shape = RoundedCornerShape(13.dp),
+        colors = CardDefaults.cardColors(containerColor = Color(0xFF081A1E)),
+        border = androidx.compose.foundation.BorderStroke(1.dp, Color(0xFF24454B))
+    ) {
+        Column(Modifier.fillMaxWidth().padding(14.dp), verticalArrangement = Arrangement.spacedBy(7.dp)) {
+            Text("RECORDER AUDIO PAGE", color = AtomosCyan,
+                fontSize = 11.sp, fontWeight = FontWeight.Bold)
+            Text(
+                if (verified) "GET 0x0647  •  RX 0x8647  •  ${rawHex.length / 2} bytes  •  ${inspection.fields.size} raw fields"
+                else "No complete typed readback for current connection (${inspection.status})",
+                color = if (verified) Color(0xFFDAEBE9) else Color(0xFF9DACB1),
+                fontSize = 11.sp, lineHeight = 16.sp
+            )
+            val macSnapshot = if (verified) com.atomosremote.nativeapp.audio.AudioR26PageSnapshot.decode(rawHex) else null
+            if (macSnapshot != null) {
+                Text("macOS AUDIO PAGE STATE | live recorder raw values",
+                    color = AtomosCyan, fontSize = 10.sp, fontWeight = FontWeight.Bold)
+                macSnapshot.rows.forEach { (name, value) ->
+                    Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.Top) {
+                        Text(name, color = Color(0xFFBDD2D4), fontSize = 10.sp,
+                            modifier = Modifier.weight(0.52f))
+                        Text(value, color = Color(0xFFE1F3EE), fontSize = 10.sp,
+                            modifier = Modifier.weight(0.48f))
+                    }
+                }
+                Text("Property names from official macOS Swift metadata. Wire-tag association inferred from scalar/list types; channel, dB and SET semantics not hardware-calibrated.",
+                    color = Color(0xFFD5B47C), fontSize = 10.sp, lineHeight = 14.sp)
+            }
+            if (verified) {
+                inspection.fields.forEach { field ->
+                    Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.Top) {
+                        Text("FIELD ${field.number}", color = AtomosCyan, fontSize = 10.sp,
+                            fontWeight = FontWeight.Bold, modifier = Modifier.width(72.dp))
+                        Text("wire=${field.wireType}  ${field.detail}",
+                            color = Color(0xFFB5C9CB), fontSize = 10.sp,
+                            lineHeight = 15.sp, modifier = Modifier.weight(1f))
+                    }
                 }
             }
-            Spacer(Modifier.height(12.dp))
-            AudioMeterPlaceholder(channel = selectedChannel)
-        }
-
-        ModuleSection("Channel Routing") {
-            ModuleValueRow("Selected channel", "CH $selectedChannel", accent = true)
-            ModuleValueRow("Monitor", "Waiting for recorder state")
-            ModuleValueRow("Record", "Waiting for recorder state")
-            ModuleFeatureChips(listOf("Monitor", "Record", "Record Enabled", "Record Valid"))
-        }
-
-        ModuleSection("Analog Input") {
-            ModuleValueRow("Input source", "Not reported")
-            ModuleValueRow("Embed", "Not reported")
-            ModuleValueRow("Input level", "Not reported")
-            ModuleValueRow("Gain L", "Not reported")
-            ModuleValueRow("Gain R", "Not reported")
-            ModuleValueRow("Frame delay", "Not reported")
-            ModuleFeatureChips(listOf("Mic", "Line", "Gain L/R", "Frame Delay", "Analog Embed"))
-        }
-
-        ModuleSection("Headphones & Speaker") {
-            ModuleValueRow("Headphones", "Not reported")
-            ModuleValueRow("Speaker", "Not reported")
-            ModuleValueRow("Speaker mute", "Not reported")
-            ModuleFeatureChips(listOf("Phones Level", "Speaker Level", "Mute"))
-        }
-
-        ModuleSection("Layout & Fill") {
-            ModuleValueRow("Meter orientation", "Not reported")
-            ModuleValueRow("Audio fill", "Not reported")
-            ModuleFeatureChips(listOf("Horizontal", "Vertical", "Audio Fill"))
-        }
-
-        ModuleSection("Recorder") {
-            ModuleValueRow("Device", recorderName, accent = true)
-            ModuleValueRow("Audio sync", "Awaiting recorder state")
+            Text("Numeric Audio page values are genuine recorder readbacks; property-tag names are inferred, not calibrated. No Audio SET is enabled.",
+                color = Color(0xFFD5B47C), fontSize = 10.sp, lineHeight = 14.sp)
         }
     }
 }
 
 @Composable
-private fun AudioMeterPlaceholder(channel: Int) {
+private fun AudioR26ReadbackLabel(
+    spec: AudioR26Setting,
+    values: Map<String, com.atomosremote.nativeapp.audio.AudioR26LiveValue>,
+    pageHex: String
+): String {
+    // R26.19 current recorder 0x8647 snapshot; do not mistake inferred tags for SET-ready controls.
+    val macPageLabel = com.atomosremote.nativeapp.audio.AudioR26PageSnapshot.rowLabel(spec.key, pageHex)
+    if (macPageLabel != null) return macPageLabel
+    val pageHint = com.atomosremote.nativeapp.audio.AudioR26ProtoCandidates.pageHint(spec.key, pageHex)
+    if (pageHint != null && values[spec.macMethods.firstOrNull()]?.status != "TYPED_RX") return pageHint
+    if (spec.key.startsWith("ch") || spec.key == "analogRecord")
+        return "Per-channel/REC GET mapping pending"
+    val getter = spec.macMethods.mapNotNull { com.atomosremote.nativeapp.audio.AudioR26RecoveredMap.byMethod(it) }.firstOrNull()
+        ?: return "Getter opcode awaiting extraction"
+    if (getter.requiresArguments) return "GET 0x${getter.command.toString(16).uppercase()}: args pending"
+    val readback = values[getter.method]
+    if (readback == null) return "GET 0x${getter.command.toString(16).uppercase()}: not read yet"
+    if (readback.status == "TYPED_RX") {
+        val raw = readback.field1Raw?.let { "raw=$it" }
+            ?: "hex=${readback.rawHex.take(20)}"
+        return "${getter.method}: $raw (RX 0x${readback.responseType?.toString(16)})"
+    }
+    return "GET 0x${getter.command.toString(16).uppercase()}: ${readback.status}"
+}
+
+@Composable
+private fun AudioR26SettingRow(
+    spec: AudioR26Setting,
+    liveValues: Map<String, com.atomosremote.nativeapp.audio.AudioR26LiveValue>,
+    pageHex: String,
+    onClick: () -> Unit
+) {
+    Row(
+        modifier = Modifier.fillMaxWidth().padding(bottom = 7.dp)
+            .border(1.dp, Color(0xFF30474E), RoundedCornerShape(12.dp))
+            .background(Color(0xFF06161B), RoundedCornerShape(12.dp))
+            .clickable(onClick = onClick)
+            .padding(horizontal = 16.dp, vertical = 17.dp),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        Text("◇", color = AtomosCyan, fontSize = 21.sp)
+        Spacer(Modifier.width(15.dp))
+        Text(spec.label, color = Color.White, fontSize = 14.sp, fontWeight = FontWeight.SemiBold,
+            modifier = Modifier.weight(1f))
+        Text(AudioR26ReadbackLabel(spec, liveValues, pageHex), color = Color(0xFF82979B), fontSize = 10.sp,
+            maxLines = 1, modifier = Modifier.widthIn(max = 110.dp))
+        Spacer(Modifier.width(8.dp))
+        Text("›", color = Color.White, fontSize = 24.sp)
+    }
+}
+
+@Composable
+private fun AudioR26MetersPlaceholder(havePayload: Boolean, rawHex: String, inspection: com.atomosremote.nativeapp.audio.AudioR26WireInspector.Inspection) {
     Card(
         modifier = Modifier.fillMaxWidth(),
-        shape = RoundedCornerShape(12.dp),
-        colors = CardDefaults.cardColors(containerColor = Color(0xFF111619))
+        shape = RoundedCornerShape(13.dp),
+        colors = CardDefaults.cardColors(containerColor = Color(0xFF081A1E)),
+        border = androidx.compose.foundation.BorderStroke(1.dp, Color(0xFF24454B))
     ) {
-        Column(Modifier.fillMaxWidth().padding(14.dp)) {
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                verticalAlignment = Alignment.CenterVertically
-            ) {
-                Text("CH $channel", fontWeight = FontWeight.ExtraBold, color = Color(0xFFE9EDEE))
-                Spacer(Modifier.weight(1f))
-                Text("NO DATA", color = Color(0xFF7C8589), fontSize = 10.sp, fontWeight = FontWeight.Bold)
+        Column(Modifier.fillMaxWidth().padding(14.dp), verticalArrangement = Arrangement.spacedBy(9.dp)) {
+            AudioR26WireInspector.meterPairs.forEach { channel ->
+                Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                    Text(channel, color = Color(0xFFB8C8CB), fontSize = 10.sp,
+                        modifier = Modifier.width(92.dp))
+                    Box(Modifier.weight(1f).height(8.dp)
+                        .background(Color(0xFF243236), RoundedCornerShape(6.dp)))
+                    Spacer(Modifier.width(8.dp))
+                    Text("-- dB", color = Color(0xFF71878C), fontSize = 10.sp)
+                }
             }
-            Spacer(Modifier.height(10.dp))
-            Box(
-                Modifier
-                    .fillMaxWidth()
-                    .height(12.dp)
-                    .background(Color(0xFF242B2F), RoundedCornerShape(8.dp))
+            Text(
+                if (havePayload) "RAW 0x0647 (${rawHex.length / 2} bytes), inspect=${inspection.status}. No channel dB decoder is enabled until AG2 hardware proof."
+                else "No verified audio levels. Bars are intentionally inactive.",
+                color = Color(0xFF869DA1), fontSize = 10.sp
             )
-            Spacer(Modifier.height(7.dp))
-            Row(Modifier.fillMaxWidth()) {
-                Text("-60", color = Color(0xFF6F787B), fontSize = 9.sp)
-                Spacer(Modifier.weight(1f))
-                Text("-12", color = Color(0xFF6F787B), fontSize = 9.sp)
-                Spacer(Modifier.weight(1f))
-                Text("0 dB", color = Color(0xFF6F787B), fontSize = 9.sp)
-            }
         }
     }
 }
@@ -5009,102 +7174,364 @@ private fun MediaDriveCard(label: String) {
     }
 }
 
+
+// OUTPUT06-14 UI integration: one reusable loader presentation for Input and Output.
+// Readback/collector ownership stays in the existing GATT and ViewModel implementations.
+@Composable
+private fun RecorderSettingsLoader(label: String, detail: String) {
+    Row(
+        Modifier.fillMaxWidth().padding(top = 12.dp, bottom = 12.dp)
+            .border(1.dp, Color(0xFF30474E), RoundedCornerShape(12.dp))
+            .background(Color(0xFF06161B), RoundedCornerShape(12.dp))
+            .padding(14.dp),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        CircularProgressIndicator(modifier = Modifier.size(22.dp), color = AtomosCyan, strokeWidth = 2.dp)
+        Spacer(Modifier.width(12.dp))
+        Column {
+            Text(label, color = Color.White, fontSize = 13.sp, fontWeight = FontWeight.SemiBold)
+            Text(detail, color = Color(0xFF9CB1B6), fontSize = 11.sp)
+        }
+    }
+}
+
+@OptIn(ExperimentalMaterial3Api::class)
 @Composable
 private fun OutputModuleScreen(vm: AtomosViewModel) {
     val selected by vm.selected.collectAsState()
     val pairing by vm.tcsPairingState.collectAsState()
     val remote by vm.tcsRemoteState.collectAsState()
-    val outputInfo by vm.outputInfo.collectAsState()
-    val hdrType by vm.outputHdrTypeId.collectAsState()
-    val gamut by vm.outputGamutId.collectAsState()
-    val rawHex by vm.inputOutputRawHex.collectAsState()
+    val outputSnapshot by vm.outputSessionSnapshot.collectAsState()
+    val outputReadbackStatus by vm.outputReadbackStatus.collectAsState()
+    val lutReadback by vm.gatt.monitorLutState.collectAsState()
+    val hdrReadback by vm.gatt.outputHdrEnabled.collectAsState()
+    val downscaleRawId by vm.outputDownscaleRawId.collectAsState()
+    val cropRawId by vm.outputDciCropRawId.collectAsState()
+    val hdmiTcEnabled by vm.outputHdmiTimecodeEnabled.collectAsState()
+    // R23: only exact-length, typed 0x8644 pages from GATT reach this flow.
+    val outputPageRaw by vm.gatt.outputPageRawR19.collectAsState()
+    val pageEvidence = remember(outputPageRaw) { OutputPageWireDecoder.decode(outputPageRaw) }
+    var outputPageBaseline by remember(selected?.address) { mutableStateOf<String?>(null) }
+    LaunchedEffect(Unit) { Log.i("AtomRemoteOutput45", "OUTPUT45 SCREEN MOUNTED") }
     val recorderName = selected?.let { vm.displayNameFor(it) } ?: "ATOMOS Recorder"
     val ready = pairing.acceptWritten && remote.available
-
-    LaunchedEffect(ready, outputInfo, hdrType, gamut, rawHex) {
-        Log.d(
-            "AtomRemoteUI",
-            "TCS19.12.8 TAB OUTPUT ready=$ready output=${outputInfo ?: "<null>"} hdrType=${hdrType ?: -1} gamut=${gamut ?: -1} rawHexChars=${rawHex?.length ?: 0}"
-        )
+    // OUTPUT R14: the AG2 returned protobuf enum ID 0 for both scalar GETs.
+    // macOS app enum symbols identify the Rec.709 entry for HDR gamma / gamut.
+    // This is a display-only mapping; no option list or SET is inferred.
+    val hdr = when (val id = outputSnapshot.hdrTypeId) {
+        null -> "Not available"
+        0 -> "Rec.709"
+        else -> "ID $id (unmapped)"
     }
-
-    // AGENT7 20.03.4.11: selecting Output is navigation only.
-    // Hardware refresh remains explicit through the REFRESH OUTPUT button.
-    LaunchedEffect(ready) { Unit }
-
-    ModuleShell(vm, AtomosViewModel.Screen.OUTPUT, "Video Output", recorderName) {
-        ModuleSection(
-            "Current Output",
-            "Current output information is read-only until the recorder reports dedicated output state."
-        ) {
-            ModuleValueRow("Session", if (ready) "Remote ready" else "Waiting for recorder", accent = ready)
-            ModuleValueRow("Signal / format", outputInfo ?: "Waiting for recorder data")
-            ModuleValueRow("HDR type ID", hdrType?.toString() ?: "Not reported")
-            ModuleValueRow("Gamut ID", gamut?.toString() ?: "Not reported")
-            ModuleValueRow("Summary received", if (rawHex.isNullOrBlank()) "No" else "Yes")
-            Button(
-                onClick = vm::refreshInputFormatSummary,
-                enabled = ready,
-                modifier = Modifier.fillMaxWidth()
-            ) { Text("REFRESH OUTPUT") }
+    val gamut = when (val id = outputSnapshot.gamutId) {
+        null -> "Not available"
+        0 -> "Rec.709"
+        else -> "ID $id (unmapped)"
+    }
+    val signal = outputSnapshot.outputInfo?.takeIf { it.isNotBlank() } ?: "Not available"
+    val rows = listOf(
+        Triple("HDR Out", hdrReadback?.let { if (it) "On" else "Off" } ?: "Not reported", "hdrEnable"),
+        Triple("HDR Type", hdr, "hdrType"),
+        Triple("Gamut", gamut, "gamut"),
+        Triple("LUT Out", lutReadback.outputLutEnabled?.let { if (it) "On" else "Off" } ?: "Not reported", "lut"),
+        Triple("4K to HD Output", if (ready) downscaleRawId?.let { "ID $it (unmapped)" } ?: "Not available" else "Not available", "downscale"),
+        Triple("DCI Crop", if (ready) cropRawId?.let { "ID $it (unmapped)" } ?: "Not available" else "Not available", "crop"),
+        Triple("HDMI Timecode", if (ready) hdmiTcEnabled?.let { if (it) "On" else "Off" } ?: "Not available" else "Not available", "timecode"),
+        Triple("SDI Link Type", "Not available", "sdiLink"),
+        Triple("Output Signal", signal, "signal"),
+        Triple("HDMI Output", "Not available", "hdmiStatus"),
+        Triple("SDI Output", "Not available", "sdiStatus"),
+        Triple("OutputPage proof", if (ready && pageEvidence.valid) "${pageEvidence.bytes}B / ${pageEvidence.fields.size} fields" else "Not received", "pageProof")
+    )
+    var outputSheet by remember { mutableStateOf<String?>(null) }
+    // One readback-driven loader: no fake 2.4-second success timer.
+    // A bounded timeout prevents indefinite spinning if no correlated summary is returned.
+    val outputHasReadback = outputSnapshot.connected && (
+        outputSnapshot.rawSummaryAvailable || outputSnapshot.hdrTypeId != null ||
+            outputSnapshot.gamutId != null || !outputSnapshot.outputInfo.isNullOrBlank() ||
+            hdrReadback != null || lutReadback.outputLutEnabled != null
+    )
+    var outputRefreshGeneration by remember(selected?.address) { mutableIntStateOf(0) }
+    var outputReadbackTimedOut by remember(selected?.address, outputRefreshGeneration) { mutableStateOf(false) }
+    var outputMinEntryElapsed by remember(selected?.address, outputRefreshGeneration) { mutableStateOf(false) }
+    // OUTPUT R8: a confirmed no-readback timeout is not a success. Preserve the
+    // warning while Refresh starts a new loading attempt; do not invent values.
+    var outputReadbackEverTimedOut by remember(selected?.address) { mutableStateOf(false) }
+    LaunchedEffect(outputReadbackTimedOut, outputHasReadback) {
+        if (outputHasReadback) outputReadbackEverTimedOut = false
+        else if (outputReadbackTimedOut) outputReadbackEverTimedOut = true
+    }
+    val currentHasOutputReadback by rememberUpdatedState(outputHasReadback)
+    LaunchedEffect(selected?.address, ready, outputRefreshGeneration) {
+        outputReadbackTimedOut = false
+        outputMinEntryElapsed = false
+        Log.i("AtomRemoteOutput45", "OUTPUT LOADER START ready=$ready refresh=$outputRefreshGeneration")
+        if (ready) {
+            vm.refreshOutputHardwareReadback()
+            delay(900L)
+            outputMinEntryElapsed = true
+            if (!currentHasOutputReadback) {
+                delay(8100L)
+                if (!currentHasOutputReadback) {
+                    outputReadbackTimedOut = true
+                    Log.i("AtomRemoteOutput45", "OUTPUT READBACK TIMEOUT readbackStatus=$outputReadbackStatus")
+                }
+            }
+        } else {
+            outputMinEntryElapsed = true
         }
-
-        ModuleSection(
-            "Output Connections",
-            "HDMI, SDI and link options appear only when supported by the connected recorder."
-        ) {
-            ModuleValueRow("HDMI output", "Waiting for recorder data")
-            ModuleValueRow("SDI output", "Waiting for recorder data")
-            ModuleValueRow("SDI link type", "Not reported")
-            ModuleFeatureChips(listOf("HDMI", "SDI", "SDI Link Type"))
+    }
+    val outputLoading = ready && (!outputMinEntryElapsed || (!outputHasReadback && !outputReadbackTimedOut))
+    // OUTPUT02/03: same visual/edit-sheet pattern as Input; no unsupported writes.
+    ModuleShell(vm, AtomosViewModel.Screen.OUTPUT, "Output", recorderName) {
+        Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+            Text("OUTPUT STATUS", color = Color(0xFF8B9497), fontSize = 10.sp, fontWeight = FontWeight.Bold)
+            Spacer(Modifier.weight(1f))
+            Text(if (ready) "REMOTE READY" else "CONNECTING", color = if (ready) AtomosCyan else Color(0xFF93A6AA), fontSize = 11.sp)
         }
-
-        ModuleSection(
-            "Downscale",
-            "Downscale choices are recorder-driven and may vary by model."
-        ) {
-            ModuleValueRow("Current state", "Not reported")
-            ModuleValueRow("Available states", "Waiting for recorder data")
-            ModuleFeatureChips(listOf("Disabled", "Enabled", "HDMI Auto"))
+        if (outputLoading) {
+            RecorderSettingsLoader("Loading Output settings", "Waiting for recorder readback")
+            if (outputReadbackEverTimedOut) {
+                Text("Previous Output GET attempts returned no verified values. Retrying...",
+                    color = Color(0xFFD8B787), fontSize = 12.sp,
+                    modifier = Modifier.padding(top = 12.dp, bottom = 8.dp))
+            }
+        } else if (ready && !outputHasReadback) {
+            Text(
+                "Recorder has not confirmed Output values. $outputReadbackStatus. Use Refresh to retry.",
+                color = Color(0xFFD8B787), fontSize = 12.sp,
+                modifier = Modifier.padding(top = 12.dp, bottom = 8.dp)
+            )
+        } else if (!ready) {
+            Text("Connect the recorder to load Output settings", color = Color(0xFF9CB1B6),
+                fontSize = 12.sp, modifier = Modifier.padding(top = 12.dp, bottom = 8.dp))
         }
-
-        ModuleSection(
-            "DCI Crop",
-            "DCI crop choices are loaded from the connected recorder."
-        ) {
-            ModuleValueRow("Current state", "Not reported")
-            ModuleValueRow("Available options", "Waiting for recorder data")
-            ModuleFeatureChips(listOf("4K / 2K DCI Crop", "Recorder Options"))
+        if (!outputLoading) {
+        listOf(
+            "HDR OUTPUT" to rows.subList(0, 4),
+            "OUTPUT OPTIONS" to rows.subList(4, 8),
+            "OUTPUT SIGNAL" to rows.subList(8, 12)
+        ).forEach { (heading, sectionRows) ->
+            Text(heading, modifier = Modifier.padding(top = 16.dp, bottom = 10.dp), color = Color(0xFF91A4A8), fontSize = 11.sp, fontWeight = FontWeight.Bold)
+            sectionRows.forEachIndexed { index, entry ->
+                val (label, value, key) = entry
+                Row(
+                    Modifier.fillMaxWidth().padding(bottom = 7.dp)
+                        .border(if (index == 0) 1.5.dp else 1.dp,
+                            if (index == 0) AtomosCyan else Color(0xFF30474E), RoundedCornerShape(12.dp))
+                        .background(Color(0xFF06161B), RoundedCornerShape(12.dp))
+                        .clickable {
+                            Log.i("AtomRemoteOutputR10", "SHEET_OPEN key=$key current=$value ready=$ready")
+                            outputSheet = key
+                        }
+                        .padding(horizontal = 16.dp, vertical = 18.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Text("◇", color = AtomosCyan, fontSize = 21.sp)
+                    Spacer(Modifier.width(15.dp))
+                    Text(label, modifier = Modifier.weight(1f), color = Color.White, fontSize = 14.sp, fontWeight = FontWeight.SemiBold)
+                    Text(value, modifier = Modifier.widthIn(max = 140.dp), color = if (index == 0) AtomosCyan else Color(0xFFCBD8DC), fontSize = 12.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                    Spacer(Modifier.width(10.dp))
+                    Text("›", color = Color.White, fontSize = 24.sp)
+                }
+            }
         }
-
-        ModuleSection("HDMI Timecode") {
-            ModuleValueRow("Embedded timecode", "Not reported")
-            ModuleFeatureChips(listOf("HDMI Timecode", "Enable", "Disable"))
+        } // End Output fields: never show setting cards while the shared loader is visible.
+        if (ready && !outputLoading) {
+            Text("Readback: $outputReadbackStatus", color = Color(0xFF93A6AA), fontSize = 11.sp,
+                modifier = Modifier.padding(top = 10.dp, bottom = 2.dp))
         }
-
-        ModuleSection(
-            "HDR Output",
-            "HDR type and gamut choices depend on recorder capabilities."
-        ) {
-            ModuleValueRow("HDR available", "Not reported")
-            ModuleValueRow("HDR enabled", "Not reported")
-            ModuleValueRow("Current type", hdrType?.toString() ?: "Not reported")
-            ModuleValueRow("Current gamut", gamut?.toString() ?: "Not reported")
-            ModuleFeatureChips(listOf("Rec.709", "PQ / ST 2084", "HLG"))
-            ModuleFeatureChips(listOf("BT.2020", "DCI-P3", "P3-D65"))
+        TextButton(onClick = { outputRefreshGeneration += 1 }, enabled = ready && !outputLoading, modifier = Modifier.fillMaxWidth()) {
+            Text("Refresh output readback", color = AtomosCyan, fontSize = 12.sp)
         }
-
-        ModuleSection(
-            "LUT Output",
-            "LUT output becomes available only when the recorder reports support."
+    }
+    // OUTPUT R10: every Output row has an Input-style bottom sheet showing the
+    // recorder's current value and *only* the options established by evidence.
+    // This phase is an inspection UI. No Output SET is emitted from these sheets:
+    // the previous LUT Output ON SET received 0xFFFF from the AG2.
+    if (!outputLoading && outputSheet != null) {
+        val sheetKey = outputSheet ?: ""
+        val selectedRow = rows.firstOrNull { it.third == sheetKey }
+        val isBooleanSetting = sheetKey == "hdrEnable" || sheetKey == "lut" || sheetKey == "timecode"
+        val confirmedBoolean: Boolean? = when (sheetKey) {
+            "hdrEnable" -> if (ready) hdrReadback else null
+            "lut" -> if (ready) lutReadback.outputLutEnabled else null
+            "timecode" -> if (ready) hdmiTcEnabled else null
+            else -> null
+        }
+        val valueReported = when (sheetKey) {
+            "hdrEnable" -> ready && hdrReadback != null
+            "lut" -> ready && lutReadback.outputLutEnabled != null
+            "hdrType" -> ready && outputSnapshot.hdrTypeId != null
+            "gamut" -> ready && outputSnapshot.gamutId != null
+            "downscale" -> ready && downscaleRawId != null
+            "crop" -> ready && cropRawId != null
+            "timecode" -> ready && hdmiTcEnabled != null
+            "signal" -> ready && !outputSnapshot.outputInfo.isNullOrBlank()
+            "pageProof" -> ready && pageEvidence.valid
+            else -> false
+        }
+        val sheetStatus = when {
+            !ready -> "Recorder disconnected"
+            valueReported -> "Current value reported by recorder"
+            else -> "Device value not reported"
+        }
+        ModalBottomSheet(
+            onDismissRequest = { outputSheet = null },
+            containerColor = Color(0xFF06161B),
+            contentColor = Color.White
         ) {
-            ModuleValueRow("Available", "Not reported")
-            ModuleValueRow("Enabled", "Not reported")
-            ModuleFeatureChips(listOf("LUT Output", "Recorder Support"))
+            Column(
+                Modifier.fillMaxWidth().verticalScroll(rememberScrollState())
+                    .padding(start = 20.dp, end = 20.dp, bottom = 28.dp),
+                verticalArrangement = Arrangement.spacedBy(11.dp)
+            ) {
+                Text(selectedRow?.first ?: "Output", color = Color.White,
+                    fontSize = 19.sp, fontWeight = FontWeight.Bold)
+                Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                    Text("CURRENT VALUE", modifier = Modifier.weight(1f),
+                        color = Color(0xFF93A6AA), fontSize = 10.sp, fontWeight = FontWeight.Bold)
+                    Text(if (valueReported) "READ BACK" else "UNAVAILABLE",
+                        color = if (valueReported) AtomosCyan else Color(0xFFD8B787),
+                        fontSize = 10.sp, fontWeight = FontWeight.Bold)
+                }
+                Text(if (ready) (selectedRow?.second ?: "Not available") else "Connect recorder",
+                    color = Color.White, fontSize = 17.sp, fontWeight = FontWeight.SemiBold)
+                Text(sheetStatus, color = Color(0xFF9CB1B6), fontSize = 11.sp)
+                if (sheetKey == "pageProof") {
+                    Text("Recorder-confirmed raw AppPolling.OutputPageGet (0x0644 / 0x8644). Protobuf field numbers are NOT proven setting labels.",
+                        color = Color(0xFF9CB1B6), fontSize = 11.sp)
+                    if (pageEvidence.valid) {
+                        Text("${pageEvidence.bytes} bytes | ${pageEvidence.fields.size} top-level fields",
+                            color = AtomosCyan, fontSize = 12.sp, fontWeight = FontWeight.Bold)
+                        pageEvidence.fields.forEach { field ->
+                            Text("Field ${field.number} (wire ${field.wireType}): ${field.value}",
+                                color = Color(0xFFCBD8DC), fontSize = 11.sp)
+                        }
+                        OutlinedButton(onClick = {
+                            outputPageBaseline = outputPageRaw
+                            Log.i("AtomRemoteOutputR23", "AB_BASELINE_CAPTURE bytes=${pageEvidence.bytes} raw=$outputPageRaw")
+                        }, modifier = Modifier.fillMaxWidth()) {
+                            Text("Save current page as A/B baseline")
+                        }
+                        if (outputPageBaseline != null) {
+                            val diffs = OutputPageWireDecoder.differences(outputPageBaseline, outputPageRaw)
+                            Text("Changed wire fields vs saved baseline: ${diffs.size}",
+                                color = AtomosCyan, fontSize = 12.sp)
+                            diffs.forEach { diff ->
+                                Text(diff, color = Color(0xFFCBD8DC), fontSize = 11.sp)
+                            }
+                            Text("After changing ONE setting on the recorder itself, tap Refresh and reopen this sheet. Any changed field is an A/B candidate, not proof until reproduced.",
+                                color = Color(0xFF9CB1B6), fontSize = 11.sp)
+                        }
+                    } else {
+                        Text("A complete typed OutputPage response has not arrived.",
+                            color = Color(0xFFD8B787), fontSize = 12.sp)
+                    }
+                }
+                if (sheetKey == "lut") {
+                    val capability = when (lutReadback.outputLutAvailable) {
+                        true -> "LUT Output capability: reported available"
+                        false -> "LUT Output capability: reported unavailable"
+                        null -> "LUT Output capability: not reported"
+                    }
+                    Text(capability, color = Color(0xFF9CB1B6), fontSize = 11.sp)
+                }
+                HorizontalDivider(color = Color(0xFF30474E))
+                Text("OPTIONS", color = Color(0xFF93A6AA),
+                    fontSize = 11.sp, fontWeight = FontWeight.Bold)
+                if (sheetKey == "pageProof") {
+                    Text("This screen is evidence only. No recorder SET is transmitted.",
+                        color = Color(0xFF9CB1B6), fontSize = 11.sp)
+                } else if (isBooleanSetting) {
+                    // Boolean choices are known from the official Output UI.
+                    // Their availability as *writable* options has NOT been verified.
+                    listOf(false, true).forEach { option ->
+                        val checked = confirmedBoolean == option
+                        Row(
+                            Modifier.fillMaxWidth()
+                                .border(1.dp, if (checked) AtomosCyan else Color(0xFF30474E),
+                                    RoundedCornerShape(11.dp))
+                                .background(Color(0xFF102126), RoundedCornerShape(11.dp))
+                                .padding(horizontal = 14.dp, vertical = 13.dp),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Text(if (option) "On" else "Off", modifier = Modifier.weight(1f),
+                                color = Color.White, fontSize = 14.sp)
+                            if (checked) {
+                                Text("CURRENT", color = AtomosCyan,
+                                    fontSize = 10.sp, fontWeight = FontWeight.Bold)
+                            } else {
+                                Text("READ ONLY", color = Color(0xFF819196), fontSize = 10.sp)
+                            }
+                        }
+                    }
+                    Text("These are the control's On/Off choices, not a confirmed writable option list. Changes are disabled until AG2 SET and post-SET GET pass.",
+                        color = Color(0xFF9CB1B6), fontSize = 11.sp)
+                    if (sheetKey == "lut") {
+                        Text("Previous LUT Out ON request was rejected (0xFFFF); no automatic retry.",
+                            color = Color(0xFFD8B787), fontSize = 11.sp)
+                    }
+                } else {
+                    // Show only the *current* recorder-returned scalar ID. The
+                    // supported-values list GET is still unmapped for this device.
+                    val enumId = when (sheetKey) {
+                        "hdrType" -> outputSnapshot.hdrTypeId
+                        "gamut" -> outputSnapshot.gamutId
+                        else -> null
+                    }
+                    if (enumId == 0) {
+                        Row(
+                            Modifier.fillMaxWidth()
+                                .border(1.dp, AtomosCyan, RoundedCornerShape(11.dp))
+                                .background(Color(0xFF102126), RoundedCornerShape(11.dp))
+                                .padding(horizontal = 14.dp, vertical = 13.dp),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Text("Rec.709", modifier = Modifier.weight(1f),
+                                color = Color.White, fontSize = 14.sp)
+                            Text("CURRENT / ID 0", color = AtomosCyan,
+                                fontSize = 10.sp, fontWeight = FontWeight.Bold)
+                        }
+                        Text("Recorder GET returned ID 0. Rec.709 is the matching official macOS enum label. Other supported options have not been reported.",
+                            color = Color(0xFF9CB1B6), fontSize = 11.sp)
+                    }
+                    Row(
+                        Modifier.fillMaxWidth().border(1.dp, Color(0xFF30474E),
+                            RoundedCornerShape(11.dp)).padding(14.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Text("Recorder option list not received yet",
+                            color = Color(0xFFB6C7CB), fontSize = 13.sp)
+                    }
+                    Text(
+                        when (sheetKey) {
+                            "hdrType", "gamut", "downscale", "crop", "sdiLink" ->
+                                "Supported choices will be shown when a verified AG2 GET/list response is available. No guessed options are added."
+                            "signal", "hdmiStatus", "sdiStatus" ->
+                                "This item reports output status; it is not a writable setting."
+                            else -> "This item is read-only until its device protocol is verified."
+                        }, color = Color(0xFF9CB1B6), fontSize = 11.sp
+                    )
+                }
+                if (sheetKey in listOf("downscale", "crop", "timecode", "sdiLink", "signal", "hdmiStatus", "sdiStatus") && pageEvidence.valid) {
+                    Text("OutputPage response available (${pageEvidence.bytes} bytes, ${pageEvidence.fields.size} fields). This setting is not yet linked to a verified field number. Open OutputPage proof for raw evidence and A/B comparison.",
+                        color = Color(0xFFD8B787), fontSize = 11.sp)
+                }
+                OutlinedButton(
+                    onClick = {
+                        Log.i("AtomRemoteOutputR10", "SHEET_REFRESH key=$sheetKey")
+                        outputSheet = null
+                        outputRefreshGeneration += 1
+                    }, enabled = ready, modifier = Modifier.fillMaxWidth()
+                ) { Text("Refresh recorder values") }
+                TextButton(onClick = { outputSheet = null }, modifier = Modifier.fillMaxWidth()) {
+                    Text("Close", color = AtomosCyan)
+                }
+            }
         }
     }
 }
-
 @Composable
 private fun SettingsModuleScreen(vm: AtomosViewModel) {
     val selected by vm.selected.collectAsState()
@@ -5234,6 +7661,121 @@ private fun RemoteModuleCard(
                     fontWeight = FontWeight.Black,
                     letterSpacing = 0.5.sp,
                     modifier = Modifier.padding(horizontal = 9.dp, vertical = 6.dp)
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun RemoteTransportDivider() {
+    Box(
+        Modifier
+            .width(1.dp)
+            .height(64.dp)
+            .background(Color(0xFF1E3538))
+    )
+}
+
+@Composable
+private fun RemoteTransportDockButton(
+    label: String,
+    kind: String,
+    enabled: Boolean,
+    accent: Color,
+    modifier: Modifier = Modifier,
+    loading: Boolean = false,
+    onClick: () -> Unit
+) {
+    Box(
+        modifier = modifier
+            .height(92.dp)
+            .background(Color.Transparent, RoundedCornerShape(14.dp))
+            .clickable(enabled = enabled, onClick = onClick),
+        contentAlignment = Alignment.Center
+    ) {
+        Column(
+            horizontalAlignment = Alignment.CenterHorizontally,
+            verticalArrangement = Arrangement.Center
+        ) {
+            if (loading) {
+                CircularProgressIndicator(
+                    modifier = Modifier.size(30.dp),
+                    strokeWidth = 2.dp,
+                    color = accent
+                )
+            } else {
+                RemoteTransportGlyph(kind = kind, tint = accent, modifier = Modifier.size(54.dp))
+            }
+            Spacer(Modifier.height(8.dp))
+            Text(
+                text = label,
+                color = if (enabled || loading) Color.White else Color(0xFF738185),
+                fontSize = 7.5.sp,
+                fontWeight = FontWeight.ExtraBold,
+                letterSpacing = 0.45.sp,
+                maxLines = 1
+            )
+        }
+    }
+}
+
+@Composable
+private fun RemoteTransportGlyph(
+    kind: String,
+    tint: Color,
+    modifier: Modifier = Modifier
+) {
+    Canvas(modifier) {
+        val w = size.width
+        val h = size.height
+        val center = Offset(w / 2f, h / 2f)
+        val ring = minOf(w, h) * 0.38f
+        val stroke = ring * 0.10f
+        val ringColor = if (kind == "record") AtomosRed else Color(0xFF5D6870)
+        drawCircle(
+            color = ringColor,
+            radius = ring,
+            center = center,
+            style = Stroke(width = stroke)
+        )
+        when (kind) {
+            "record" -> {
+                drawCircle(color = AtomosRed, radius = ring * 0.42f, center = center)
+            }
+            "stop" -> {
+                val side = ring * 0.82f
+                drawRoundRect(
+                    color = Color.White,
+                    topLeft = Offset(center.x - side / 2f, center.y - side / 2f),
+                    size = Size(side, side),
+                    cornerRadius = androidx.compose.ui.geometry.CornerRadius(side * 0.12f, side * 0.12f)
+                )
+            }
+            "play" -> {
+                val path = androidx.compose.ui.graphics.Path().apply {
+                    moveTo(center.x - ring * 0.28f, center.y - ring * 0.40f)
+                    lineTo(center.x + ring * 0.42f, center.y)
+                    lineTo(center.x - ring * 0.28f, center.y + ring * 0.40f)
+                    close()
+                }
+                drawPath(path = path, color = Color.White)
+            }
+            "pause" -> {
+                val barW = ring * 0.22f
+                val barH = ring * 0.85f
+                val gap = ring * 0.18f
+                drawRoundRect(
+                    color = Color.White,
+                    topLeft = Offset(center.x - gap / 2f - barW, center.y - barH / 2f),
+                    size = Size(barW, barH),
+                    cornerRadius = androidx.compose.ui.geometry.CornerRadius(barW * 0.25f, barW * 0.25f)
+                )
+                drawRoundRect(
+                    color = Color.White,
+                    topLeft = Offset(center.x + gap / 2f, center.y - barH / 2f),
+                    size = Size(barW, barH),
+                    cornerRadius = androidx.compose.ui.geometry.CornerRadius(barW * 0.25f, barW * 0.25f)
                 )
             }
         }
@@ -5481,7 +8023,7 @@ private fun NetworkScreen(vm: AtomosViewModel) {
             item {
                 Card(Modifier.fillMaxWidth(), colors = CardDefaults.cardColors(containerColor = AtomosSurface2)) {
                     Column(Modifier.padding(14.dp)) {
-                        Text("${status.transport} â€¢ ${if (status.connected) "CONNECTED" else "OFFLINE"}", color = AtomosCyan, fontWeight = FontWeight.Bold)
+                        Text("${status.transport} Ã¢â‚¬Â¢ ${if (status.connected) "CONNECTED" else "OFFLINE"}", color = AtomosCyan, fontWeight = FontWeight.Bold)
                         Text(status.localAddresses.joinToString().ifBlank { "No local address" }, color = Color.LightGray, fontSize = 11.sp)
                         Text(status.message, color = Color.Gray, fontSize = 10.sp)
                         Text("Discovery combines mDNS/DNS-SD, SSDP, neighbour-cache hints and a bounded same-subnet scan. Same Wi-Fi now identifies the Shogun and launches BLE pairing from the device card. ATOMOS documents AtomRemote control over Bluetooth LE; no public LAN remote-control API was found, so SSH/port 22 is never treated as a control interface.", color = Color.Gray, fontSize = 11.sp, modifier = Modifier.padding(top = 8.dp))
@@ -5528,7 +8070,7 @@ private fun LanDeviceCard(device: LanDeviceCandidate, onProbe: () -> Unit, onPai
             Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
                 Column(Modifier.weight(1f)) {
                     Text(
-                        if (device.likelyAtomos) "ATOMOS CANDIDATE â€¢ ${device.displayName}" else device.displayName,
+                        if (device.likelyAtomos) "ATOMOS CANDIDATE Ã¢â‚¬Â¢ ${device.displayName}" else device.displayName,
                         color = if (device.likelyAtomos) AtomosCyan else Color.White,
                         fontWeight = FontWeight.Bold
                     )
@@ -5860,7 +8402,7 @@ private fun FinalQaScreen(vm: AtomosViewModel) {
                     Column(Modifier.padding(14.dp)) {
                         Text("RELEASE READINESS", color = AtomosCyan, fontWeight = FontWeight.Bold)
                         Text(
-                            report?.let { "${it.passed}/${it.total} checks passing â€¢ ${it.blockers} blocker(s)" } ?: "Running checks...",
+                            report?.let { "${it.passed}/${it.total} checks passing Ã¢â‚¬Â¢ ${it.blockers} blocker(s)" } ?: "Running checks...",
                             color = Color.LightGray,
                             fontSize = 12.sp
                         )

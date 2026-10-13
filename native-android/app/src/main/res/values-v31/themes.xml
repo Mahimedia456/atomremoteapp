@@ -1,0 +1,7 @@
+<resources>
+    <style name="Theme.AtomosRemote.Starting" parent="Theme.AtomosRemote">
+        <item name="android:windowSplashScreenBackground">@color/atom_remote_bg</item>
+        <item name="android:windowSplashScreenAnimatedIcon">@drawable/atom_remote_icon_foreground</item>
+        <item name="android:windowSplashScreenIconBackgroundColor">@color/atom_remote_bg</item>
+    </style>
+</resources>
