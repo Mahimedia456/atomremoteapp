@@ -575,12 +575,14 @@ class GattClient(context: Context) {
 
     @SuppressLint("MissingPermission")
     fun connect(device: BluetoothDevice) {
+        r2706MicReset("new-connect")
         outputR21MtuRequested = false
         outputR21MtuBytes = 23
         outputR21MtuResult = "not-requested"
         audioR26RunId += 1
         audioR26Active = null
         _audioR26Live.value = com.atomosremote.nativeapp.audio.AudioR26LiveSnapshot()
+        _r2697MicLineEvidence.value = com.atomosremote.nativeapp.audio.AudioR2697MicLineSnapshot()
         targetDevice = device
         address = device.address
         retryCount = 0
@@ -809,6 +811,7 @@ class GattClient(context: Context) {
 
     @SuppressLint("MissingPermission")
     fun disconnect() {
+        r2706MicReset("disconnect")
         pendingOps.clear()
         activeOp = null
         operationInFlight = false
@@ -848,6 +851,7 @@ class GattClient(context: Context) {
         audioR26RunId += 1
         audioR26Active = null
         _audioR26Live.value = com.atomosremote.nativeapp.audio.AudioR26LiveSnapshot()
+        _r2697MicLineEvidence.value = com.atomosremote.nativeapp.audio.AudioR2697MicLineSnapshot()
         activeOp = null
         operationInFlight = false
         val current = gatt
@@ -3536,6 +3540,19 @@ class GattClient(context: Context) {
             return true
         }
 
+        // R27.01: give a pending, MTU-ready verified Audio GET one bounded
+        // turn only BETWEEN Extended Input probes, never during an active packet.
+        // This retains the original input probe index, variant and response contract.
+        if (audioR2701YieldAllowed()) {
+            mainHandler.postDelayed({ queueExtendedInputProbe() }, 180L)
+            return true
+        }
+        // R27.08 Mic/Line: one non-local polling GET in this genuinely idle gap.
+        // Preserve Input index/variant and never change the active Input payload.
+        if (r2708MicYieldToInputGap()) {
+            mainHandler.postDelayed({ queueExtendedInputProbe() }, 180L)
+            return true
+        }
         val probe = InputExtendedReadPlan.probes[inputExtendedIndex]
         val localRoute = inputExtendedVariant == 1
         val packetId = if (localRoute) 0 else {
@@ -4179,9 +4196,766 @@ class GattClient(context: Context) {
     // no changes to official TCS pairing, Input owner, or PacketLink serializer.
     private val _audioR26Live = MutableStateFlow(com.atomosremote.nativeapp.audio.AudioR26LiveSnapshot())
     val audioR26Live: StateFlow<com.atomosremote.nativeapp.audio.AudioR26LiveSnapshot> = _audioR26Live
+    // R26.97 READ-ONLY candidate evidence, scoped to current TCS session.
+    // Does not alter pairing, PacketLink state, or Audio-page GET.
+    private val _r2697MicLineEvidence = MutableStateFlow(com.atomosremote.nativeapp.audio.AudioR2697MicLineSnapshot())
+    val r2697MicLineEvidence: StateFlow<com.atomosremote.nativeapp.audio.AudioR2697MicLineSnapshot> = _r2697MicLineEvidence
+    private var r2697MicLineToken = 0L
+    private fun r2697MicLineState(key: String, cmd: Int, state: String, detail: String = "") {
+        r2697MicLineToken += 1L
+        val report = com.atomosremote.nativeapp.audio.AudioR2697MicLineRecord(
+            key, cmd, r2697MicLineToken, state, detail = detail)
+        _r2697MicLineEvidence.value = _r2697MicLineEvidence.value.copy(
+            controls = _r2697MicLineEvidence.value.controls + (key to report))
+        android.util.Log.i("AtomRemoteAudioR2697", "MIC_GET_STATE key=$key state=$state cmd=0x${cmd.toString(16)} detail=$detail")
+    }
+
+    // R27.06 MIC/LINE: bounded, operator-origin read intents. Main-thread pump only.
+    // 'accepted into intents' != PacketLink buffer != ATT callback != device RX.
+    private data class R2706MicRead(
+        val key: String, val command: Int, val token: Long, val createdMs: Long,
+        var stage: String = "PENDING_TRANSPORT", var dispatchedMs: Long = 0L,
+        var gattWrittenMs: Long = 0L, var deliveredMs: Long = 0L,
+        var requestPacketId: Int = 0, var assembledSeen: Int = 0,
+        var typedCandidatesSeen: Int = 0, var invalidFramesSeen: Int = 0,
+        var localTrial: Boolean = false // R27.11 limited operator-triggered Gain Left trial
+    )
+    private val r2706MicReads = ArrayDeque<R2706MicRead>()
+    private var r2706MicActive: R2706MicRead? = null
+    private var r2706MicPumpTask: Runnable? = null
+    private val r2706MicWaitMs = 85_000L
+    private val r2706MicAttMs = 18_000L
+    private val r2706MicRxMs = 12_000L
+
+    private fun r2706MicMark(read: R2706MicRead, stage: String, detail: String) {
+        val old = _r2697MicLineEvidence.value.controls[read.key] ?: return
+        if (old.requestToken != read.token) return
+        read.stage = stage
+        _r2697MicLineEvidence.value = _r2697MicLineEvidence.value.copy(
+            controls = _r2697MicLineEvidence.value.controls +
+                (read.key to old.copy(state = stage, detail = detail)))
+        android.util.Log.i("AtomRemoteAudioR2706", "MIC_STAGE key=${read.key} " +
+            "cmd=0x${read.command.toString(16)} token=${read.token} stage=$stage detail=$detail")
+    }
+
+    private var r2722LastGainRxMs = 0L
+    // A05: Explicit one-shot Input Level pilot evidence; no other SET unlocked.
+    private var a05LastInputRxMs = 0L
+    private var a05InputPendingTarget: Int? = null
+    private var a05InputPreviousRaw: Long? = null
+    private var a05InputSetAtMs = 0L
+    private var r2722PilotRestoreSelector: Boolean? = null
+    private var r2722PilotSinceMs = 0L
+    // A12.35: Capture one explicit Gain pilot at a time, and prove which
+    // channel changed using only a fresh recorder GET. Never infer SET success
+    // from local PacketLink queue acceptance.
+    private var a135GainPilotSelector: Boolean? = null
+    private var a135GainPilotRestore = false
+    private var a135GainPilotBeforeLeft = 0L
+    private var a135GainPilotBeforeRight = 0L
+    private var a135GainPilotAt = 0L
+
+
+    private fun r2706MicReset(reason: String) {
+        a051CancelSetIntent("session-reset:$reason")
+        r2722LastGainRxMs = 0L
+        a05LastInputRxMs = 0L
+        a05InputPendingTarget = null
+        a05InputPreviousRaw = null
+        a05InputSetAtMs = 0L
+        r2722PilotRestoreSelector = null
+        r2722CancelIdleWindow("session-reset")
+        r2722PilotSinceMs = 0L
+        r2706MicPumpTask?.let { mainHandler.removeCallbacks(it) }
+        r2706MicPumpTask = null
+        r2706MicReads.clear()
+        r2706MicActive = null
+        r2708MicTurnOpen = false
+        r2708MicTurnGeneration = -1
+        r2708MicConsumedGeneration = -1
+        android.util.Log.i("AtomRemoteAudioR2706", "MIC_SESSION_RESET reason=$reason")
+    }
+
+    private fun r2706MicPumpSoon(delayMs: Long = 250L) {
+        if (r2706MicPumpTask != null) return
+        val task = Runnable {
+            r2706MicPumpTask = null
+            r2706MicPump()
+        }
+        r2706MicPumpTask = task
+        mainHandler.postDelayed(task, delayMs)
+    }
+
+    @SuppressLint("MissingPermission")
+    private fun r2706RequestMicLineRead(key: String, cmd: Int): Boolean {
+        if (gatt == null || !_tcsPairingState.value.acceptWritten ||
+            !_tcsRemoteState.value.available) {
+            r2697MicLineState(key, cmd, "RECORDER_NOT_READY", "Pairing and PacketLink required")
+            return false
+        }
+        if (r2706MicActive?.key == key || r2706MicReads.any { it.key == key }) {
+            android.util.Log.i("AtomRemoteAudioR2706", "MIC_DUPLICATE_COLLAPSED key=$key")
+            return true
+        }
+        if (r2706MicReads.size >= 4) {
+            r2697MicLineState(key, cmd, "READ_QUEUE_FULL", "Maximum four distinct pending controls")
+            return false
+        }
+        r2697MicLineState(key, cmd, "PENDING_TRANSPORT", "Queued locally, no BLE TX yet")
+        val token = _r2697MicLineEvidence.value.controls[key]?.requestToken ?: return false
+        val intent = R2706MicRead(key, cmd, token, android.os.SystemClock.elapsedRealtime())
+        // A12.32: a delay confirmation requested after a SET must not sit behind
+        // queued Gain/Input GETs. Never interrupt an active ATT or PacketLink op.
+        if (key == "delay" && a124DelayPendingGet) {
+            r2706MicReads.addFirst(intent)
+            android.util.Log.i("AtomRemoteAudioA132", "DELAY_GET_PRIORITY queuedFirst=true active=${r2706MicActive?.key ?: "none"} preempt=false")
+        } else {
+            r2706MicReads.addLast(intent)
+        }
+        android.util.Log.i("AtomRemoteAudioR2706", "MIC_INTENT_ACCEPTED key=$key " +
+            "cmd=0x${cmd.toString(16)} token=$token local=false body=EMPTY " +
+            "bleTransmitted=false depth=${r2706MicReads.size}")
+        r2706MicPumpSoon(0L)
+        return true
+    }
+
+    // R27.15: strictly scoped Audio In Level read (InputSourceGet 0x06B3).
+    // Official macOS expected reply base: 0x06AE. Recorder reply is not yet verified.
+    // This does not change Gain, TCS, PacketLink, or any remote SET.
+    @SuppressLint("MissingPermission")
+    private fun r2715EnqueueMicInputLevelTrial(read: R2706MicRead): Boolean {
+        if (!com.atomosremote.nativeapp.audio.AudioR2715InputLevelTrial.eligible(read.key, read.command)) return false
+        val current = gatt ?: return false
+        val characteristic = current.getService(UUID.fromString(AIRGLU_SHOGUN_SERVICE_UUID))
+            ?.getCharacteristic(UUID.fromString(TCS_PACKET_WRITE_UUID)) ?: return false
+        if (pendingRemotePacket != null || packetLink18.bufferedPacketSize() != 0) return false
+        val purpose = "r2672-micline-get:${read.key}"
+        val body = buildOfficialAtomMessageBodyWithProtoPayload(0, read.command, byteArrayOf())
+        val packet = PendingRemotePacket(body = body, purpose = purpose,
+            label = "R2715 Audio In Level GET only", commandId = read.command, packetId = 0)
+        pendingRemotePacket = packet
+        pendingRemoteFrameWritten = false
+        val buffered = queueRemotePacket18_8(packet, local = true)
+        if (!buffered) {
+            if (pendingRemotePacket === packet) {
+                pendingRemotePacket = null
+                pendingRemoteFrameWritten = false
+            }
+            android.util.Log.i("AtomRemoteAudioR2715", "INPUT_LEVEL_LOCAL_DEFER noTx=true")
+            return false
+        }
+        android.util.Log.i("AtomRemoteAudioR2715", "INPUT_LEVEL_LOCAL_BUFFER " +
+            "key=${read.key} cmd=0x${read.command.toString(16)} packetId=0 " +
+            "local=true proto=EMPTY body=${body.toHex()} expectedATT=E8000000B306 " +
+            "physicalTxPending=true optionMappingVerified=false setTx=false")
+        return true
+    }
+
+    // R27.11: verified local GET wire shape is E8 + packetID(0) + len(0)
+    // + opcode(0x06B6). This is an EXPERIMENTAL Gain Left read only.
+    // No nonlocal fallback, SET, retries or changes to the shared serializer.
+    @SuppressLint("MissingPermission")
+    private fun r2711EnqueueMicLocalTrial(read: R2706MicRead): Boolean {
+        if (!com.atomosremote.nativeapp.audio.AudioR2711LocalGainTrial.eligible(read.key, read.command)) return false
+        val current = gatt ?: return false
+        val characteristic = current.getService(UUID.fromString(AIRGLU_SHOGUN_SERVICE_UUID))
+            ?.getCharacteristic(UUID.fromString(TCS_PACKET_WRITE_UUID)) ?: return false
+        if (pendingRemotePacket != null || packetLink18.bufferedPacketSize() != 0) return false
+        val purpose = "r2672-micline-get:${read.key}"
+        val body = buildOfficialAtomMessageBodyWithProtoPayload(0, read.command, byteArrayOf())
+        val packet = PendingRemotePacket(body = body, purpose = purpose,
+            label = "R2711 local Gain Left trial", commandId = read.command, packetId = 0)
+        pendingRemotePacket = packet
+        pendingRemoteFrameWritten = false
+        val buffered = queueRemotePacket18_8(packet, local = true)
+        if (!buffered) {
+            if (pendingRemotePacket === packet) {
+                pendingRemotePacket = null
+                pendingRemoteFrameWritten = false
+            }
+            android.util.Log.w("AtomRemoteAudioR2711", "MIC_LOCAL_TRIAL_DEFER noTx=true")
+            return false
+        }
+        android.util.Log.i("AtomRemoteAudioR2711", "MIC_LOCAL_TRIAL_BUFFER " +
+            "key=${read.key} cmd=0x${read.command.toString(16)} " +
+            "packetId=0 local=true proto=EMPTY body=${body.toHex()} " +
+            "expectedATT=E8000000B606 physicalTxPending=true numericVerified=false")
+        return true
+    }
+
+    // A10 one-shot operator-triggered FrameDelayGet pilot. No SET and no fallback.
+    @SuppressLint("MissingPermission")
+    private fun a10EnqueueDelayLocalGet(read: R2706MicRead): Boolean {
+        if (read.key != "delay" || read.command != 0x06B9) return false
+        val connected = gatt ?: return false
+        val ch = connected.getService(UUID.fromString(AIRGLU_SHOGUN_SERVICE_UUID))
+            ?.getCharacteristic(UUID.fromString(TCS_PACKET_WRITE_UUID)) ?: return false
+        if (pendingRemotePacket != null || packetLink18.bufferedPacketSize() != 0) return false
+        val payload = buildOfficialAtomMessageBodyWithProtoPayload(0, 0x06B9, byteArrayOf())
+        val packet = PendingRemotePacket(payload, "r2672-micline-get:delay",
+            "A10 Delay local GET pilot", 0x06B9, 0)
+        pendingRemotePacket = packet
+        pendingRemoteFrameWritten = false
+        val queued = queueRemotePacket18_8(packet, local = true)
+        if (!queued && pendingRemotePacket === packet) {
+            pendingRemotePacket = null
+            pendingRemoteFrameWritten = false
+        }
+        android.util.Log.i("AtomRemoteAudioA10", "DELAY_LOCAL_GET queued=$queued " +
+            "cmd=0x06B9 local=true packetId=0 proto=EMPTY " +
+            "expectedATT=E8000000B906 setTx=false numericVerified=false")
+        return queued
+    }
+
+    // packet ID, like existing non-local Input and Display getters. The general
+    // payload helper is intentionally unchanged because local SETs use ID zero.
+    @SuppressLint("MissingPermission")
+    private fun r2708EnqueueMicNonLocalRead(read: R2706MicRead): Boolean {
+        val current = gatt ?: return false
+        val characteristic = current.getService(UUID.fromString(AIRGLU_SHOGUN_SERVICE_UUID))
+            ?.getCharacteristic(UUID.fromString(TCS_PACKET_WRITE_UUID)) ?: return false
+        if (pendingRemotePacket != null || packetLink18.bufferedPacketSize() != 0) return false
+        // same sequence rule as queueOfficialDisplayGetter / non-local Input probes
+        tcsCommandSequence = if (tcsCommandSequence >= 255) 1 else tcsCommandSequence + 1
+        val packetId = tcsCommandSequence
+        val purpose = "r2672-micline-get:${read.key}"
+        val body = buildOfficialAtomMessageBodyWithProtoPayload(packetId, read.command, byteArrayOf())
+        val packet = PendingRemotePacket(
+            body = body, purpose = purpose, label = "R2708 Mic GET ${read.key}",
+            commandId = read.command, packetId = packetId
+        )
+        pendingRemotePacket = packet
+        pendingRemoteFrameWritten = false
+        val buffered = queueRemotePacket18_8(packet, local = false)
+        if (!buffered) {
+            if (pendingRemotePacket === packet) {
+                pendingRemotePacket = null
+                pendingRemoteFrameWritten = false
+            }
+            android.util.Log.w("AtomRemoteAudioR2708", "MIC_NONLOCAL_ENQUEUE_DEFER " +
+                "key=${read.key} cmd=0x${read.command.toString(16)} id=$packetId")
+            return false
+        }
+        android.util.Log.i("AtomRemoteAudioR2708", "MIC_NONLOCAL_PACKET_ID " +
+            "key=${read.key} cmd=0x${read.command.toString(16)} " +
+            "packetId=$packetId local=false emptyProto=true body=${body.toHex()} " +
+            "bufferedOnly=true physicalTxPending=true numericVerified=false")
+        return true
+    }
+
+    // R27.08: exactly one bounded Mic/Line polling opportunity between two
+    // completed Extended Input probes. Never interrupt a current Input packet.
+    private var r2708MicTurnOpen = false
+    private var r2708MicTurnGeneration = -1
+    private var r2708MicTurnIndex = -1
+    private var r2708MicTurnStartedMs = 0L
+    private var r2708MicConsumedGeneration = -1
+    private var r2708MicConsumedIndex = -1
+    private fun r2708MicYieldToInputGap(): Boolean {
+        if (!inputExtendedRunning || r2706MicActive != null || r2706MicReads.isEmpty() ||
+            _audioR26Live.value.running || inputExtendedActive != null ||
+            inputCollectorRunning || remoteBootstrapActive || pendingRemotePacket != null ||
+            pendingOps.isNotEmpty() || operationInFlight ||
+            packetLink18.bufferedPacketSize() != 0 ||
+            packetLink18.state().toString() != "READY") {
+            r2708MicTurnOpen = false
+            return false
+        }
+        if (r2708MicConsumedGeneration == inputExtendedGeneration &&
+            r2708MicConsumedIndex == inputExtendedIndex) return false
+        val now = android.os.SystemClock.elapsedRealtime()
+        if (r2708MicTurnGeneration != inputExtendedGeneration ||
+            r2708MicTurnIndex != inputExtendedIndex) {
+            r2708MicTurnGeneration = inputExtendedGeneration
+            r2708MicTurnIndex = inputExtendedIndex
+            r2708MicTurnStartedMs = now
+        }
+        if (now - r2708MicTurnStartedMs >= 800L) {
+            r2708MicTurnOpen = false
+            android.util.Log.i("AtomRemoteAudioR2708", "MIC_FAIR_GAP_EXPIRED " +
+                "inputIndex=$inputExtendedIndex queued=${r2706MicReads.size}")
+            return false
+        }
+        r2708MicTurnOpen = true
+        r2706MicPumpTask?.let { mainHandler.removeCallbacks(it) }
+        r2706MicPumpTask = null
+        r2706MicPumpSoon(0L)
+        android.util.Log.i("AtomRemoteAudioR2708", "MIC_FAIR_GAP_GRANTED " +
+            "inputIndex=$inputExtendedIndex total=${InputExtendedReadPlan.probes.size} " +
+            "queued=${r2706MicReads.size} noActiveInputPacket=true")
+        return true
+    }
+
+    @SuppressLint("MissingPermission")
+    private fun r2706MicPump() {
+        val now = android.os.SystemClock.elapsedRealtime()
+        if (gatt == null || !_tcsPairingState.value.acceptWritten ||
+            !_tcsRemoteState.value.available) {
+            r2706MicActive?.let { r2706MicMark(it, "SESSION_ENDED", "Recorder disconnected") }
+            r2706MicReads.forEach { r2706MicMark(it, "SESSION_ENDED", "Recorder disconnected") }
+            r2706MicReset("transport-not-ready")
+            return
+        }
+        if (r2706MicReads.isNotEmpty()) {
+            val head = r2706MicReads.first()
+            val waitMs = now - head.createdMs
+            if (waitMs >= 1500L && waitMs % 3000L < 300L) {
+                android.util.Log.i("AtomRemoteAudioA125", "MIC_GET_WAIT " +
+                    "key=${head.key} waitMs=$waitMs queueDepth=${r2706MicReads.size} " +
+                    "active=${r2706MicActive?.key ?: "none"} inputExtended=$inputExtendedRunning " +
+                    "audioRunning=${audioR26Live.value.running} attBusy=$operationInFlight " +
+                    "pendingOps=${pendingOps.size} pendingPacket=${pendingRemotePacket?.purpose ?: "none"}")
+            }
+        }
+        val active = r2706MicActive
+        if (active != null) {
+            val elapsed = now - active.dispatchedMs
+            val timeout = when {
+                active.deliveredMs > 0L -> now - active.deliveredMs >= r2706MicRxMs
+                active.gattWrittenMs > 0L -> elapsed >= r2706MicAttMs + r2706MicRxMs
+                else -> elapsed >= r2706MicAttMs
+            }
+            if (timeout) {
+                val state = when {
+                    active.deliveredMs > 0L -> "RX_TIMEOUT_AFTER_DELIVERY"
+                    active.gattWrittenMs > 0L -> "DELIVERY_TIMEOUT_AFTER_ATT"
+                    else -> "ATT_WRITE_UNCONFIRMED_TIMEOUT"
+                }
+                r2706MicMark(active, state,
+                    "Bounded read ended; transport not reset; no SET; no automatic resend")
+                android.util.Log.w("AtomRemoteAudioR2706", "MIC_GET_TIMEOUT " +
+                    "key=${active.key} stage=$state elapsedMs=$elapsed " +
+                    "assembledSeen=${active.assembledSeen} " +
+                    "typedCandidatesSeen=${active.typedCandidatesSeen} " +
+                    "invalidFramesSeen=${active.invalidFramesSeen}")
+                android.util.Log.i("AtomRemoteAudioR2707", "MIC_RX_WINDOW_SUMMARY " +
+                    "key=${active.key} cmd=0x${active.command.toString(16)} token=${active.token} " +
+                    "expectedPacketId=${active.requestPacketId} assembled=${active.assembledSeen} " +
+                    "typed=${active.typedCandidatesSeen} malformed=${active.invalidFramesSeen} " +
+                    "result=NO_VERIFIED_NUMERIC_RESPONSE")
+                r2706MicActive = null
+            }
+        }
+        while (r2706MicReads.isNotEmpty() && now - r2706MicReads.first().createdMs > r2706MicWaitMs) {
+            val expired = r2706MicReads.removeFirst()
+            r2706MicMark(expired, "DEFER_EXPIRED", "Transport busy for 85s; no BLE TX")
+        }
+        if (r2706MicActive == null && r2706MicReads.isNotEmpty()) {
+            val ready = !_audioR26Live.value.running && !remoteBootstrapActive &&
+                !inputCollectorRunning && (!inputExtendedRunning || r2708MicTurnOpen) &&
+                (inputExtendedActive == null || !inputExtendedRunning) &&
+                pendingRemotePacket == null && pendingOps.isEmpty() &&
+                !operationInFlight && packetLink18.bufferedPacketSize() == 0 &&
+                packetLink18.state().toString() == "READY"
+            if (ready) {
+                val candidate = r2706MicReads.first()
+                // R27.11: one operator-triggered Gain Left read uses the verified
+                // E8 local wire ROUTE from the working Input GETs. All other GET
+                // paths remain exactly R27.10 and do not auto-fallback.
+                val inputLevelTrial = com.atomosremote.nativeapp.audio.AudioR2715InputLevelTrial.eligible(
+                    candidate.key, candidate.command)
+                // A10: Delay GET local-route pilot, explicitly read-only and manually requested.
+                val a10DelayTrial = candidate.key == "delay" && candidate.command == 0x06B9
+                val localTrial = inputLevelTrial || a10DelayTrial ||
+                    com.atomosremote.nativeapp.audio.AudioR2711LocalGainTrial.eligible(
+                        candidate.key, candidate.command)
+                val accepted = when {
+                    inputLevelTrial -> r2715EnqueueMicInputLevelTrial(candidate)
+                    a10DelayTrial -> a10EnqueueDelayLocalGet(candidate)
+                    localTrial -> r2711EnqueueMicLocalTrial(candidate)
+                    else -> r2708EnqueueMicNonLocalRead(candidate)
+                }
+                if (accepted) {
+                    android.util.Log.i("AtomRemoteAudioA126", "MIC_GET_DISPATCH " +
+                        "key=${candidate.key} queueWaitMs=${now - candidate.createdMs} " +
+                        "pendingOps=${pendingOps.size} attIdle=${!operationInFlight}")
+                    r2706MicReads.removeFirst()
+                    candidate.dispatchedMs = now
+                    candidate.requestPacketId = pendingRemotePacket?.packetId ?: 0
+                    candidate.localTrial = localTrial
+                    r2706MicActive = candidate
+                    if (r2708MicTurnOpen) {
+                        r2708MicConsumedGeneration = inputExtendedGeneration
+                        r2708MicConsumedIndex = inputExtendedIndex
+                    }
+                    r2708MicTurnOpen = false
+                    r2706MicMark(candidate, "BUFFER_ACCEPTED", "PacketLink only; awaiting ATT write")
+                    android.util.Log.i("AtomRemoteAudioR2706", "MIC_GET_BUFFER_ACCEPTED " +
+                        "key=${candidate.key} cmd=0x${candidate.command.toString(16)} " +
+                        "packetId=${candidate.requestPacketId} local=$localTrial " +
+                        "proto=EMPTY physicalTxConfirmed=false")
+                }
+            }
+        }
+        if (r2706MicActive != null || r2706MicReads.isNotEmpty()) r2706MicPumpSoon(300L)
+    }
+
+    /** Invoke only after successful PLINK18 ATT write callback, never on enqueue. */
+    private fun r2706MicOnAttWrite(bytes: ByteArray) {
+        val read = r2706MicActive ?: return
+        if (pendingRemotePacket?.purpose != "r2672-micline-get:${read.key}" || bytes.size <= 1) return
+        if (read.gattWrittenMs == 0L) {
+            read.gattWrittenMs = android.os.SystemClock.elapsedRealtime()
+            r2706MicMark(read, "ATT_WRITE_CONFIRMED", "GATT callback success, recorder RX pending")
+            android.util.Log.i("AtomRemoteAudioR2706", "MIC_GET_ATT_WRITE_OK " +
+                "key=${read.key} cmd=0x${read.command.toString(16)} " +
+                "attBytes=${bytes.toHex()} responseVerified=false")
+        }
+    }
+
+    private fun r2706MicOnDelivered(sent: PendingRemotePacket?) {
+        val read = r2706MicActive ?: return
+        if (sent?.purpose != "r2672-micline-get:${read.key}" || sent.commandId != read.command) return
+        read.deliveredMs = android.os.SystemClock.elapsedRealtime()
+        r2706MicMark(read, "TRANSPORT_DELIVERED", "PacketLink completed; waiting typed RX")
+        android.util.Log.i("AtomRemoteAudioR2706", "MIC_GET_PLINK_DELIVERED " +
+            "key=${read.key} cmd=0x${read.command.toString(16)} " +
+            "attWriteObserved=${read.gattWrittenMs > 0L} numericVerified=false")
+    }
+
+    /** R27.09: These are the expected reply bases embedded in OFFICIAL macOS
+     * Audio poll command objects at offset +0x2C, not the request command ID.
+     * Actual response wire opcode may carry high-nibble flags. The official
+     * dispatcher normalizes it with 0x0FFF before matching. No TX behavior here.
+     */
+    private fun r2709ExpectedMicResponseBase(command: Int): Int? =
+        com.atomosremote.nativeapp.audio.AudioR2709MacDispatch.expectedReplyBase(command)
+
+    /** R27.07: observes assembled PacketLink payload before the normal demux.
+     * A malformed/uncorrelated packet stays diagnostic only. The observer cannot
+     * satisfy a GET, mutate numeric UI state or divert another feature's packet.
+     */
+    private fun r2707MicOnAssembled(payload: ByteArray, local: Boolean) {
+        val read = r2706MicActive ?: return
+        if (read.gattWrittenMs == 0L) return
+        val frame = com.atomosremote.nativeapp.audio.AudioR2707MicWireAudit.inspect(payload)
+        read.assembledSeen++
+        if (!frame.exactLength) read.invalidFramesSeen++
+        val expectedBase = r2709ExpectedMicResponseBase(read.command) ?: return
+        val exactMacReply = frame.exactLength && frame.messageType != null &&
+            com.atomosremote.nativeapp.audio.AudioR2709MacDispatch.normalize(frame.messageType) == expectedBase
+        if (exactMacReply) read.typedCandidatesSeen++
+        val interesting = exactMacReply ||
+            frame.messageType == 0xFFFF || frame.messageType == 0xFFFE ||
+            frame.messageType == 0x8000 || !frame.exactLength
+        if (interesting || read.assembledSeen <= 12) {
+            val owner = pendingRemotePacket?.purpose ?: "none"
+            val raw = if (interesting) payload.take(96).toByteArray().toHex() else "OMITTED_OTHER_TYPE"
+            android.util.Log.i("AtomRemoteAudioR2707", "MIC_PRE_FILTER_ASSEMBLED " +
+                "key=${read.key} token=${read.token} cmd=0x${read.command.toString(16)} " +
+                "expectedBase=0x${expectedBase.toString(16)} normalizedRx=0x${((frame.messageType ?: 0) and 0x0fff).toString(16)} " +
+                "kind=${frame.kind} packetId=${frame.packetId ?: -1} " +
+                "expectedPacketId=${read.requestPacketId} " +
+                "messageType=0x${(frame.messageType ?: 0).toString(16)} local=$local " +
+                "declared=${frame.declaredLength ?: -1} actualBody=${frame.bodyLength} " +
+                "exact=${frame.exactLength} owner=$owner raw=$raw " +
+                "readbackNumericVerified=false")
+        }
+    }
+
+    /** R27.07: strict demux already validated AtomMessage length before here.
+     * Typed GET bodies become candidates, never invented numeric gain/delay values.
+     */
+    private fun r2706MicOnRx(messageType: Int, body: ByteArray, local: Boolean, packetId: Int) {
+        val read = r2706MicActive ?: return
+        val expectedBase = r2709ExpectedMicResponseBase(read.command) ?: return
+        val purpose = "r2672-micline-get:${read.key}"
+        val currentOwner = pendingRemotePacket?.purpose
+        // R27.09: Mac dispatch compares (wireOpcode & 0x0FFF) to the +0x2C
+        // expected reply base; request opcode | 0x8000 is NOT the contract.
+        // Correlate only the exact live nonzero packet ID after verified GATT TX.
+        // Recorder can allocate its own response packet ID for local GETs
+        // (Input.SourceGet: TX ID 0 -> RX ID 47). Match by exact official
+        // response base, local E8 route and exclusive live Mic/Line window.
+        val macMatch = if (read.localTrial) {
+            val age = android.os.SystemClock.elapsedRealtime() - read.gattWrittenMs
+            val ownerSafe = currentOwner == null || currentOwner == purpose
+            if (read.key == "inputLevel") {
+                com.atomosremote.nativeapp.audio.AudioR2715InputLevelTrial.matches(
+                    key = read.key, command = read.command, reply = messageType,
+                    local = local, attConfirmed = read.gattWrittenMs > 0L,
+                    safeOwner = ownerSafe, sinceAttMs = age)
+            } else if (read.key == "delay" && read.command == 0x06B9) {
+                // A10: accept only exact official reply base in a live local ATT window.
+                val expected = r2709ExpectedMicResponseBase(read.command)
+                val matched = expected != null && (messageType and 0x0FFF) == expected &&
+                    local && read.gattWrittenMs > 0L && ownerSafe && age in 0L..12000L
+                android.util.Log.i("AtomRemoteAudioA10", "DELAY_LOCAL_RX_MATCH accepted=$matched " +
+                    "reply=0x${messageType.toString(16)} expected=$expected local=$local " +
+                    "attConfirmed=${read.gattWrittenMs > 0L} ageMs=$age numericVerified=false")
+                matched
+            } else {
+                com.atomosremote.nativeapp.audio.AudioR2711LocalGainTrial.matches(
+                    key = read.key, requestOpcode = read.command,
+                    responseOpcode = messageType, responseLocal = local,
+                    attConfirmed = read.gattWrittenMs > 0L,
+                    safeOwner = ownerSafe, sinceAttMs = age)
+            }
+        } else {
+            com.atomosremote.nativeapp.audio.AudioR2709MacDispatch.matches(
+                read.command, messageType, packetId, read.requestPacketId,
+                read.gattWrittenMs > 0L)
+        }
+        if (!macMatch) {
+            if ((messageType and 0x0FFF) == expectedBase || messageType == 0x8000 ||
+                messageType == 0xFFFF || messageType == 0xFFFE) {
+                android.util.Log.w("AtomRemoteAudioR2709", "MIC_RX_QUARANTINED " +
+                    "key=${read.key} token=${read.token} response=0x${messageType.toString(16)} " +
+                    "normalized=0x${(messageType and 0x0FFF).toString(16)} " +
+                    "expectedBase=0x${expectedBase.toString(16)} " +
+                    "packetId=$packetId expectedPacketId=${read.requestPacketId} " +
+                    "owner=${currentOwner ?: "none"} reason=UNMATCHED_OFFICIAL_DISPATCH numericVerified=false")
+            }
+            return
+        }
+        val status = if (read.localTrial) "R2711_LOCAL_EXACT_OPCODE_ACTIVE_WINDOW"
+            else "R2709_MAC_EXPECTED_RESPONSE_AND_PACKET_ID"
+        android.util.Log.i("AtomRemoteAudioR2709", "MIC_MAC_RX_MATCH " +
+            "key=${read.key} cmd=0x${read.command.toString(16)} " +
+            "response=0x${messageType.toString(16)} normalized=0x${(messageType and 0x0FFF).toString(16)} " +
+            "expectedBase=0x${expectedBase.toString(16)} packetId=$packetId " +
+            "bodyBytes=${body.size} numericVerified=false")
+        val record = _r2697MicLineEvidence.value.controls[read.key] ?: return
+        if (record.requestToken != read.token) return
+        // Old R26.97 classifier requires reply == request, but macOS shows
+        // 0x06B6 Gain GET expects a distinct 0x06B1 response base. Preserve
+        // local trial raw response as UNMAPPED, never report numeric readback.
+        val classified = if (read.localTrial) record.copy(
+            state = if (body.isNotEmpty()) "CANDIDATE_RX_UNMAPPED" else "EMPTY_RX",
+            responseType = messageType,
+            rawHex = body.take(192).toByteArray().toHex(),
+            detail = if (read.key == "inputLevel")
+                "R27.15 Input Level typed read; enum Mic/Line mapping unverified; SET disabled"
+            else if (read.key == "delay")
+                "A10 local Delay GET candidate; frames mapping unverified; SET disabled"
+            else "R27.11 local Gain read; channel and gain scale unverified; SET disabled")
+        else com.atomosremote.nativeapp.audio.AudioR2697MicLineEvidence.classify(
+            record, messageType, body.toHex(), local)
+        _r2697MicLineEvidence.value = _r2697MicLineEvidence.value.copy(
+            controls = _r2697MicLineEvidence.value.controls + (read.key to classified))
+        android.util.Log.i("AtomRemoteAudioR2707", "MIC_GET_RX_CANDIDATE " +
+            "key=${read.key} req=0x${read.command.toString(16)} " +
+            "response=0x${messageType.toString(16)} packetId=$packetId " +
+            "expectedPacketId=${read.requestPacketId} local=$local owner=${currentOwner ?: "none"} " +
+            "correlation=$status state=${classified.state} bytes=${body.size} " +
+            "raw=${body.take(192).toByteArray().toHex()} verifiedNumeric=false")
+        // A11: strict FrameDelayGet numeric evidence, read-only. Exact two-byte
+        // protobuf f1/wire0 for verified hardware test range 0..20 frames.
+        if (read.key == "delay" && read.command == 0x06B9 && messageType == 0x86B3 && local) {
+            val a11Frames = if (body.size == 2 && body[0] == 0x08.toByte() &&
+                (body[1].toInt() and 0xFF) in 0..20) (body[1].toInt() and 0xFF) else null
+            android.util.Log.i("AtomRemoteAudioA11", "DELAY_FRAMES_RX " +
+                "value=${a11Frames?.toString() ?: "UNMAPPED"} " +
+                "unit=fr raw=${body.toHex()} typed=true " +
+                "range0to20=${a11Frames != null} setTx=false")
+            // A12.24: PASSIVE observation only; retains A11's GET correlation and parser.
+            // Only a fresh value=0 from this BLE session may authorize 0 -> 1 SET pilot.
+            if (a11Frames != null) {
+                val rxAt = android.os.SystemClock.elapsedRealtime()
+                a124DelayLastFrames = a11Frames
+                a124DelayLastRxAtMs = rxAt
+                a124DelayLastRxGatt = gatt
+                // A12.29: the typed GET is authoritative regardless of whether
+                // an earlier SET verification window has timed out. Keep the
+                // user-visible recorder value independent from transaction ACK.
+                android.util.Log.i("AtomRemoteAudioA129Delay", "DELAY_CONFIRMED_RECORDER_GET " +
+                    "frames=$a11Frames target=${a125DelayTargetFrames ?: "none"} " +
+                    "setVerificationPending=$a124DelayPendingGet " +
+                    "sameSession=${a124DelayPendingGatt === gatt} " +
+                    "afterSetQueue=${rxAt > a124DelaySetQueuedAtMs} " +
+                    "source=0x86B3 verifiedRecorderValue=true")
+                if (a124DelayPendingGet && rxAt > a124DelaySetQueuedAtMs &&
+                    a124DelayPendingGatt === gatt) {
+                    val result = if (a11Frames == a125DelayTargetFrames) "READBACK_TARGET_MATCH" else "READBACK_NOT_TARGET"
+                    android.util.Log.w("AtomRemoteAudioA124", "DELAY_POST_SET_$result " +
+                        "value=$a11Frames target=$a125DelayTargetFrames cmd=0x06BA freshGet=0x86B3 " +
+                        "setQueueAccepted=true physicalWriteUnproven=true " +
+                        "recorderAppliedByThisApp=UNVERIFIED")
+                    if (a11Frames == a125DelayTargetFrames) {
+                        // A12.27: A fresh matching recorder GET completes this manually
+                        // requested transaction. Unlock the next manual SET only now.
+                        a124DelayPendingGet = false
+                        a12PilotAttempted.remove("delay")
+                        android.util.Log.i("AtomRemoteAudioA127", "DELAY_SET_VERIFIED " +
+                            "target=$a11Frames nextManualSetEnabled=true noAutoSet=true")
+                    } else {
+                        // Do not treat an interim/unchanged GET as final failure.
+                        // Later GET retries or the existing timeout will settle it.
+                        android.util.Log.i("AtomRemoteAudioA127", "DELAY_SET_AWAIT_TARGET " +
+                            "observed=$a11Frames target=$a125DelayTargetFrames " +
+                            "pending=true nextManualSetEnabled=false")
+                    }
+                }
+            }
+        }
+        // R27.22: readback timestamp only for typed, decodable GainValuesGet.
+        // No changes to the GET serializer, PacketLink correlation or parser.
+        if (read.command == 0x06B6 && messageType == 0x86B1 && local &&
+            com.atomosremote.nativeapp.audio.AudioR2714GainReadback.decode(body) != null) {
+            r2722LastGainRxMs = android.os.SystemClock.elapsedRealtime()
+            // A12.29: Observe actual bulk GET for BOTH gain channels. Logging
+            // only: neither channel selector polarity nor the full dB scale
+            // has been hardware-calibrated. Do not unlock arbitrary GainSet.
+            val a129GainPair = com.atomosremote.nativeapp.audio.AudioR2714GainReadback.decode(body)
+            if (a129GainPair != null) {
+                android.util.Log.i("AtomRemoteAudioA129Gain", "GAIN_CHANNEL_RX " +
+                    "leftRaw=${a129GainPair.leftRaw} rightRaw=${a129GainPair.rightRaw} " +
+                    "leftDisplay=${a129GainPair.leftLabel()} " +
+                    "rightDisplay=${a129GainPair.rightLabel()} " +
+                    "fullyCalibrated=${a129GainPair.fullyCalibrated()} " +
+                    "request=0x06B6 response=0x86B1 tx=false")
+            }
+            // A12.37 recorder GET owns the verdict, never the queued SET.
+            if (a137GainPending && a129GainPair != null && r2722LastGainRxMs > a137GainStartedMs) {
+                val actual = if (a137GainSelector) a129GainPair.rightRaw else a129GainPair.leftRaw
+                val other = if (a137GainSelector) a129GainPair.leftRaw else a129GainPair.rightRaw
+                val originalOther = if (a137GainSelector) a137GainBeforeLeft else a137GainBeforeRight
+                val status = when {
+                    other != originalOther -> "OTHER_CHANNEL_CHANGED_STOP"
+                    actual == a137GainTargetRaw -> "VERIFIED_TARGET_MATCH"
+                    else -> "UNCHANGED_OR_DIFFERENT"
+                }
+                android.util.Log.i("AtomRemoteAudioA137Gain", "GAIN_RANGE_GET_VERDICT " +
+                    "selector=${a137GainSelector} targetRaw=$a137GainTargetRaw " +
+                    "afterLeft=${a129GainPair.leftRaw} afterRight=${a129GainPair.rightRaw} " +
+                    "result=$status freshGet=0x86B1")
+                if (status != "UNCHANGED_OR_DIFFERENT") a137GainPending = false
+            }
+            // Evidence-only: assess changed side independent from guessed Bool polarity.
+            val a135Selector = a135GainPilotSelector
+            if (a135Selector != null && a129GainPair != null) {
+                val age = android.os.SystemClock.elapsedRealtime() - a135GainPilotAt
+                if (age in 0L..30_000L) {
+                    val dl = a129GainPair.leftRaw - a135GainPilotBeforeLeft
+                    val dr = a129GainPair.rightRaw - a135GainPilotBeforeRight
+                    val verdict = when {
+                        dl == 0L && dr == 0L -> "UNCHANGED_GET_KEEP_WAITING"
+                        dl != 0L && dr == 0L -> "LEFT_ONLY_CHANGED"
+                        dl == 0L && dr != 0L -> "RIGHT_ONLY_CHANGED"
+                        else -> "BOTH_CHANGED_UNSAFE"
+                    }
+                    android.util.Log.i("AtomRemoteAudioA135Gain",
+                        "GAIN_SELECTOR_EVIDENCE selector=$a135Selector restore=$a135GainPilotRestore " +
+                        "beforeLeft=$a135GainPilotBeforeLeft beforeRight=$a135GainPilotBeforeRight " +
+                        "afterLeft=${a129GainPair.leftRaw} afterRight=${a129GainPair.rightRaw} " +
+                        "deltaLeft=$dl deltaRight=$dr result=$verdict ageMs=$age " +
+                        "freshGet=0x86B1 tx=false")
+                    if (verdict != "UNCHANGED_GET_KEEP_WAITING") a135GainPilotSelector = null
+                } else {
+                    android.util.Log.w("AtomRemoteAudioA135Gain",
+                        "GAIN_SELECTOR_EVIDENCE_TIMEOUT selector=$a135Selector ageMs=$age noProof=true")
+                    a135GainPilotSelector = null
+                }
+            }
+            // Clear an outstanding restore ONLY when the hardware GET confirms 0/0.
+            // This is deliberately not conditioned on ACK or queue status.
+            val verifiedGains = com.atomosremote.nativeapp.audio.AudioR2714GainReadback.decode(body)
+            if (r2722PilotRestoreSelector != null && verifiedGains?.leftRaw == 0L &&
+                verifiedGains.rightRaw == 0L) {
+                val resolvedSelector = r2722PilotRestoreSelector
+                r2722PilotRestoreSelector = null
+                r2722PilotSinceMs = 0L
+                android.util.Log.i("AtomRemoteAudioA053", "RESTORE_READBACK_CONFIRMED " +
+                    "selector=$resolvedSelector left=0 right=0 source=0x86B1")
+            } else if (r2722PilotRestoreSelector != null) {
+                android.util.Log.w("AtomRemoteAudioA053", "RESTORE_STILL_PENDING " +
+                    "selector=$r2722PilotRestoreSelector left=${verifiedGains?.leftRaw} " +
+                    "right=${verifiedGains?.rightRaw} noSuccessClaim=true")
+            }
+        }
+        if (read.command == 0x06B3 && messageType == 0x86AE && local) {
+            val rawMode = com.atomosremote.nativeapp.audio.AudioR2716InputLevelReadback.decodeHex(body.toHex())
+            if (rawMode != null && rawMode.rawEnum in 1L..2L) {
+                a05LastInputRxMs = android.os.SystemClock.elapsedRealtime()
+                val target = a05InputPendingTarget
+                if (target != null) {
+                    val age = a05LastInputRxMs - a05InputSetAtMs
+                    val verdict = when {
+                        age !in 0L..30_000L -> "STALE_OR_UNCORRELATED"
+                        rawMode.rawEnum == target.toLong() && a05InputPreviousRaw != rawMode.rawEnum -> "TARGET_READBACK_MATCHED"
+                        rawMode.rawEnum == a05InputPreviousRaw -> "NO_OBSERVED_CHANGE"
+                        else -> "UNEXPECTED_VALUE"
+                    }
+                    android.util.Log.i("AtomRemoteAudioA05", "INPUT_SET_GET_VERDICT result=$verdict " +
+                        "previous=${a05InputPreviousRaw} target=$target current=${rawMode.rawEnum} " +
+                        "elapsedMs=$age recorderEffectRequiresPhysicalCheck=true")
+                    // A08: after a hardware-confirmed Mic/Line mode flip, request a fresh
+                    // left+right bulk GainValuesGet (0x06B6). GET ONLY, never Gain SET.
+                    // The existing R2706 mic-read scheduler owns PacketLink arbitration.
+                    if (verdict == "TARGET_READBACK_MATCHED") {
+                        mainHandler.postDelayed({
+                            if (gatt != null && _tcsPairingState.value.acceptWritten &&
+                                _tcsRemoteState.value.available) {
+                                val accepted = r2672TryMicLineCandidateGet("gainLeft")
+                                android.util.Log.i("AtomRemoteAudioA08",
+                                    "INPUT_MODE_GAIN_REFRESH requested=$accepted key=gainLeft " +
+                                    "bulkGet=0x06B6 readOnly=true inputLevelFrozen=true")
+                            } else {
+                                android.util.Log.i("AtomRemoteAudioA08",
+                                    "INPUT_MODE_GAIN_REFRESH_SKIPPED reason=session-not-ready")
+                            }
+                        }, 650L)
+                    }
+                    a05InputPendingTarget = null
+                    a05InputPreviousRaw = null
+                    a05InputSetAtMs = 0L
+                }
+            }
+        }
+        if (body.isNotEmpty()) {
+            android.util.Log.i("AtomRemoteAudioR2707", "MIC_GET_PROTO_SHAPE " +
+                "key=${read.key} " +
+                com.atomosremote.nativeapp.audio.AudioR2701WireInspector.describe(body))
+            if (read.command == 0x06B6) {
+                // Same bulk gain-values poll opcode for Left and Right. Preserve
+                // complete payload as candidate; channel map not yet proven.
+                android.util.Log.i("AtomRemoteAudioR2707", "MIC_GAIN_BULK_CANDIDATE " +
+                    "key=${read.key} leftRightMapping=UNVERIFIED " +
+                    "payload=${body.take(192).toByteArray().toHex()} " +
+                    "updateBothNumeric=false")
+            }
+        }
+        r2706MicActive = null
+        r2706MicPumpSoon(100L)
+    }
+
+    // R27.01: cooperative, bounded Audio priority at *between-probe* Input gap.
+    // Input packets and PacketLink ownership are never preempted or cancelled.
+    private var audioR2701InputYieldStartMs = 0L
+    private var audioR2701InputYieldLastLogMs = 0L
+    private val audioR2701InputYieldLimitMs = 5_000L
+
+    private fun audioR2701YieldAllowed(): Boolean {
+        if (!inputExtendedRunning || !_audioR26Live.value.running ||
+            outputR21MtuBytes < 61 || inputCollectorRunning || remoteBootstrapActive ||
+            inputExtendedActive != null || pendingRemotePacket != null ||
+            packetLink18.bufferedPacketSize() != 0 ||
+            audioR26Position >= audioR26Schedule.size) return false
+        val now = android.os.SystemClock.elapsedRealtime()
+        if (audioR2701InputYieldStartMs == 0L) {
+            audioR2701InputYieldStartMs = now
+            audioR2701InputYieldLastLogMs = 0L
+        }
+        val age = now - audioR2701InputYieldStartMs
+        if (age >= audioR2701InputYieldLimitMs) {
+            if (now - audioR2701InputYieldLastLogMs > 1_000L) {
+                android.util.Log.i("AtomRemoteAudioR2701", "FAIR_YIELD_EXPIRED ageMs=$age inputExtendedContinues=true")
+                audioR2701InputYieldLastLogMs = now
+            }
+            return false
+        }
+        if (now - audioR2701InputYieldLastLogMs > 1_000L) {
+            android.util.Log.i("AtomRemoteAudioR2701", "FAIR_YIELD_GRANTED ageMs=$age mtU=$outputR21MtuBytes currentInput=${inputExtendedIndex}/${InputExtendedReadPlan.probes.size}")
+            audioR2701InputYieldLastLogMs = now
+        }
+        return true
+    }
+
     private var audioR26RunId = 0
     private var audioR26Position = 0
     private var audioR26BusyTicks = 0
+    // R26.23: Audio-local, bounded recovery for an orphaned ATT MTU queue entry.
+    private var audioR2623MtuOrphanRearms = 0
     private var audioR26Active: com.atomosremote.nativeapp.audio.AudioR26GetDefinition? = null
     private var audioR26ActiveStartedMs = 0L
     // R26.17 AUDIO-only passive lifecycle evidence. Buffer acceptance is NOT a BLE write.
@@ -4194,9 +4968,12 @@ class GattClient(context: Context) {
     // verified. Do NOT treat macOS getter names as argument-free requests.
     // R26.15: the ONLY getter proven by a typed AG2 hardware RX is 0x0647.
     // Put it first, after requesting the mandatory MTU at collector start.
+    // R26.20: collect only hardware-proven readback. The full macOS method
+    // catalog remains available for OFFLINE analysis, but must not be treated
+    // as 22 supported device GETs or generate noisy no-op collector entries.
     private val audioR26Schedule = listOf(
         com.atomosremote.nativeapp.audio.AudioR26GetDefinition("AudioMetersPageGet", 0x0647, false, "AG2_TYPED_RX_VERIFIED")
-    ) + com.atomosremote.nativeapp.audio.AudioR26RecoveredMap.auditCandidates
+    )
     private var audioR26QueueRefusals = 0
     // R26.14.1: the Input/Output owner may be busy for minutes; do not claim
     // recorder incompatibility or consume an Audio key solely because ATT is busy.
@@ -4210,6 +4987,7 @@ class GattClient(context: Context) {
     private var audioR26VerifiedPageHex = ""
 
     fun cancelAudioR26RecoveredCollector() {
+        audioR2701InputYieldStartMs = 0L
         audioR26RunId += 1
         audioR26Active = null
         _audioR26Live.value = _audioR26Live.value.copy(running = false, activeMethod = null,
@@ -4226,9 +5004,12 @@ class GattClient(context: Context) {
             return false
         }
         audioR26RunId += 1
+        audioR2701InputYieldStartMs = 0L
+        audioR2701InputYieldLastLogMs = 0L
         val generation = audioR26RunId
         audioR26Position = 0
         audioR26BusyTicks = 0
+        audioR2623MtuOrphanRearms = 0
         audioR26QueueRefusals = 0
         audioR26AuditStartedMs = android.os.SystemClock.elapsedRealtime()
         audioR26BusySinceMs = 0L
@@ -4241,6 +5022,10 @@ class GattClient(context: Context) {
         // This only queues PendingOp.OutputR21Mtu via the original exclusive ATT
         // serializer and NEVER transmits an ATOMOS RemoteApi SET.
         val mtuReadyOrQueued = if (outputR21MtuBytes < 61) requestR21OutputPageMtu() else true
+        android.util.Log.i("AtomRemoteAudioR2620", "CAPABILITY_AUDIT device=AG2 " +
+            "verifiedGet=0x0647 expectedRx=0x8647 requestedMethods=1 " +
+            "macosRegistry=${com.atomosremote.nativeapp.audio.AudioR26RecoveredMap.allKeys.size} " +
+            "parameterizedGetTx=disabled audioSetTx=disabled")
         android.util.Log.i("AtomRemoteAudioR2615Fix",
             "START_MTU_PREPARE current=$outputR21MtuBytes queued=$mtuReadyOrQueued " +
             "state=$outputR21MtuResult attInFlight=$operationInFlight attQueue=${pendingOps.size} " +
@@ -4265,6 +5050,7 @@ class GattClient(context: Context) {
             val rx = items.count { it.status == "TYPED_RX" }
             val rejected = items.count { it.status.startsWith("RECORDER_REJECT") }
             val skipped = items.count { it.status.startsWith("SKIPPED_") }
+            audioR2701InputYieldStartMs = 0L
             _audioR26Live.value = _audioR26Live.value.copy(running = false,
                 activeMethod = null, status = "Audit complete: $rx RX, $rejected rejected, $skipped skipped, ${items.size}/${audioR26Schedule.size} checked")
             android.util.Log.i("AtomRemoteAudioR2614", "COLLECTOR_COMPLETE checked=${items.size} total=${audioR26Schedule.size} typed=$rx rejected=$rejected skipped=$skipped noSet=true")
@@ -4321,6 +5107,33 @@ class GattClient(context: Context) {
                 android.util.Log.i("AtomRemoteAudioR2615", "COLLECTOR_PAUSED_MTU method=${upcoming.method} mtu=$outputR21MtuBytes")
                 return
             }
+            // R26.23: The 2026-10-14 capture showed MTU state=queued for 44s
+            // despite attBusy=false, activeOp=none, and attQueue=0. Repeating
+            // requestR21OutputPageMtu() cannot work while its existing
+            // connection-local outputR21MtuRequested flag remains true.
+            // Re-arm ONLY after 8 seconds, ONLY when there is no ATT owner and
+            // no actual pending MTU op, at most twice per Audio collector run.
+            // No recorder RemoteApi bytes are emitted by this recovery.
+            val orphanPending = pendingOps.any { it is PendingOp.OutputR21Mtu }
+            if (com.atomosremote.nativeapp.audio.AudioR2623MtuOrphanPolicy.shouldRearm(
+                    negotiatedMtu = outputR21MtuBytes,
+                    wasRequested = outputR21MtuRequested,
+                    requestState = outputR21MtuResult,
+                    attBusy = operationInFlight,
+                    hasActiveOperation = activeOp != null,
+                    mtuStillQueued = orphanPending,
+                    elapsedMs = elapsed,
+                    rearmCount = audioR2623MtuOrphanRearms
+                )) {
+                audioR2623MtuOrphanRearms += 1
+                outputR21MtuRequested = false
+                outputR21MtuResult = "audio-orphan-rearm"
+                val requeued = requestR21OutputPageMtu()
+                android.util.Log.i("AtomRemoteAudioR2623",
+                    "MTU_ORPHAN_REARM attempt=$audioR2623MtuOrphanRearms " +
+                        "queued=$requeued mtu=$outputR21MtuBytes attInFlight=$operationInFlight " +
+                        "attQueue=${pendingOps.size} remoteOwner=${pendingRemotePacket?.purpose ?: "none"}")
+            }
             audioR26BusyTicks += 1
             if (audioR26BusyTicks == 1 || audioR26BusyTicks % 8 == 0) requestR21OutputPageMtu()
             if (audioR26BusyTicks == 1 || audioR26BusyTicks % 5 == 0)
@@ -4340,9 +5153,13 @@ class GattClient(context: Context) {
         // WRITING/READING or an unrelated in-flight ATT operation is not by
         // itself a reason to permanently skip an Audio GET. We must still
         // respect the real PacketLink buffer/pending owner and Input/bootstrap.
+        // R27.01: the Ext-Input collector keeps its running flag set even at
+        // a packet-free gap. Permit Audio only during our explicit bounded
+        // cooperative yield, not while any Input probe owns the transport.
+        val inCooperativeGap = inputExtendedRunning && audioR2701YieldAllowed()
         val realOwnerBusy = pendingRemotePacket != null ||
             packetLink18.bufferedPacketSize() != 0 || remoteBootstrapActive ||
-            inputCollectorRunning || inputExtendedRunning
+            inputCollectorRunning || (inputExtendedRunning && !inCooperativeGap)
         if (realOwnerBusy) {
             val now = android.os.SystemClock.elapsedRealtime()
             if (audioR26BusySinceMs == 0L) audioR26BusySinceMs = now
@@ -4497,7 +5314,7 @@ class GattClient(context: Context) {
         audioR26QueueRefusals = 0
         _audioR26Live.value = _audioR26Live.value.copy(
             activeMethod = null,
-            status = "Audio GET audit: ${_audioR26Live.value.values.size}/${audioR26Schedule.size} checked")
+            status = "Audio page GET: ${_audioR26Live.value.values.size}/${audioR26Schedule.size} checked")
         mainHandler.postDelayed({ audioR26Step(generation) }, 320L)
     }
 
@@ -4509,9 +5326,25 @@ class GattClient(context: Context) {
         // R26.18: pendingRemotePacket is a *transport* owner, not a reply token.
         // It is cleared at the successful PacketLink read turn, potentially
         // before the recorder's standalone typed RemoteApi reply is received.
-        // Observe that narrow post-delivery interval WITHOUT assigning a
-        // response to Audio (the app can have other GETs concurrently).
-        if (pending?.purpose != "remote-audio-r26-recovered-get:${active.method}" || !local) {
+        // In a narrow post-delivery window, accept ONLY the uniquely typed
+        // 0x8647 response whose full AG2 Audio page parses. Other responses
+        // remain uncorrelated to avoid stealing Input/Monitor messages.
+        // OnePass RX correction: recorder can send the standalone 0x8647
+        // reply AFTER the PacketLink transport owner is cleared. Only a
+        // strictly parsed Audio page within this active GET's delivery window
+        // may be attributed to this collector; never infer any SET success.
+        val lateTypedAudioRx = com.atomosremote.nativeapp.audio.AudioR26LateTypedGate.accept(
+            activeCommand = active.command,
+            responseType = messageType,
+            bodyHex = body.toHex(),
+            local = local,
+            pendingPurpose = pending?.purpose,
+            physicalWriteMs = audioR26PhysicalWriteMs,
+            transportCompleteMs = audioR26TransportCompleteMs,
+            nowMs = android.os.SystemClock.elapsedRealtime(),
+            windowMs = audioR26TypedRxMaxWaitMs
+        )
+        if ((pending?.purpose != "remote-audio-r26-recovered-get:${active.method}" && !lateTypedAudioRx) || !local) {
             val now = android.os.SystemClock.elapsedRealtime()
             val afterDelivery = audioR26PhysicalWriteMs != 0L &&
                 audioR26TransportCompleteMs != 0L &&
@@ -4532,6 +5365,12 @@ class GattClient(context: Context) {
                     "delivered=$afterDelivery notAcceptedAsTyped=true")
             }
             return
+        }
+        if (lateTypedAudioRx) {
+            android.util.Log.i("AtomRemoteAudioOnePassRxFix", "LATE_TYPED_RX_ACCEPT " +
+                "method=${active.method} type=0x${messageType.toString(16)} bytes=${body.size} " +
+                "ageAfterDeliveryMs=${android.os.SystemClock.elapsedRealtime() - audioR26TransportCompleteMs} " +
+                "pending=none verifiedPage=true noSet=true")
         }
         val gen = audioR26RunId
         val normalized = messageType and 0x7FFF
@@ -4568,6 +5407,2369 @@ class GattClient(context: Context) {
                 "local=$local bodyBytes=${body.size} field1Raw=$rawField1 raw=$raw currentRawOnly=true")
             audioR26Advance(gen)
         }
+    }
+
+    // B01.20: Channel REC is ON/OFF for each REC channel, NEVER a headphone source selector.
+    // B01.19 missed idle windows because the click-time ATT/write guard ran once while
+    // recurring E0 transport polls were in flight. B01.20 arms ONE explicit request,
+    // then waits for a bounded quiet window. It is NOT a verified SET serializer.
+    // B01.21: ID 3 OFF -> recorder physically disabled Channels 5/6,
+    // and a new Audio 0x8647 GET removed ID 3 from f3 while f4 remained unchanged.
+    // Only this particular ID/direction is hardware-verified so far.
+    // Other valid REC IDs are operator trials, not a calibrated channel map.
+    private data class B0121QueuedRecordTrial(
+        val session: BluetoothGatt,
+        val id: Int,
+        val expectedOn: Boolean,
+        val baselineGeneration: Int
+    )
+    private var b0121LastQueuedRecord: B0121QueuedRecordTrial? = null
+    private var b0120RecordPending = false
+
+    @SuppressLint("MissingPermission")
+    fun b0119TryRecordOneShot(recordId: Int, enable: Boolean): Boolean {
+        val live = _audioR26Live.value
+        val proof = live.values["AudioMetersPageGet"]
+        val page = proof?.takeIf { it.status == "TYPED_RX" && it.responseType == 0x8647 }
+            ?.rawHex?.let { com.atomosremote.nativeapp.audio.AudioR26PageSnapshot.decode(it) }
+        val valid = page?.recordValidList?.contains(recordId.toLong()) == true
+        val enabledNow = page?.recordEnabledList?.contains(recordId.toLong()) == true
+        val startGatt = gatt
+        // No global one-shot latch. Re-arm only after a NEW, completed recorder
+        // GET in this same BLE session confirms the previous requested REC ID.
+        // Never release on enqueue success or GATT status=0 alone.
+        val pendingEmbed = b0123EmbedQueued
+        if (b0123EmbedArming) {
+            android.util.Log.w("AtomRemoteAudioB0123", "REC_BLOCK_EMBED_ARMING tx=false")
+            return false
+        }
+        if (pendingEmbed != null) {
+            val embedFresh = startGatt === pendingEmbed.session &&
+                live.generation > pendingEmbed.baselineGeneration && !live.running &&
+                proof?.status == "TYPED_RX" && proof.responseType == 0x8647
+            if (!embedFresh) {
+                android.util.Log.w("AtomRemoteAudioB0124", "REC_WAIT_EMBED_FRESH_GET " +
+                    "target=${pendingEmbed.target} tx=false")
+                return false
+            }
+            // B01.24 hardware evidence: 0x06B2 / 0800 was ACKed by ATT but
+            // fresh f11 remained 1. That is an Embedded SET failure, not a
+            // reason to block the already-proven REC setter forever.
+            b0123EmbedQueued = null
+            if (page?.analogEmbed?.toInt() != pendingEmbed.target) {
+                android.util.Log.w("AtomRemoteAudioB0124", "EMBED_FRESH_GET_MISMATCH_SETTLED " +
+                    "target=${pendingEmbed.target} actual=${page?.analogEmbed} " +
+                    "embeddedVerified=false recGateReleased=true noRetry=true tx=false")
+            } else {
+                android.util.Log.i("AtomRemoteAudioB0124", "EMBED_GET_MATCH_BEFORE_REC " +
+                    "target=${pendingEmbed.target} recGateReleased=true")
+            }
+        }
+        val prior = b0121LastQueuedRecord
+        if (prior != null) {
+            if (startGatt !== prior.session) {
+                b0121LastQueuedRecord = null
+                android.util.Log.i("AtomRemoteAudioB0121", "REC_SESSION_RESET previousId=${prior.id} tx=false")
+            } else {
+                val fresh = live.generation > prior.baselineGeneration && !live.running &&
+                    proof?.status == "TYPED_RX" && proof?.responseType == 0x8647
+                val confirmed = fresh && page?.recordValidList?.contains(prior.id.toLong()) == true &&
+                    (page?.recordEnabledList?.contains(prior.id.toLong()) == prior.expectedOn)
+                if (!confirmed) {
+                    android.util.Log.w("AtomRemoteAudioB0121", "REC_WAIT_FRESH_GET " +
+                        "previousId=${prior.id} target=${prior.expectedOn} " +
+                        "generation=${live.generation} baseline=${prior.baselineGeneration} " +
+                        "fresh=$fresh actualOn=${page?.recordEnabledList?.contains(prior.id.toLong())} " +
+                        "tx=false noRepeat=true")
+                    return false
+                }
+                b0121LastQueuedRecord = null
+                android.util.Log.i("AtomRemoteAudioB0121", "REC_PREVIOUS_GET_CONFIRMED " +
+                    "id=${prior.id} state=${prior.expectedOn} freshGeneration=${live.generation} " +
+                    "nextManualToggleAllowed=true")
+            }
+        }
+        val logicalReady = !b0120RecordPending && !live.running &&
+            recordId in 0..7 && valid && (enabledNow != enable) &&
+            startGatt != null && _tcsPairingState.value.acceptWritten &&
+            _tcsRemoteState.value.available && !remoteBootstrapActive
+        if (!logicalReady) {
+            android.util.Log.w("AtomRemoteAudioB0120", "REC_ARM_BLOCKED id=$recordId target=$enable " +
+                "valid=$valid enabledNow=$enabledNow " +
+                "pending=$b0120RecordPending pageCurrent=${page != null} " +
+                "collectorRunning=${live.running} " +
+                "gatt=${startGatt != null} pairing=${_tcsPairingState.value.acceptWritten} " +
+                "remoteAvailable=${_tcsRemoteState.value.available} " +
+                "bootstrap=${remoteBootstrapActive} tx=false")
+            return false
+        }
+        // Hypothetical field #1 = REC index, field #2 = enable bool.
+        // Retained exactly to isolate the B01.19 transport-busy problem.
+        // NO claim of official wire-tag verification or recorder acceptance.
+        val protoCandidate = byteArrayOf(0x08, recordId.toByte(), 0x10,
+            if (enable) 1.toByte() else 0.toByte())
+        b0120RecordPending = true
+        val armedAt = android.os.SystemClock.elapsedRealtime()
+        android.util.Log.w("AtomRemoteAudioB0120", "REC_ARMED id=$recordId " +
+            "from=$enabledNow target=$enable proto=${protoCandidate.toHex()} " +
+            "cmd=0x06A7 maxWaitMs=12000 tx=false")
+        val worker = object : Runnable {
+            var lastDiagnostic = -1L
+            override fun run() {
+                if (!b0120RecordPending) return
+                val age = android.os.SystemClock.elapsedRealtime() - armedAt
+                val sameSession = gatt === startGatt && _tcsPairingState.value.acceptWritten
+                if (!sameSession || age > 12_000L || remoteBootstrapActive) {
+                    b0120RecordPending = false
+                    android.util.Log.w("AtomRemoteAudioB0120", "REC_ARM_ABORT id=$recordId " +
+                        "ageMs=$age sameSession=$sameSession bootstrap=$remoteBootstrapActive tx=false")
+                    return
+                }
+                val nowLive = _audioR26Live.value
+                val free = !_audioR26Live.value.running && !inputCollectorRunning &&
+                    !inputExtendedRunning && r2706MicActive == null &&
+                    r2706MicReads.isEmpty() && !operationInFlight &&
+                    pendingRemotePacket == null && pendingOps.isEmpty() &&
+                    packetLink18.bufferedPacketSize() == 0 &&
+                    packetLink18.state().toString() == "READY"
+                if (!free) {
+                    if (lastDiagnostic < 0L || age - lastDiagnostic >= 1800L) {
+                        lastDiagnostic = age
+                        android.util.Log.i("AtomRemoteAudioB0120", "REC_IDLE_WAIT id=$recordId " +
+                            "ageMs=$age audioRunning=${nowLive.running} " +
+                            "inputRunning=$inputCollectorRunning extended=$inputExtendedRunning " +
+                            "micActive=${r2706MicActive != null} micQueued=${r2706MicReads.size} " +
+                            "attBusy=$operationInFlight ops=${pendingOps.size} " +
+                            "packetPending=${pendingRemotePacket != null} " +
+                            "buffered=${packetLink18.bufferedPacketSize()} " +
+                            "plink=${packetLink18.state()} tx=false")
+                    }
+                    mainHandler.postDelayed(this, 50L)
+                    return
+                }
+                // Exactly one TX per click. A second operator click is allowed
+                // ONLY after a fresh, command-following 0x8647 GET matches.
+                b0120RecordPending = false
+                android.util.Log.w("AtomRemoteAudioB0120", "REC_CANDIDATE_QUEUE_ATTEMPT " +
+                    "id=$recordId target=$enable cmd=0x06A7 proto=${protoCandidate.toHex()} " +
+                    "ageMs=$age")
+                val queued = enqueueOfficialRemoteCommandProtoPayload(
+                    commandId = 0x06A7, proto = protoCandidate,
+                    purpose = "b0120-record-one-shot:$recordId:$enable",
+                    label = "B01.20 REC trial ID $recordId to $enable", local = true
+                )
+                if (queued && startGatt != null) {
+                    b0121LastQueuedRecord = B0121QueuedRecordTrial(
+                        startGatt, recordId, enable, nowLive.generation)
+                }
+                android.util.Log.w("AtomRemoteAudioB0120", "REC_QUEUE_RESULT " +
+                    "id=$recordId target=$enable queued=$queued " +
+                    "recorderConfirmed=false verifyPhysicalRecorderAndFreshGet=true")
+                android.util.Log.i("AtomRemoteAudioB0121", "REC_POST_QUEUE_GATE " +
+                    "id=$recordId queued=$queued requiresNewConfirmedGet=$queued " +
+                    "baseGeneration=${nowLive.generation} sessionBound=true")
+                // No optimistic local state change, no automatic repeat, no
+                // new GET preempting PacketLink. Operator performs fresh GET.
+            }
+        }
+        mainHandler.post(worker)
+        return true // ARMED only, NOT ATT/TX confirmed.
+    }
+
+
+// B01.23: isolated Audio Embedded one-shot trial. The x86/arm64 class
+// AnalogEmbedSet and SwiftProtobuf _analogEmbed field exist, but 0x06B2
+// and field-1 wire tags are *not* established by binary analysis.
+// This is NOT a production setter; only the operator's explicit consent
+// with a current GET may schedule one bounded trial. No automatic retry.
+private data class B0123EmbedQueued(val session: BluetoothGatt,
+    val target: Int, val baselineGeneration: Int)
+private var b0123EmbedQueued: B0123EmbedQueued? = null
+private var b0123EmbedArming = false
+
+@SuppressLint("MissingPermission")
+private fun b0123TryEmbedOneShot(desired: Int): Boolean {
+    // B01.28: RETIRED after two recorder-correlated failed 0x06B2 hardware trials.
+    // This private stub is intentionally non-transmitting. No old candidate can
+    // be revived by calling this method, after app data reset, or after reconnect.
+    android.util.Log.w("AtomRemoteAudioB0128", "EMBED_SET_RETIRED target=$desired " +
+        "reason=0x06B2_FAILED_BOTH_DIRECTIONS tx=false noRetry=true")
+    return false
+}
+
+    // B01.34: macOS x86_64 Headphone Level slider ACTION handler
+    // 0x10001A1C5 calls 0x10007C5B0 (value in EDI), which passes 0x06AB
+    // to 0x100088970; 0x1000889A3 writes opcode to outgoing +0x10.
+    // It uses scalar value encoding, but AG2 hardware validation is REQUIRED.
+    // Old 0x06AC is an unverified adjacent-opcode guess and MUST NOT be sent.
+    // Scope = PhonesLevel ONLY. Orientation/Embedded/REC logic above untouched.
+    private data class B0134PhonesPending(
+        val session: BluetoothGatt, val target: Int, val baseline: Int,
+        val generationBeforeTx: Int
+    )
+    private var b0134PhonesSession: BluetoothGatt? = null
+    private var b0134PhonesArming = false
+    private var b0134PhonesPending: B0134PhonesPending? = null
+    private var b0134PhonesFailedTarget: Int? = null
+    private var b0134PhonesLastTxMs = 0L
+
+    @SuppressLint("MissingPermission")
+    private fun b0134TryHeadphoneLevelSet(desired: Int): Boolean {
+        val session = gatt
+        if (session == null) {
+            android.util.Log.w("AtomRemoteAudioB0134", "PHONES_BLOCK reason=NO_GATT tx=false")
+            return false
+        }
+        if (b0134PhonesSession !== session) {
+            b0134PhonesSession = session
+            b0134PhonesArming = false
+            b0134PhonesPending = null
+            b0134PhonesFailedTarget = null
+            b0134PhonesLastTxMs = 0L
+            android.util.Log.i("AtomRemoteAudioB0134", "PHONES_SESSION_RESET noAutomaticTX=true")
+        }
+        val live = _audioR26Live.value
+        val proof = live.values["AudioMetersPageGet"]
+        val fresh = !live.running && proof?.status == "TYPED_RX" &&
+            proof.responseType == 0x8647
+        val page = if (fresh) proof?.rawHex?.let {
+            com.atomosremote.nativeapp.audio.AudioR26PageSnapshot.decode(it)
+        } else null
+        val current = page?.phonesLevel?.toInt()
+        val low = page?.phonesLevelMin?.toInt()
+        val high = page?.phonesLevelMax?.toInt()
+
+        // A manually requested GET after a timed-out automatic GET can also
+        // complete verification. Never treat ATT status=0 as recorder success.
+        val previous = b0134PhonesPending
+        if (previous != null && (previous.session !== session ||
+                (fresh && live.generation > previous.generationBeforeTx))) {
+            val matched = previous.session === session && current == previous.target
+            b0134PhonesFailedTarget = if (matched) null else previous.target
+            b0134PhonesPending = null
+            android.util.Log.w("AtomRemoteAudioB0134", "PHONES_FRESH_GET_SETTLED " +
+                "wanted=${previous.target} observed=$current matched=$matched " +
+                "noAutoRetry=true physicalRecorderMustMatch=true")
+        }
+        val oldAudio = b0130QueuedAudio
+        val waitingOtherAudio = oldAudio != null && oldAudio.session === session &&
+            live.generation <= oldAudio.generationBeforeTx
+        val boundsValid = current != null && low != null && high != null &&
+            low >= 0 && high <= 127 && high > low && desired in low..high && desired != current
+        val paired = _tcsPairingState.value.acceptWritten && _tcsRemoteState.value.available
+        val cooldown = b0134PhonesLastTxMs > 0 &&
+            android.os.SystemClock.elapsedRealtime() - b0134PhonesLastTxMs < 700L
+        val ready = fresh && boundsValid && paired && !remoteBootstrapActive &&
+            !inputCollectorRunning && !inputExtendedRunning &&
+            !b0134PhonesArming && b0134PhonesPending == null &&
+            !b0130AudioArming && !waitingOtherAudio &&
+            !b0120RecordPending && b0121LastQueuedRecord == null &&
+            !b0123EmbedArming && b0123EmbedQueued == null &&
+            b0134PhonesFailedTarget != desired && !cooldown
+        if (!ready) {
+            android.util.Log.w("AtomRemoteAudioB0134", "PHONES_BLOCK current=$current " +
+                "desired=$desired low=$low high=$high fresh=$fresh paired=$paired " +
+                "arming=$b0134PhonesArming pending=${b0134PhonesPending != null} " +
+                "otherAudioPending=$waitingOtherAudio blockedDirection=${b0134PhonesFailedTarget == desired} " +
+                "cooldown=$cooldown tx=false")
+            return false
+        }
+        b0134PhonesArming = true
+        val generationAtArm = live.generation
+        val baseline = current!!
+        val armStarted = android.os.SystemClock.elapsedRealtime()
+        android.util.Log.w("AtomRemoteAudioB0134", "PHONES_ARMED from=$baseline " +
+            "target=$desired allowed=$low..$high opcode=0x06AB " +
+            "protoCandidate=08${"%02x".format(desired)} tx=false binaryOpcodeProof=true " +
+            "hardwareProofPending=true")
+        val worker = object : Runnable {
+            override fun run() {
+                if (!b0134PhonesArming) return
+                val age = android.os.SystemClock.elapsedRealtime() - armStarted
+                val currentLive = _audioR26Live.value
+                val sessionGood = gatt === session &&
+                    _tcsPairingState.value.acceptWritten && _tcsRemoteState.value.available
+                if (!sessionGood || age > 12000L || currentLive.generation != generationAtArm ||
+                    remoteBootstrapActive) {
+                    b0134PhonesArming = false
+                    android.util.Log.w("AtomRemoteAudioB0134", "PHONES_ARM_ABORT ageMs=$age " +
+                        "sessionGood=$sessionGood generationChanged=${currentLive.generation != generationAtArm} tx=false")
+                    return
+                }
+                val idle = !currentLive.running && !inputCollectorRunning &&
+                    !inputExtendedRunning && r2706MicActive == null &&
+                    r2706MicReads.isEmpty() && !operationInFlight &&
+                    pendingRemotePacket == null && pendingOps.isEmpty() &&
+                    packetLink18.bufferedPacketSize() == 0 &&
+                    packetLink18.state().toString() == "READY" &&
+                    !b0120RecordPending && b0121LastQueuedRecord == null &&
+                    !b0130AudioArming
+                if (!idle) {
+                    mainHandler.postDelayed(this, 90L)
+                    return
+                }
+                b0134PhonesArming = false
+                val payload = byteArrayOf(0x08, desired.toByte())
+                val queued = enqueueOfficialRemoteCommandProtoPayload(
+                    commandId = 0x06AB, proto = payload,
+                    purpose = "b0134-phones-binary-verified-opcode:$desired",
+                    label = "B01.34 PHONES LEVEL $baseline to $desired (VERIFY GET)",
+                    local = true
+                )
+                android.util.Log.w("AtomRemoteAudioB0134", "PHONES_SET_QUEUED " +
+                    "from=$baseline target=$desired cmd=0x06AB proto=${payload.toHex()} " +
+                    "queued=$queued recorderConfirmed=false noAutoRetry=true")
+                if (!queued) return
+                b0134PhonesLastTxMs = android.os.SystemClock.elapsedRealtime()
+                b0134PhonesPending = B0134PhonesPending(session, desired, baseline, currentLive.generation)
+                val genAtTx = currentLive.generation
+                val txAt = android.os.SystemClock.elapsedRealtime()
+                val refresh = object : Runnable {
+                    override fun run() {
+                        if (gatt !== session) return
+                        val elapsed = android.os.SystemClock.elapsedRealtime() - txAt
+                        val v = _audioR26Live.value
+                        val isIdle = !v.running && !remoteBootstrapActive &&
+                            !inputCollectorRunning && !inputExtendedRunning &&
+                            r2706MicActive == null && r2706MicReads.isEmpty() &&
+                            !operationInFlight && pendingRemotePacket == null &&
+                            pendingOps.isEmpty() && packetLink18.bufferedPacketSize() == 0 &&
+                            packetLink18.state().toString() == "READY"
+                        if (!isIdle) {
+                            if (elapsed > 24000L) {
+                                android.util.Log.w("AtomRemoteAudioB0134", "PHONES_AUTO_GET_DEFERRED " +
+                                    "busy=true manualRefreshRequired=true noAutoSet=true")
+                                return
+                            }
+                            mainHandler.postDelayed(this, 120L)
+                            return
+                        }
+                        val accepted = startAudioR26RecoveredCollector()
+                        android.util.Log.i("AtomRemoteAudioB0134", "PHONES_AUTO_GET_REQUEST " +
+                            "accepted=$accepted afterSet=0x06AB target=$desired noAutoSet=true")
+                        if (!accepted) return
+                        val pollAt = android.os.SystemClock.elapsedRealtime()
+                        val verifier = object : Runnable {
+                            override fun run() {
+                                if (gatt !== session) return
+                                val newLive = _audioR26Live.value
+                                val rx = newLive.values["AudioMetersPageGet"]
+                                val newFresh = newLive.generation > genAtTx &&
+                                    !newLive.running && rx?.status == "TYPED_RX" &&
+                                    rx.responseType == 0x8647
+                                if (newFresh) {
+                                    val r = rx?.rawHex?.let {
+                                        com.atomosremote.nativeapp.audio.AudioR26PageSnapshot.decode(it)
+                                    }
+                                    val observed = r?.phonesLevel?.toInt()
+                                    val matched = observed == desired
+                                    val pending = b0134PhonesPending
+                                    if (pending != null && pending.session === session &&
+                                        pending.generationBeforeTx == genAtTx) {
+                                        b0134PhonesPending = null
+                                        b0134PhonesFailedTarget = if (matched) null else desired
+                                    }
+                                    android.util.Log.w("AtomRemoteAudioB0134", "PHONES_POST_GET_RESULT " +
+                                        "requested=$desired observed=$observed matched=$matched " +
+                                        "baseline=$baseline physicalRecorderMustMatch=true noAutoRetry=true")
+                                    return
+                                }
+                                if (android.os.SystemClock.elapsedRealtime() - pollAt > 22000L) {
+                                    android.util.Log.w("AtomRemoteAudioB0134", "PHONES_POST_GET_TIMEOUT " +
+                                        "requested=$desired manualFreshGETRequired=true " +
+                                        "noAutoRetry=true")
+                                    return
+                                }
+                                mainHandler.postDelayed(this, 200L)
+                            }
+                        }
+                        mainHandler.postDelayed(verifier, 200L)
+                    }
+                }
+                mainHandler.postDelayed(refresh, 180L)
+            }
+        }
+        mainHandler.post(worker)
+        return true // Armed only; UI cannot display the draft as recorder value.
+    }
+
+    // R26.65 EXPERIMENTAL AUDIO SET PILOT. Explicit UI operator action only.
+    // Opcodes and field-1 scalar bodies are CANDIDATES (macOS class adjacency).
+    // Do not call this from polling, reconnection, backend or automatic startup.
+    @SuppressLint("MissingPermission")
+    fun r2665TryAudioScalarSet(key: String, desired: Int): Boolean {
+        if (key == "phones") return b0134TryHeadphoneLevelSet(desired)
+        // R2695_UNIFIED_SOURCE_BATCH: candidate TX is NOT a confirmed SET contract.
+        // B01: Only the explicitly operator-triggered phones pilot may pass the
+        // historical proof gate. All other unverified SET keys remain blocked.
+        // 0x06AC remains an unverified candidate, not production control.
+        if (key != "phones" && !com.atomosremote.nativeapp.audio.AudioR2695Proof.canHardwareSet(key)) {
+            android.util.Log.w("AtomRemoteAudioR2695", "SET_BLOCKED unverified-audio key=$key desired=$desired")
+            return false
+        }
+        if (key == "phones" && "b01-phones" in a12PilotAttempted) {
+            android.util.Log.w("AtomRemoteAudioB01", "PHONES_ONE_SHOT_ALREADY_ATTEMPTED tx=false")
+            return false
+        }
+        val proof = _audioR26Live.value.values["AudioMetersPageGet"]
+        val page = proof?.takeIf { it.status == "TYPED_RX" && it.responseType == 0x8647 }
+            ?.rawHex?.let { com.atomosremote.nativeapp.audio.AudioR26PageSnapshot.decode(it) }
+        val current = when (key) {
+            "phones" -> page?.phonesLevel
+            "monitor" -> page?.monitor
+            "orientation" -> page?.orientation
+            "embed" -> page?.analogEmbed
+            else -> null
+        }
+        val allowed = when (key) {
+            "phones" -> page != null && desired.toLong() in page.phonesLevelMin..page.phonesLevelMax
+            "monitor" -> page != null && desired.toLong() in page.monitorList
+            "orientation" -> page != null && page.orientationChangeable != 0L && desired in 0..1
+            "embed" -> page != null && desired.toLong() in page.analogEmbedList
+            else -> false
+        }
+        val ready = _tcsPairingState.value.acceptWritten && _tcsRemoteState.value.available &&
+            page != null && allowed && current != null && current != desired.toLong() &&
+            desired in 0..127 && !audioR26Live.value.running && !remoteBootstrapActive &&
+            !inputCollectorRunning && !inputExtendedRunning && pendingRemotePacket == null &&
+            pendingOps.isEmpty() && packetLink18.bufferedPacketSize() == 0
+        if (!ready) {
+            android.util.Log.i("AtomRemoteAudioR2665", "SET_TRIAL_BLOCKED key=$key desired=$desired " +
+                "current=$current allowed=$allowed paired=${_tcsPairingState.value.acceptWritten} " +
+                "collector=${audioR26Live.value.running} busy=${pendingRemotePacket != null}" +
+                " remoteAvailable=${_tcsRemoteState.value.available} " +
+                " bootstrap=$remoteBootstrapActive inputCore=$inputCollectorRunning " +
+                " inputExtended=$inputExtendedRunning attBusy=$operationInFlight " +
+                " attQueue=${pendingOps.size} plinkBuffered=${packetLink18.bufferedPacketSize()}")
+            return false
+        }
+        // IMPORTANT: These four IDs are candidates, NOT confirmed AG2 setter opcodes.
+        val opcode = when (key) {
+            "phones" -> 0x06AB // B01.34 direct binary action path; early-dispatched above
+            "monitor" -> 0x06A6 // between recovered MonitorGet and MonitorListGet
+            "orientation" -> 0x06B0 // between recovered OrientationGet and AnalogEmbedGet
+            "embed" -> 0x06B2 // between recovered AnalogEmbedGet and AnalogEmbedListGet
+            else -> return false
+        }
+        android.util.Log.i("AtomRemoteAudioR2665", "SET_TRIAL_ATTEMPT key=$key opcode=0x${opcode.toString(16)} " +
+            "baseline=$current desired=$desired protoCandidate=08${"%02x".format(desired)} " +
+            "operatorAction=true ACK_NOT_YET_VERIFIED noAutomaticRetry=true")
+        android.util.Log.i("AtomRemoteAudioB011", "SET_DISPATCH_ENTER key=$key command=0x${opcode.toString(16)} " +
+            "target=$desired gattPresent=${gatt != null} plinkState=${packetLink18.state()} " +
+            "peerCredit=${packetLink18.peerCredit()} pending=${pendingRemotePacket?.purpose ?: "none"} " +
+            "attBusy=$operationInFlight attQueue=${pendingOps.size} candidateUnverified=true")
+        val queued = enqueueOfficialRemoteCommandProtoExplicitVarint1(
+            commandId = opcode, value = desired,
+            purpose = "r2665-audio-set-trial:$key:$desired",
+            label = "R2665 AUDIO SET TRIAL $key $desired"
+        )
+        android.util.Log.i("AtomRemoteAudioB011", "SET_DISPATCH_RETURN key=$key queued=$queued " +
+            "plinkState=${packetLink18.state()} buffered=${packetLink18.bufferedPacketSize()} " +
+            "pending=${pendingRemotePacket?.purpose ?: "none"} physicalWriteNotYetConfirmed=true")
+        if (key == "phones" && queued) a12PilotAttempted.add("b01-phones")
+        android.util.Log.i("AtomRemoteAudioR2665", "SET_TRIAL_QUEUE key=$key " +
+            "desired=$desired queued=$queued gattTxNotYetProven=true")
+        return queued
+    }
+
+    // R26.72 EXPERIMENTAL MIC/LINE CANDIDATE GET/SET.
+    // These methods are explicit operator trials based on official macOS method names
+    // and adjacent opcode recovery. They are NOT verified protocol implementations.
+    @SuppressLint("MissingPermission")
+    fun r2672TryMicLineCandidateGet(key: String): Boolean {
+        // R2706: operator-tapped macOS empty-body getter. Defer across transport
+        // ownership instead of dropping taps. The existing PacketLink writer,
+        // Input packet order, TCS pairing and all SET paths are untouched.
+        val macGet = com.atomosremote.nativeapp.audio.AudioR2705MacReadOnlyCommands.get(key)
+        if (macGet != null) return r2706RequestMicLineRead(key, macGet)
+        // R27.00: all four ABI-image candidates were rejected by AG2 (0xFFFF).
+        // Never keep probing on a card tap or pretend a failed GET has a value.
+        // Preserve official PacketLink and all working remote controls unchanged.
+        if (!com.atomosremote.nativeapp.audio.AudioR2698MacGetAbi.canTransmitGet(key)) {
+            val method = com.atomosremote.nativeapp.audio.AudioR2698MacGetAbi.forKey(key)
+                ?: return false
+            r2697MicLineState(key, method.opcode, "WIRE_SCHEMA_UNVERIFIED",
+                "R26.99 candidate got 0xFFFF; official SwiftProtobuf wire encoding not established. No BLE command sent")
+            android.util.Log.w("AtomRemoteAudioR2700",
+                "MIC_GET_SAFE_BLOCK key=$key cmd=0x${method.opcode.toString(16)} " +
+                    "source=macOS-local-ABI notWireFormat=true transmitted=false")
+            return false
+        }
+        val ready = _tcsPairingState.value.acceptWritten && _tcsRemoteState.value.available &&
+            !audioR26Live.value.running && !remoteBootstrapActive && !inputCollectorRunning &&
+            !inputExtendedRunning && pendingRemotePacket == null && pendingOps.isEmpty() &&
+            packetLink18.bufferedPacketSize() == 0
+        if (!ready) {
+            com.atomosremote.nativeapp.audio.AudioR2697MicLineEvidence.getOpcode(key)?.let { cmd ->
+                r2697MicLineState(key, cmd, "DEFERRED_TRANSPORT_BUSY", "No GET bytes transmitted")
+            }
+            android.util.Log.i("AtomRemoteAudioR2672", "GET_TRIAL_BLOCKED key=$key " +
+                "paired=${_tcsPairingState.value.acceptWritten} remoteAvailable=${_tcsRemoteState.value.available} " +
+                "collector=${audioR26Live.value.running} pending=${pendingRemotePacket?.purpose ?: "none"} " +
+                "attBusy=$operationInFlight attQueue=${pendingOps.size} plinkBuffered=${packetLink18.bufferedPacketSize()}")
+            return false
+        }
+        // R26.98: macOS constructor ABI candidates, NOT proven serialized wire
+        // schemas. One candidate GET per explicit operator card tap, no SET.
+        val candidate = com.atomosremote.nativeapp.audio.AudioR2698MacGetAbi.forKey(key)
+            ?: return false
+        val commandId = candidate.opcode
+        val proto = candidate.body
+        val label = "${candidate.method} ${candidate.key} ABI Candidate"
+        android.util.Log.i("AtomRemoteAudioR2699",
+            "GET_ABI_CANDIDATE key=$key cmd=0x${commandId.toString(16).uppercase()} " +
+                "body=${proto.toHex()} provenance=${candidate.provenance} " +
+                "wireVerified=false operatorAction=true noAutoRetry=true")
+        val queued = enqueueOfficialRemoteCommandProtoPayload(
+            commandId = commandId,
+            proto = proto,
+            purpose = "r2672-micline-get:$key",
+            label = "R2672 $label",
+            local = true
+        )
+        android.util.Log.i("AtomRemoteAudioR2672", "GET_TRIAL_QUEUE key=$key queued=$queued")
+        r2697MicLineState(key, commandId,
+            if (queued) "AWAITING_CANDIDATE_RX" else "DEFERRED_QUEUE_REFUSED",
+            "Local ABI candidate ${candidate.provenance}, not a verified wire schema or numeric GET")
+        if (queued) {
+            val token = r2697MicLineToken
+            mainHandler.postDelayed({
+                val record = _r2697MicLineEvidence.value.controls[key]
+                if (record?.requestToken == token && record.state == "AWAITING_CANDIDATE_RX") {
+                    _r2697MicLineEvidence.value = _r2697MicLineEvidence.value.copy(
+                        controls = _r2697MicLineEvidence.value.controls +
+                            (key to record.copy(state = "CANDIDATE_GET_TIMEOUT",
+                                detail = "No purpose-correlated response observed in 12 seconds")))
+                    android.util.Log.i("AtomRemoteAudioR2697", "MIC_GET_TIMEOUT key=$key token=$token")
+                }
+            }, 12_000L)
+        }
+        return queued
+    }
+
+    // A05.1: bounded, operator-only Mic/Line SET readiness scheduler.
+    // Existing setter guards and PacketLink TX implementation remain authoritative.
+    // It only waits for earlier GET owners, refreshes stale proven GETs, and offers
+    // one narrow pilot at a normal READY boundary. No automatic SET retry.
+    private data class A051SetIntent(
+        val id: Long, val kind: String, val selector: Boolean, val restore: Boolean,
+        val desired: Int, val startedAt: Long,
+        var getAttempted: Boolean = false,
+        @Volatile var inputReadyAtBoundary: Boolean = false
+    )
+    @Volatile private var a051SetIntent: A051SetIntent? = null
+    private var a051NextIntentId = 0L
+    private val a051IntentTtlMs = 75_000L
+
+    private fun a051CancelSetIntent(reason: String) {
+        val intent = a051SetIntent ?: return
+        a051SetIntent = null
+        android.util.Log.w("AtomRemoteAudioA051",
+            "SET_PREP_ABORT kind=${intent.kind} id=${intent.id} reason=$reason tx=false")
+    }
+
+    private fun a051StartSetIntent(kind: String, selector: Boolean = false,
+                                  restore: Boolean = false, desired: Int = 0): Boolean {
+        val existing = a051SetIntent
+        if (existing != null || gatt == null || !_tcsPairingState.value.acceptWritten ||
+            !_tcsRemoteState.value.available || remoteBootstrapActive ||
+            audioR26Live.value.running || inputCollectorRunning || inputExtendedRunning ||
+            (kind == "INPUT" && (desired !in 1..2 || a05InputPendingTarget != null))) {
+            android.util.Log.w("AtomRemoteAudioA051", "SET_PREP_BLOCKED kind=$kind " +
+                "active=${existing?.kind ?: "none"} desired=$desired tx=false")
+            return false
+        }
+        a051NextIntentId += 1L
+        val intent = A051SetIntent(a051NextIntentId, kind, selector, restore, desired,
+            android.os.SystemClock.elapsedRealtime())
+        a051SetIntent = intent
+        android.util.Log.i("AtomRemoteAudioA051", "SET_PREP_ACCEPTED kind=$kind " +
+            "id=${intent.id} selector=$selector restore=$restore desired=$desired " +
+            "deadlineMs=$a051IntentTtlMs transmitted=false")
+        mainHandler.post { a051PollSetIntent(intent.id) }
+        return true
+    }
+
+    fun a051RequestGainPilot(selector: Boolean, restore: Boolean): String =
+        if (a051StartSetIntent("GAIN", selector, restore)) "PREPARING_GET_IDLE"
+        else "BLOCKED_NO_TX"
+
+    fun a051RequestInputPilot(desired: Int): Boolean =
+        a051StartSetIntent("INPUT", desired = desired)
+
+    private fun a051PollSetIntent(id: Long) {
+        val intent = a051SetIntent ?: return
+        if (intent.id != id) return
+        val now = android.os.SystemClock.elapsedRealtime()
+        if (now - intent.startedAt > a051IntentTtlMs) {
+            a051CancelSetIntent("bounded-timeout")
+            return
+        }
+        if (gatt == null || !_tcsPairingState.value.acceptWritten ||
+            !_tcsRemoteState.value.available || remoteBootstrapActive ||
+            audioR26Live.value.running || inputCollectorRunning || inputExtendedRunning) {
+            a051CancelSetIntent("session-or-owner-changed")
+            return
+        }
+        val key = if (intent.kind == "GAIN") "gainLeft" else "inputLevel"
+        val rec = _r2697MicLineEvidence.value.controls[key]
+        val lastRx = if (intent.kind == "GAIN") r2722LastGainRxMs else a05LastInputRxMs
+        val maxAge = if (intent.kind == "GAIN") 25_000L else 15_000L
+        val typed = if (intent.kind == "GAIN")
+            rec?.command == 0x06B6 && rec.responseType == 0x86B1 &&
+                rec.state == "CANDIDATE_RX_UNMAPPED" &&
+                com.atomosremote.nativeapp.audio.AudioR2714GainReadback.decodeHex(rec.rawHex) != null
+        else
+            rec?.command == 0x06B3 && rec.responseType == 0x86AE &&
+                rec.state == "CANDIDATE_RX_UNMAPPED" &&
+                com.atomosremote.nativeapp.audio.AudioR2716InputLevelReadback.decodeHex(rec.rawHex) != null
+        val fresh = lastRx > 0L && now - lastRx in 0L..maxAge && typed
+        // A05.2: A previous restore may already have physically succeeded.
+        // Reconcile its pending marker ONLY from a fresh typed 0/0 recorder GET.
+        // Never clear an unverified -1 dB state and never send a restore here.
+        if (intent.kind == "GAIN" && intent.restore && fresh) {
+            val confirmed = com.atomosremote.nativeapp.audio.AudioR2714GainReadback
+                .decodeHex(rec!!.rawHex)
+            if (confirmed?.leftRaw == 0L && confirmed.rightRaw == 0L &&
+                r2722PilotRestoreSelector == intent.selector) {
+                r2722PilotRestoreSelector = null
+                r2722PilotSinceMs = 0L
+                a051CancelSetIntent("verified-zero-zero-no-restore-tx")
+                android.util.Log.i("AtomRemoteAudioA052", "GAIN_RESTORE_RECONCILED " +
+                    "selector=${intent.selector} rawLeft=0 rawRight=0 tx=false source=fresh-typed-GET")
+                return
+            }
+        }
+        if (!fresh) {
+            // Let the existing bounded Mic/Line GET queue drain naturally. In
+            // particular, the nonresponding Delay GET must not be cancelled.
+            if (!intent.getAttempted && r2706MicActive == null &&
+                r2706MicReads.isEmpty() && pendingRemotePacket == null &&
+                pendingOps.isEmpty() && !inputExtendedRunning) {
+                intent.getAttempted = r2672TryMicLineCandidateGet(key)
+                android.util.Log.i("AtomRemoteAudioA051", "SET_PREP_FRESH_GET " +
+                    "kind=${intent.kind} accepted=${intent.getAttempted} key=$key txIsGetOnly=true")
+            }
+            if (intent.getAttempted && rec?.state in setOf("RX_TIMEOUT_AFTER_DELIVERY",
+                    "DELIVERY_TIMEOUT_AFTER_ATT", "ATT_WRITE_UNCONFIRMED_TIMEOUT")) {
+                a051CancelSetIntent("fresh-get-failed")
+                return
+            }
+        } else if (r2706MicActive == null && r2706MicReads.isEmpty() &&
+            pendingRemotePacket == null && pendingOps.isEmpty() &&
+            packetLink18.bufferedPacketSize() == 0) {
+            if (intent.kind == "GAIN") {
+                val verdict = r2722RequestGainPilotIdleWindow(intent.selector, intent.restore)
+                if (verdict == "WAITING_IDLE" || verdict == "QUEUED_UNVERIFIED") {
+                    a051SetIntent = null
+                    android.util.Log.i("AtomRemoteAudioA051", "GAIN_SET_PREP_RESULT " +
+                        "result=$verdict selector=${intent.selector} restore=${intent.restore} " +
+                        "recorderApplied=UNVERIFIED")
+                    // A05.4: bounded GET-only readback scheduling. The old single
+                    // 2.7s attempt could miss while another Mic owner was active.
+                    // This block NEVER retries or transmits a SET.
+                    val readbackStartedAt = android.os.SystemClock.elapsedRealtime()
+                    val readback = object : Runnable {
+                        override fun run() {
+                            if (gatt == null || !_tcsPairingState.value.acceptWritten ||
+                                !_tcsRemoteState.value.available) {
+                                android.util.Log.w("AtomRemoteAudioA054",
+                                    "GAIN_GET_AFTER_SET_CANCEL reason=session-changed setRetransmit=false")
+                                return
+                            }
+                            if (r2722LastGainRxMs != 0L) {
+                                android.util.Log.i("AtomRemoteAudioA054",
+                                    "GAIN_GET_AFTER_SET_FINISHED source=typed-0x86B1 setRetransmit=false")
+                                return
+                            }
+                            val ageMs = android.os.SystemClock.elapsedRealtime() - readbackStartedAt
+                            if (ageMs > 15_000L) {
+                                android.util.Log.w("AtomRemoteAudioA054",
+                                    "GAIN_GET_AFTER_SET_TIMEOUT elapsedMs=$ageMs setRetransmit=false")
+                                return
+                            }
+                            val free = r2706MicActive == null && r2706MicReads.isEmpty() &&
+                                pendingRemotePacket == null && pendingOps.isEmpty() &&
+                                packetLink18.bufferedPacketSize() == 0 &&
+                                !audioR26Live.value.running && !inputCollectorRunning &&
+                                !inputExtendedRunning
+                            if (ageMs >= 1_500L && free) {
+                                val requested = r2672TryMicLineCandidateGet("gainLeft")
+                                android.util.Log.i("AtomRemoteAudioA054",
+                                    "GAIN_GET_AFTER_SET_ATTEMPT accepted=$requested " +
+                                        "elapsedMs=$ageMs requestType=GET setRetransmit=false")
+                                if (requested) return
+                            }
+                            mainHandler.postDelayed(this, 450L)
+                        }
+                    }
+                    mainHandler.postDelayed(readback, 1_500L)
+                    return
+                }
+            } else {
+                val raw = com.atomosremote.nativeapp.audio.AudioR2716InputLevelReadback
+                    .decodeHex(rec!!.rawHex)?.rawEnum
+                if (raw == intent.desired.toLong()) {
+                    a051CancelSetIntent("target-already-current")
+                    return
+                }
+                if (raw !in 1L..2L) {
+                    a051CancelSetIntent("invalid-input-enum")
+                    return
+                }
+                // The next completed ATT read owns the only safe READY boundary.
+                // The existing A05 setter still performs all final guards.
+                if (!intent.inputReadyAtBoundary) {
+                    intent.inputReadyAtBoundary = true
+                    android.util.Log.i("AtomRemoteAudioA051", "INPUT_BOUNDARY_ARMED " +
+                        "desired=${intent.desired} tx=false")
+                }
+            }
+        }
+        mainHandler.postDelayed({ a051PollSetIntent(id) }, 120L)
+    }
+
+    @SuppressLint("MissingPermission")
+    private fun a051OfferInputAtCompletedRead(g: BluetoothGatt) {
+        val intent = a051SetIntent ?: return
+        if (intent.kind != "INPUT" || !intent.inputReadyAtBoundary || g !== gatt ||
+            packetLink18.state().toString() != "READY" || operationInFlight ||
+            android.os.SystemClock.elapsedRealtime() - intent.startedAt > a051IntentTtlMs) return
+        // No preemption, no special GATT write, and no retry after success.
+        val sent = a05TryInputLevelSetPilot(intent.desired)
+        if (sent) {
+            a051SetIntent = null
+            android.util.Log.i("AtomRemoteAudioA051", "INPUT_BOUNDARY_RESULT " +
+                "desired=${intent.desired} queued=true effect=UNVERIFIED freshGetRequired=true")
+        }
+    }
+
+    // R27.22.2: An operator-requested pilot may wait briefly for the normal
+    // PLINK E0 WRITING/READING turn to finish. This does NOT relax any guard:
+    // the original r2722TryGainPilot() is the sole physical-write gate.
+    // A reconnect/session reset, stale GET, other queued work, or timeout cancels.
+    // R27.22.3: the ATT read callback sees a READY boundary before the next
+    // 10 ms PacketLink process tick. These fields publish the UI intent to
+    // that callback; no transport timer or BLE state machine is modified.
+    private val r2722IdleWindowLock = Any()
+    @Volatile private var r2722IdleWindowToken = 0L
+    @Volatile private var r2722IdleWindowPending = false
+    @Volatile private var r2722IdleWindowStartedAtMs = 0L
+    @Volatile private var r2722IdleWindowSelector = false
+    @Volatile private var r2722IdleWindowRestore = false
+
+    private fun r2722CancelIdleWindow(reason: String): Boolean {
+        val cancelled = synchronized(r2722IdleWindowLock) {
+            if (!r2722IdleWindowPending) false else {
+                r2722IdleWindowPending = false
+                r2722IdleWindowToken += 1L
+                r2722IdleWindowStartedAtMs = 0L
+                true
+            }
+        }
+        if (cancelled) android.util.Log.w("AtomRemoteAudioR2722",
+            "IDLE_WINDOW_CANCEL reason=$reason tx=false")
+        return cancelled
+    }
+
+    // Claim is atomic against the 15ms fallback polling and ATT read callback.
+    // This is essential: a single UI acknowledgment can never queue twice.
+    private fun r2722ClaimIdleWindow(token: Long): Boolean = synchronized(r2722IdleWindowLock) {
+        if (!r2722IdleWindowPending || token != r2722IdleWindowToken) false else {
+            r2722IdleWindowPending = false
+            r2722IdleWindowToken += 1L
+            r2722IdleWindowStartedAtMs = 0L
+            true
+        }
+    }
+
+    private fun r2722IdleWindowPrerequisites(selector: Boolean, restore: Boolean): Boolean {
+        val now = android.os.SystemClock.elapsedRealtime()
+        val rec = _r2697MicLineEvidence.value.controls["gainLeft"]
+        val gains = if (rec?.command == 0x06B6 && rec.responseType == 0x86B1 &&
+            rec.state == "CANDIDATE_RX_UNMAPPED")
+            com.atomosremote.nativeapp.audio.AudioR2714GainReadback.decodeHex(rec.rawHex)
+        else null
+        val fresh = r2722LastGainRxMs > 0L && (now - r2722LastGainRxMs) in 0L..25_000L
+        val contextReady = gatt != null && _tcsPairingState.value.acceptWritten &&
+            _tcsRemoteState.value.available && !remoteBootstrapActive &&
+            !audioR26Live.value.running && !inputCollectorRunning && !inputExtendedRunning &&
+            r2706MicActive == null && r2706MicReads.isEmpty() &&
+            pendingRemotePacket == null && pendingOps.isEmpty() &&
+            packetLink18.bufferedPacketSize() == 0
+        val baselineSafe = gains?.leftRaw == 0L && gains.rightRaw == 0L
+        val restoreSafe = gains != null &&
+            ((gains.leftRaw == -2L && gains.rightRaw == 0L) ||
+             (gains.leftRaw == 0L && gains.rightRaw == -2L)) &&
+            r2722PilotRestoreSelector == selector &&
+            (now - r2722PilotSinceMs) in 0L..300_000L
+        val eligible = contextReady && fresh && (if (restore) restoreSafe else baselineSafe) &&
+            (restore || r2722PilotRestoreSelector == null)
+        if (!eligible) {
+            android.util.Log.w("AtomRemoteAudioR2722",
+                "A03_GAIN_GUARD tx=false restore=$restore selector=$selector " +
+                "fresh=$fresh ageMs=${if (r2722LastGainRxMs > 0L) now - r2722LastGainRxMs else -1L} " +
+                "baselineSafe=$baselineSafe restoreSafe=$restoreSafe " +
+                "leftRaw=${gains?.leftRaw} rightRaw=${gains?.rightRaw} " +
+                "paired=${_tcsPairingState.value.acceptWritten} remote=${_tcsRemoteState.value.available} " +
+                "bootstrap=${remoteBootstrapActive} audioCollector=${audioR26Live.value.running} " +
+                "inputCollector=$inputCollectorRunning inputExtended=$inputExtendedRunning " +
+                "micActive=${r2706MicActive != null} micQueued=${r2706MicReads.size} " +
+                "pendingPacket=${pendingRemotePacket != null} pendingOps=${pendingOps.size} " +
+                "plinkBuffered=${packetLink18.bufferedPacketSize()} operationInFlight=$operationInFlight " +
+                "plinkState=${packetLink18.state()} restorePending=${r2722PilotRestoreSelector != null}")
+        }
+        return eligible
+    }
+
+    /** Return WAITING_IDLE, QUEUED_UNVERIFIED or BLOCKED_NO_TX.
+     * Only one operator request in flight; retry expires within 1,000 ms.
+     * Do not confuse WAITING_IDLE with a transmitted or applied SET.
+     */
+    @SuppressLint("MissingPermission")
+    fun r2722RequestGainPilotIdleWindow(selector: Boolean, restore: Boolean): String {
+        if (r2722IdleWindowPending) {
+            android.util.Log.w("AtomRemoteAudioR2722",
+                "IDLE_WINDOW_REJECT duplicate=true selector=$selector restore=$restore tx=false")
+            return "BLOCKED_NO_TX"
+        }
+        if (!r2722IdleWindowPrerequisites(selector, restore)) {
+            android.util.Log.w("AtomRemoteAudioR2722",
+                "IDLE_WINDOW_REJECT prerequisites=false selector=$selector restore=$restore tx=false")
+            return "BLOCKED_NO_TX"
+        }
+        // Do not issue a SET inside an active GATT operation, even if PLINK
+        // has zero application bytes buffered. Require actual READY too.
+        if (!operationInFlight && packetLink18.state().toString() == "READY") {
+            val queued = r2722TryGainPilot(selector, restore)
+            android.util.Log.i("AtomRemoteAudioR2722",
+                "IDLE_WINDOW_IMMEDIATE queued=$queued selector=$selector restore=$restore")
+            return if (queued) "QUEUED_UNVERIFIED" else "BLOCKED_NO_TX"
+        }
+        val state = packetLink18.state().toString()
+        if (!operationInFlight || state !in setOf("WRITING", "READING")) {
+            android.util.Log.w("AtomRemoteAudioR2722",
+                "IDLE_WINDOW_REJECT activeAtt=$operationInFlight state=$state reason=not-plink-turn tx=false")
+            return "BLOCKED_NO_TX"
+        }
+        val started = android.os.SystemClock.elapsedRealtime()
+        val token = synchronized(r2722IdleWindowLock) {
+            r2722IdleWindowToken += 1L
+            r2722IdleWindowStartedAtMs = started
+            r2722IdleWindowSelector = selector
+            r2722IdleWindowRestore = restore
+            r2722IdleWindowPending = true
+            r2722IdleWindowToken
+        }
+        var samples = 0
+        android.util.Log.i("AtomRemoteAudioR2722",
+            "IDLE_WINDOW_ARMED selector=$selector restore=$restore ttlMs=1000 tx=false")
+        val task = object : Runnable {
+            override fun run() {
+                if (token != r2722IdleWindowToken || !r2722IdleWindowPending) return
+                samples += 1
+                val elapsed = android.os.SystemClock.elapsedRealtime() - started
+                if (elapsed > 1_000L || !r2722IdleWindowPrerequisites(selector, restore)) {
+                    if (r2722CancelIdleWindow(if (elapsed > 1_000L) "timeout" else "guard-changed")) {
+                        android.util.Log.w("AtomRemoteAudioR2722",
+                            "IDLE_WINDOW_ABORT selector=$selector restore=$restore elapsed=$elapsed samples=$samples noSet=true")
+                    }
+                    return
+                }
+                if (!operationInFlight && packetLink18.state().toString() == "READY") {
+                    if (r2722ClaimIdleWindow(token)) {
+                        // Re-check all original guards immediately at transmission.
+                        val queued = r2722TryGainPilot(selector, restore)
+                        android.util.Log.i("AtomRemoteAudioR2722",
+                            "IDLE_WINDOW_RESULT queued=$queued selector=$selector restore=$restore " +
+                                "elapsed=$elapsed samples=$samples recorderApplied=UNVERIFIED")
+                    }
+                    return
+                }
+                mainHandler.postDelayed(this, 15L)
+            }
+        }
+        mainHandler.postDelayed(task, 15L)
+        return "WAITING_IDLE"
+    }
+
+    /** R27.22.3: consume a single pending pilot *inside* a completed ATT read.
+     * onCharacteristicRead already set operationInFlight=false before invoking
+     * the PacketLink handler. onReadSubpacket(E0 / final) sets READY here, but
+     * the 10 ms process loop can consume that state before UI polling sees it.
+     * This only buffers an explicit operator request; it never performs a
+     * direct GATT write. The original physical SET guard remains authoritative.
+     */
+    @SuppressLint("MissingPermission")
+    private fun r2722OfferIdleWindowAtCompletedRead(g: BluetoothGatt) {
+        if (!r2722IdleWindowPending || g !== gatt ||
+            packetLink18.state().toString() != "READY") return
+        val token = r2722IdleWindowToken
+        val started = r2722IdleWindowStartedAtMs
+        val selector = r2722IdleWindowSelector
+        val restore = r2722IdleWindowRestore
+        val elapsed = android.os.SystemClock.elapsedRealtime() - started
+        if (started <= 0L || elapsed !in 0L..1_000L) {
+            if (r2722CancelIdleWindow("boundary-expired")) {
+                android.util.Log.w("AtomRemoteAudioR2722",
+                    "IDLE_WINDOW_BOUNDARY_ABORT reason=expired elapsed=$elapsed tx=false")
+            }
+            return
+        }
+        // If another owner took the packet or ATT queue, keep waiting only
+        // until the existing deadline; never preempt Settings, Input or Remote.
+        if (!r2722IdleWindowPrerequisites(selector, restore) ||
+            operationInFlight || pendingOps.isNotEmpty()) {
+            if (r2722CancelIdleWindow("boundary-guard-changed")) {
+                android.util.Log.w("AtomRemoteAudioR2722",
+                    "IDLE_WINDOW_BOUNDARY_ABORT reason=guard-changed tx=false")
+            }
+            return
+        }
+        if (!r2722ClaimIdleWindow(token)) return
+        // r2722TryGainPilot checks fresh typed GET, 0/-1 raw baseline,
+        // pairing, bootstrap, pending owners and *actual* ATT availability.
+        val queued = r2722TryGainPilot(selector, restore)
+        android.util.Log.i("AtomRemoteAudioR2722",
+            "IDLE_WINDOW_BOUNDARY_RESULT queued=$queued selector=$selector " +
+                "restore=$restore elapsed=$elapsed path=ATT_READ_READY " +
+                "recorderApplied=UNVERIFIED physicalGetRequired=true")
+    }
+
+    // A12.37: Proven selector=false LEFT / selector=true RIGHT.
+    // Numeric 0.5 dB mapping comes from GET A/B and -1 dB SET pilot.
+    // This is an operator-only single shot, with explicit field-2 selector.
+    // No automatic SET retries; no success until independent typed GET.
+    @Volatile private var a137GainPending = false
+    private var a137GainSelector = false
+    private var a137GainTargetRaw = 0L
+    private var a137GainBeforeLeft = 0L
+    private var a137GainBeforeRight = 0L
+    private var a137GainStartedMs = 0L
+
+    @SuppressLint("MissingPermission")
+    fun a137RequestGainSet(selector: Boolean, rawTarget: Int): Boolean {
+        val now = android.os.SystemClock.elapsedRealtime()
+        val rec = _r2697MicLineEvidence.value.controls["gainLeft"]
+        val gains = if (rec?.command == 0x06B6 && rec.responseType == 0x86B1 &&
+            rec.state == "CANDIDATE_RX_UNMAPPED")
+            com.atomosremote.nativeapp.audio.AudioR2714GainReadback.decodeHex(rec.rawHex)
+        else null
+        val current = if (selector) gains?.rightRaw else gains?.leftRaw
+        if (a137GainPending || rawTarget !in -20..40 || gains == null ||
+            r2722LastGainRxMs <= 0L || now - r2722LastGainRxMs !in 0L..15_000L ||
+            current == rawTarget.toLong() || gatt == null ||
+            !_tcsPairingState.value.acceptWritten || !_tcsRemoteState.value.available ||
+            remoteBootstrapActive || audioR26Live.value.running ||
+            inputCollectorRunning || inputExtendedRunning ||
+            r2722PilotRestoreSelector != null || a051SetIntent != null) {
+            android.util.Log.w("AtomRemoteAudioA137Gain", "GAIN_RANGE_BLOCKED selector=$selector target=$rawTarget " +
+                "current=$current pending=$a137GainPending freshMs=${now-r2722LastGainRxMs} tx=false")
+            return false
+        }
+        a137GainPending = true
+        a137GainSelector = selector
+        a137GainTargetRaw = rawTarget.toLong()
+        a137GainBeforeLeft = gains.leftRaw
+        a137GainBeforeRight = gains.rightRaw
+        a137GainStartedMs = now
+        android.util.Log.i("AtomRemoteAudioA137Gain", "GAIN_RANGE_ARMED selector=$selector targetRaw=$rawTarget " +
+            "beforeLeft=${gains.leftRaw} beforeRight=${gains.rightRaw} setTx=false")
+        val run = object : Runnable {
+            override fun run() {
+                if (!a137GainPending || a137GainStartedMs != now) return
+                val elapsed = android.os.SystemClock.elapsedRealtime() - now
+                if (elapsed > 5_000L || gatt == null || !_tcsPairingState.value.acceptWritten ||
+                    !_tcsRemoteState.value.available || remoteBootstrapActive) {
+                    a137GainPending = false
+                    android.util.Log.w("AtomRemoteAudioA137Gain", "GAIN_RANGE_ABORT reason=idle-timeout-or-session " +
+                        "elapsedMs=$elapsed tx=false")
+                    return
+                }
+                val idle = !operationInFlight && pendingRemotePacket == null &&
+                    pendingOps.isEmpty() && r2706MicActive == null && r2706MicReads.isEmpty() &&
+                    !inputCollectorRunning && !inputExtendedRunning && !audioR26Live.value.running &&
+                    packetLink18.bufferedPacketSize() == 0 && packetLink18.state().toString() == "READY"
+                if (!idle) { mainHandler.postDelayed(this, 25L); return }
+                // Explicit field-2 FALSE or TRUE is required, even when false.
+                val raw = rawTarget.toLong()
+                val wire = java.io.ByteArrayOutputStream()
+                wire.write(0x08)
+                var x = raw
+                while (true) {
+                    if ((x and -128L) == 0L) { wire.write(x.toInt()); break }
+                    wire.write(((x and 127L) or 128L).toInt())
+                    x = x ushr 7
+                }
+                wire.write(0x10)
+                wire.write(if (selector) 1 else 0)
+                val proto = wire.toByteArray()
+                val packet = PendingRemotePacket(
+                    buildOfficialAtomMessageBodyWithProtoPayload(0, 0x06B7, proto),
+                    "a137-gain-range:$selector:$rawTarget", "A137 Gain SET", 0x06B7, 0)
+                pendingRemotePacket = packet
+                pendingRemoteFrameWritten = false
+                val queued = queueRemotePacket18_8(packet, local = true)
+                if (!queued && pendingRemotePacket === packet) {
+                    pendingRemotePacket = null
+                    pendingRemoteFrameWritten = false
+                }
+                if (!queued) {
+                    a137GainPending = false
+                    android.util.Log.w("AtomRemoteAudioA137Gain", "GAIN_RANGE_QUEUE_REFUSED selector=$selector " +
+                        "raw=$rawTarget tx=false")
+                    return
+                }
+                r2722LastGainRxMs = 0L
+                android.util.Log.i("AtomRemoteAudioA137Gain", "GAIN_RANGE_SET_QUEUED selector=$selector " +
+                    "targetRaw=$rawTarget proto=${proto.toHex()} elapsedMs=$elapsed " +
+                    "transmissionUnverified=true applied=UNKNOWN noSetRetry=true")
+                // GET ONLY. Busy transport may defer GET; do not retransmit SET.
+                val requestAt = android.os.SystemClock.elapsedRealtime()
+                val verify = object : Runnable {
+                    override fun run() {
+                        if (!a137GainPending || a137GainStartedMs != now) return
+                        val age = android.os.SystemClock.elapsedRealtime() - requestAt
+                        if (age > 15_000L) {
+                            a137GainPending = false
+                            android.util.Log.w("AtomRemoteAudioA137Gain", "GAIN_RANGE_UNVERIFIED_TIMEOUT " +
+                                "targetRaw=$rawTarget setRetry=false")
+                            return
+                        }
+                        val free = r2706MicActive == null && r2706MicReads.isEmpty() &&
+                            pendingRemotePacket == null && pendingOps.isEmpty() &&
+                            packetLink18.bufferedPacketSize() == 0 && !operationInFlight
+                        if (free && r2722LastGainRxMs == 0L) {
+                            val accepted = r2672TryMicLineCandidateGet("gainLeft")
+                            android.util.Log.i("AtomRemoteAudioA137Gain", "GAIN_RANGE_VERIFY_GET " +
+                                "accepted=$accepted ageMs=$age cmd=0x06B6 setRetry=false")
+                        }
+                        mainHandler.postDelayed(this, 450L)
+                    }
+                }
+                mainHandler.postDelayed(verify, 400L)
+            }
+        }
+        mainHandler.post(run)
+        return true
+    }
+
+    /** R27.22 constrained hardware pilot, not production gain SET.
+     * Unknown channel polarity is intentionally exposed as selector=false/true.
+     * The ONLY allowed physical delta is 0 dB -> -1 dB on one channel.
+     * Restore 0 dB is a separate operator action after independent fresh GET.
+     * All other four-control SET paths remain locked.
+     */
+    @SuppressLint("MissingPermission")
+    fun r2722TryGainPilot(selector: Boolean, restore: Boolean): Boolean {
+        val now = android.os.SystemClock.elapsedRealtime()
+        val rec = _r2697MicLineEvidence.value.controls["gainLeft"]
+        val gains = if (rec?.command == 0x06B6 && rec.responseType == 0x86B1 &&
+            rec.state == "CANDIDATE_RX_UNMAPPED")
+            com.atomosremote.nativeapp.audio.AudioR2714GainReadback.decodeHex(rec.rawHex)
+        else null
+        val fresh = r2722LastGainRxMs > 0L && (now - r2722LastGainRxMs) in 0L..25_000L
+        val ready = gatt != null && _tcsPairingState.value.acceptWritten &&
+            _tcsRemoteState.value.available && !remoteBootstrapActive &&
+            !audioR26Live.value.running && !inputCollectorRunning && !inputExtendedRunning &&
+            r2706MicActive == null && r2706MicReads.isEmpty() &&
+            pendingRemotePacket == null && pendingOps.isEmpty() &&
+            packetLink18.bufferedPacketSize() == 0 && !operationInFlight &&
+            packetLink18.state().toString() == "READY"
+        val baselineSafe = gains?.leftRaw == 0L && gains.rightRaw == 0L
+        val restoreSafe = gains != null &&
+            ((gains.leftRaw == -2L && gains.rightRaw == 0L) ||
+             (gains.leftRaw == 0L && gains.rightRaw == -2L)) &&
+            r2722PilotRestoreSelector == selector &&
+            (now - r2722PilotSinceMs) in 0L..300_000L
+        if (!ready || !fresh || (if (restore) !restoreSafe else !baselineSafe) ||
+            (!restore && r2722PilotRestoreSelector != null)) {
+            android.util.Log.w("AtomRemoteAudioR2722",
+                "GAIN_PILOT_BLOCKED restore=$restore selector=$selector ready=$ready " +
+                "fresh=$fresh left=${gains?.leftRaw} right=${gains?.rightRaw} " +
+                "restorePending=${r2722PilotRestoreSelector != null} tx=false")
+            android.util.Log.w("AtomRemoteAudioR2722",
+                "R2722_GUARD_DETAIL " +
+                "gattPresent=${gatt != null} " +
+                "pairAccepted=${_tcsPairingState.value.acceptWritten} " +
+                "remoteAvailable=${_tcsRemoteState.value.available} " +
+                "bootstrapInactive=${!remoteBootstrapActive} " +
+                "audioInactive=${!audioR26Live.value.running} " +
+                "inputCollectorInactive=${!inputCollectorRunning} " +
+                "inputExtendedInactive=${!inputExtendedRunning} " +
+                "micActiveIdle=${r2706MicActive == null} " +
+                "micQueueEmpty=${r2706MicReads.isEmpty()} " +
+                "packetPendingNone=${pendingRemotePacket == null} " +
+                "opsEmpty=${pendingOps.isEmpty()} " +
+                "plinkEmpty=${packetLink18.bufferedPacketSize() == 0} " +
+                "plinkBytes=${packetLink18.bufferedPacketSize()} " +
+                "plinkState=${packetLink18.state()} " +
+                "operationIdle=${!operationInFlight} tx=false")
+            return false
+        }
+        val rawGain = if (restore) 0 else -2
+        val legacyProto = com.atomosremote.nativeapp.audio.AudioR2722GainPilotWire
+            .gainMessage(rawGain, selector, explicitZero = restore)
+        // A12.36: deliberately encode a present field-2 FALSE, instead of
+        // omitting it. Only the existing operator-triggered 0/-1dB pilot.
+        // This is a one-shot protocol hypothesis, NOT a proven recorder setting.
+        val proto = if (!selector) legacyProto + byteArrayOf(0x10, 0x00)
+                    else legacyProto
+        android.util.Log.i("AtomRemoteAudioA136Gain",
+            "GAIN_EXPLICIT_SELECTOR_PILOT selector=$selector restore=$restore " +
+            "field2Present=true explicitFalse=${!selector} " +
+            "legacy=${legacyProto.toHex()} candidate=${proto.toHex()} " +
+            "hardwareEffect=UNVERIFIED")
+        // Isolate the pilot packet from legacy R26.72 and clean up on queue refusal.
+        val purpose = "r2722-gain-pilot:${if (restore) "restore" else "trial"}:$selector"
+        val body = buildOfficialAtomMessageBodyWithProtoPayload(0, 0x06B7, proto)
+        val packet = PendingRemotePacket(body, purpose,
+            "R2722 Gain PILOT ${if (restore) "RESTORE" else "MINUS_1_DB"}", 0x06B7, 0)
+        pendingRemotePacket = packet
+        pendingRemoteFrameWritten = false
+        val queued = queueRemotePacket18_8(packet, local = true)
+        if (!queued && pendingRemotePacket === packet) {
+            pendingRemotePacket = null
+            pendingRemoteFrameWritten = false
+        }
+        if (queued) {
+            // This is an evidence marker, not an acknowledgment of recorder SET.
+            a135GainPilotSelector = selector
+            a135GainPilotRestore = restore
+            a135GainPilotBeforeLeft = gains!!.leftRaw
+            a135GainPilotBeforeRight = gains.rightRaw
+            a135GainPilotAt = now
+            android.util.Log.i("AtomRemoteAudioA135Gain",
+                "GAIN_SELECTOR_ARMED selector=$selector restore=$restore " +
+                "beforeLeft=${gains.leftRaw} beforeRight=${gains.rightRaw} " +
+                "cmd=0x06B7 rawGain=$rawGain queueAccepted=true physicalEffect=UNVERIFIED")
+            if (restore) {
+                // A05 combined safety fix: QUEUED is not APPLIED. Keep the
+                // restore marker until typed 0/0 GET proves physical restore.
+                // In particular 0xFFFF or unchanged -1dB MUST NOT unlock SET.
+                android.util.Log.i("AtomRemoteAudioA053", "RESTORE_QUEUED_AWAIT_GET " +
+                    "selector=$selector raw=0 applied=false")
+            } else {
+                r2722PilotRestoreSelector = selector
+                r2722PilotSinceMs = now
+            }
+            r2722LastGainRxMs = 0L // operator must refresh the recorder after every write
+        }
+        android.util.Log.i("AtomRemoteAudioR2722",
+            "GAIN_PILOT_QUEUE queued=$queued selector=$selector restore=$restore " +
+            "cmd=0x06B7 rawGain=$rawGain proto=${proto.toHex()} " +
+            "recorderApplied=UNVERIFIED physicalGetRequired=true")
+        return queued
+    }
+
+    /** A05: one-shot macOS-derived 0x06B4 InputSourceSet PILOT, NOT production SET.
+     * Operator must confirm recorder idle and monitoring muted. Only 1<->2 flip
+     * from a fresh 0x86AE GET, with no BLE owner conflicts; one post-SET GET.
+     * Payload is a candidate (protobuf f1 enum), never treated as ACK.
+     */
+    @SuppressLint("MissingPermission")
+    fun a05TryInputLevelSetPilot(desired: Int): Boolean {
+        val now = android.os.SystemClock.elapsedRealtime()
+        val read = _r2697MicLineEvidence.value.controls["inputLevel"]
+        val current = if (read?.command == 0x06B3 && read.responseType == 0x86AE &&
+            read.state == "CANDIDATE_RX_UNMAPPED")
+            com.atomosremote.nativeapp.audio.AudioR2716InputLevelReadback.decodeHex(read.rawHex)
+        else null
+        val fresh = a05LastInputRxMs > 0L && (now - a05LastInputRxMs) in 0L..15_000L
+        val idle = gatt != null && _tcsPairingState.value.acceptWritten &&
+            _tcsRemoteState.value.available && !remoteBootstrapActive &&
+            !audioR26Live.value.running && !inputCollectorRunning && !inputExtendedRunning &&
+            r2706MicActive == null && r2706MicReads.isEmpty() &&
+            pendingRemotePacket == null && pendingOps.isEmpty() && !operationInFlight &&
+            packetLink18.bufferedPacketSize() == 0 && packetLink18.state().toString() == "READY"
+        val previous = current?.rawEnum
+        if (desired !in 1..2 || !fresh || !idle || (previous == null || previous !in 1L..2L) ||
+            previous == desired.toLong() || a05InputPendingTarget != null) {
+            android.util.Log.w("AtomRemoteAudioA05", "INPUT_SET_BLOCKED tx=false " +
+                "desired=$desired current=$previous fresh=$fresh idle=$idle " +
+                "pending=${a05InputPendingTarget != null} " +
+                "gattPresent=${gatt != null} pairing=${_tcsPairingState.value.acceptWritten} " +
+                "available=${_tcsRemoteState.value.available} " +
+                "micActive=${r2706MicActive != null} micQueued=${r2706MicReads.size} " +
+                "pendingPacket=${pendingRemotePacket?.purpose ?: "none"} " +
+                "attBusy=$operationInFlight plink=${packetLink18.state()}")
+            return false
+        }
+        // Candidate f1 enum from real AG2 GETs; SET wire has not been proven.
+        val proto = byteArrayOf(0x08, desired.toByte())
+        val body = buildOfficialAtomMessageBodyWithProtoPayload(0, 0x06B4, proto)
+        val packet = PendingRemotePacket(body, "a05-input-pilot:$desired",
+            "A05 Input Level PILOT ${if (desired == 1) "LINE" else "MIC"}", 0x06B4, 0)
+        pendingRemotePacket = packet
+        pendingRemoteFrameWritten = false
+        val queued = queueRemotePacket18_8(packet, local = true)
+        if (!queued && pendingRemotePacket === packet) {
+            pendingRemotePacket = null
+            pendingRemoteFrameWritten = false
+        }
+        android.util.Log.i("AtomRemoteAudioA05", "INPUT_SET_PILOT queued=$queued " +
+            "cmd=0x06B4 local=true packetId=0 proto=${proto.toHex()} " +
+            "before=$previous requested=$desired effect=UNVERIFIED")
+        if (queued) {
+            a05InputPendingTarget = desired
+            a05InputPreviousRaw = previous
+            a05InputSetAtMs = now
+            // Exactly one readback request. Never automatically retry a SET.
+            mainHandler.postDelayed({
+                if (a05InputPendingTarget == desired && gatt != null &&
+                    _tcsPairingState.value.acceptWritten) {
+                    val accepted = r2672TryMicLineCandidateGet("inputLevel")
+                    android.util.Log.i("AtomRemoteAudioA05", "INPUT_POST_SET_GET_REQUEST " +
+                        "accepted=$accepted target=$desired txIsGETOnly=true")
+                }
+            }, 1_800L)
+            // A06: One bounded additional GET opportunity if the first GET
+            // could not complete while ATT/PacketLink was busy. This never
+            // retries the experimental SET and never assumes a write succeeded.
+            mainHandler.postDelayed({
+                if (a05InputPendingTarget == desired && a05InputSetAtMs == now &&
+                    gatt != null && _tcsPairingState.value.acceptWritten) {
+                    val accepted = r2672TryMicLineCandidateGet("inputLevel")
+                    android.util.Log.i("AtomRemoteAudioA06", "INPUT_POST_SET_GET_RETRY " +
+                        "accepted=$accepted target=$desired txIsGETOnly=true setRetried=false")
+                }
+            }, 7_000L)
+            mainHandler.postDelayed({
+                if (a05InputPendingTarget == desired && a05InputSetAtMs == now) {
+                    android.util.Log.w("AtomRemoteAudioA05", "INPUT_SET_UNCONFIRMED " +
+                        "target=$desired reason=no-bounded-typed-readback")
+                    a05InputPendingTarget = null
+                    a05InputPreviousRaw = null
+                    a05InputSetAtMs = 0L
+                }
+            }, 35_000L)
+        }
+        return queued
+    }
+
+    @SuppressLint("MissingPermission")
+    fun r2672TryMicLineCandidateSet(key: String, desired: Int): Boolean {
+        // R2695_UNIFIED_SOURCE_BATCH: wrong gain scale/channel enum must never be transmitted.
+        if (!com.atomosremote.nativeapp.audio.AudioR2695Proof.canHardwareSet(key)) {
+            android.util.Log.w("AtomRemoteAudioR2695", "SET_BLOCKED unverified-micline key=$key desired=$desired")
+            return false
+        }
+        val ready = _tcsPairingState.value.acceptWritten && _tcsRemoteState.value.available &&
+            !audioR26Live.value.running && !remoteBootstrapActive && !inputCollectorRunning &&
+            !inputExtendedRunning && pendingRemotePacket == null && pendingOps.isEmpty() &&
+            packetLink18.bufferedPacketSize() == 0
+        if (!ready) {
+            android.util.Log.i("AtomRemoteAudioR2672", "SET_TRIAL_BLOCKED key=$key desired=$desired " +
+                "paired=${_tcsPairingState.value.acceptWritten} remoteAvailable=${_tcsRemoteState.value.available} " +
+                "collector=${audioR26Live.value.running} pending=${pendingRemotePacket?.purpose ?: "none"} " +
+                "attBusy=$operationInFlight attQueue=${pendingOps.size} plinkBuffered=${packetLink18.bufferedPacketSize()}")
+            return false
+        }
+        val tuple = when (key) {
+            "gainLeft" -> Triple(0x06B8, buildProtoVarintFields(1 to 0, 2 to desired.coerceIn(0, 100)), "GainSet Left")
+            "gainRight" -> Triple(0x06B8, buildProtoVarintFields(1 to 1, 2 to desired.coerceIn(0, 100)), "GainSet Right")
+            "delay" -> Triple(0x06BB, buildProtoVarintFields(1 to desired.coerceIn(0, 12)), "FrameDelaySet")
+            "inputLevel" -> Triple(0x06B5, buildProtoVarintFields(1 to desired.coerceIn(0, 1)), "InputSourceSet")
+            else -> return false
+        }
+        val (commandId, proto, label) = tuple
+        android.util.Log.i("AtomRemoteAudioR2672",
+            "SET_TRIAL_ATTEMPT key=$key desired=$desired cmd=0x${commandId.toString(16).uppercase()} " +
+                "proto=${proto.toHex()} verifiedBytes=false operatorAction=true")
+        val queued = enqueueOfficialRemoteCommandProtoPayload(
+            commandId = commandId,
+            proto = proto,
+            purpose = "r2672-micline-set:$key:$desired",
+            label = "R2672 $label",
+            local = true
+        )
+        android.util.Log.i("AtomRemoteAudioR2672", "SET_TRIAL_QUEUE key=$key desired=$desired queued=$queued")
+        return queued
+    }
+
+
+    // A12.5: bounded, explicitly triggered delay SET opportunity.
+    // SET is a candidate, and a queued packet MUST NOT be shown as confirmed.
+    // No other control may use this gate. No SET retry after queue acceptance.
+    private val a12PilotAttempted = mutableSetOf<String>()
+    private var a125DelayWaiting = false
+    private var a125DelayDeadlineMs = 0L
+
+    // A12.7: explicitly operator-triggered MONITOR candidate, NOT protocol proven.
+    // Previous 0x06A6 / 0801 trial left the microphone monitor GET unchanged.
+    // Deliberately isolated from existing audio SET and global ATT scheduler.
+    private var a127MonitorWaiting = false
+    private var a127MonitorAttempted = false
+    @SuppressLint("MissingPermission")
+    private fun a127MonitorExperimentalOneShot(desired: Int): Boolean {
+        if (desired !in 0..1 || a127MonitorWaiting || a127MonitorAttempted) {
+            android.util.Log.w("AtomRemoteAudioA127", "MONITOR_REJECT desired=$desired reason=invalid-or-once tx=false")
+            return false
+        }
+        if (gatt == null || !_tcsPairingState.value.acceptWritten || !_tcsRemoteState.value.available) {
+            android.util.Log.w("AtomRemoteAudioA127", "MONITOR_REJECT reason=not-connected tx=false")
+            return false
+        }
+        a127MonitorWaiting = true
+        val initialGatt = gatt
+        val deadline = android.os.SystemClock.elapsedRealtime() + 18_000L
+        val tick = object : Runnable {
+            override fun run() {
+                if (!a127MonitorWaiting) return
+                if (gatt == null || gatt !== initialGatt || !_tcsPairingState.value.acceptWritten ||
+                    !_tcsRemoteState.value.available) {
+                    a127MonitorWaiting = false
+                    android.util.Log.w("AtomRemoteAudioA127", "MONITOR_ABORT session-changed tx=false")
+                    return
+                }
+                if (android.os.SystemClock.elapsedRealtime() >= deadline) {
+                    a127MonitorWaiting = false
+                    android.util.Log.w("AtomRemoteAudioA127", "MONITOR_IDLE_TIMEOUT tx=false")
+                    return
+                }
+                val idle = !audioR26Live.value.running && !remoteBootstrapActive &&
+                    !inputCollectorRunning && !inputExtendedRunning &&
+                    pendingRemotePacket == null && pendingOps.isEmpty() &&
+                    !operationInFlight && packetLink18.bufferedPacketSize() == 0 &&
+                    r2706MicActive == null && r2706MicReads.isEmpty() &&
+                    !a125DelayWaiting
+                val state = packetLink18.state().toString()
+                if (!idle || (state != "READY" && state != "WRITING")) {
+                    mainHandler.postDelayed(this, 300L)
+                    return
+                }
+                a127MonitorWaiting = false
+                a127MonitorAttempted = true // one attempt only, including queue rejection
+                val proto = buildProtoVarintFields(1 to desired)
+                android.util.Log.w("AtomRemoteAudioA127", "MONITOR_SET_CANDIDATE opcode=0x06A6 proto=${proto.toHex()} " +
+                    "requested=$desired mappingUnverified=true mayChangeMonitorSource=true")
+                val queued = enqueueOfficialRemoteCommandProtoPayload(
+                    commandId = 0x06A6, proto = proto,
+                    purpose = "a127-experimental-monitor-one-shot:$desired",
+                    label = "A127 UNVERIFIED MonitorSet candidate", local = true)
+                android.util.Log.w("AtomRemoteAudioA127", "MONITOR_SET_QUEUE queued=$queued " +
+                    "recorderVerified=false noRetry=true")
+                if (queued) mainHandler.postDelayed({
+                    if (gatt === initialGatt && _tcsPairingState.value.acceptWritten) {
+                        val getQueued = probeR26AudioMetersPage()
+                        android.util.Log.i("AtomRemoteAudioA127", "MONITOR_POST_SET_AUDIO_GET " +
+                            "requested=$getQueued desired=$desired compareField1Only=true noSetRetry=true")
+                    }
+                }, 2_500L)
+            }
+        }
+        mainHandler.post(tick)
+        android.util.Log.w("AtomRemoteAudioA127", "MONITOR_IDLE_WINDOW_ARMED desired=$desired maxMs=18000 " +
+            "explicitOneShot=true unverifiedOpcode=true")
+        return true // scheduled candidate; NOT confirmed recorder change
+    }
+
+    // A12.74 SHARED Audio-tab and Mic/Line headphone-source diagnostic.
+    // Recorder GET 0x8647 field 1 is authoritative. This candidate is NOT a verified SET.
+    // 0x06A7 / AudioRecordMsg fields 1(record) + 2(enable) may affect other settings.
+    // Never auto-send, retry, sweep IDs, or call it from GET/connection lifecycle.
+    private var a1274SourceWaiting = false
+    private var a1274SourceAttempted = false
+
+    @SuppressLint("MissingPermission")
+    private fun a1274SharedSourcePilot(desired: Int): Boolean {
+        if (desired !in 0..7 || a1274SourceWaiting || a1274SourceAttempted) {
+            android.util.Log.w("AtomRemoteAudioA1274", "REJECT reason=bad-id-or-in-progress tx=false requested=$desired")
+            return false
+        }
+        val startGatt = gatt
+        if (startGatt == null || !_tcsPairingState.value.acceptWritten ||
+            !_tcsRemoteState.value.available) {
+            android.util.Log.w("AtomRemoteAudioA1274", "REJECT reason=not-linked tx=false")
+            return false
+        }
+        val prefs = appContext.getSharedPreferences("a1274_headphone_source_pilot", Context.MODE_PRIVATE)
+        val lock = "one_test_" + startGatt.device.address
+        if (prefs.getBoolean(lock, false) && !prefs.getBoolean("confirmed_" + startGatt.device.address, false)) {
+            android.util.Log.w("AtomRemoteAudioA1274", "REJECT reason=pilot-not-verified-one-shot-spent tx=false")
+            return false
+        }
+        // Never repeat the failed A12.73 source-1 hypothesis for the same recorder.
+        if (desired == 1 && !prefs.getBoolean("confirmed_" + startGatt.device.address, false) &&
+            appContext.getSharedPreferences("a1273_source1_trial", Context.MODE_PRIVATE)
+                .getBoolean("attempted_" + startGatt.device.address, false)) {
+            android.util.Log.w("AtomRemoteAudioA1274", "REJECT reason=A1273-source1-already-tried tx=false")
+            return false
+        }
+        val latest = _audioR26Live.value.values["AudioMetersPageGet"]
+        val before = latest?.takeIf { it.status == "TYPED_RX" && it.responseType == 0x8647 }
+            ?.rawHex?.let { com.atomosremote.nativeapp.audio.AudioR26PageSnapshot.decode(it) }
+        val currentSource = before?.monitor?.toInt()
+        if (currentSource == null || currentSource !in 0..7 || currentSource == desired) {
+            android.util.Log.w("AtomRemoteAudioA1274", "REJECT reason=no-valid-changed-source tx=false current=$currentSource desired=$desired")
+            return false
+        }
+        val startGeneration = _audioR26Live.value.generation
+        val initialRaw = latest!!.rawHex
+        val startRecIds = before!!.recordEnabledList.joinToString(",")
+        a1274SourceWaiting = true
+        val deadline = android.os.SystemClock.elapsedRealtime() + 25_000L
+        val tick = object : Runnable {
+            override fun run() {
+                if (!a1274SourceWaiting) return
+                if (gatt !== startGatt || !_tcsPairingState.value.acceptWritten ||
+                    !_tcsRemoteState.value.available) {
+                    a1274SourceWaiting = false
+                    android.util.Log.w("AtomRemoteAudioA1274", "ABORT session-disconnected tx=false")
+                    return
+                }
+                val now = android.os.SystemClock.elapsedRealtime()
+                if (now >= deadline) {
+                    a1274SourceWaiting = false
+                    android.util.Log.w("AtomRemoteAudioA1274", "IDLE_TIMEOUT tx=false")
+                    return
+                }
+                val live = _audioR26Live.value.values["AudioMetersPageGet"]
+                val page = live?.takeIf { it.status == "TYPED_RX" && it.responseType == 0x8647 }
+                    ?.rawHex?.let { com.atomosremote.nativeapp.audio.AudioR26PageSnapshot.decode(it) }
+                if (page?.monitor?.toInt() != currentSource) {
+                    a1274SourceWaiting = false
+                    android.util.Log.w("AtomRemoteAudioA1274", "ABORT recorder-source-changed-before-tx tx=false")
+                    return
+                }
+                val state = packetLink18.state().toString()
+                val idle = !_audioR26Live.value.running && !remoteBootstrapActive &&
+                    !inputCollectorRunning && !inputExtendedRunning &&
+                    r2706MicActive == null && r2706MicReads.isEmpty() &&
+                    pendingRemotePacket == null && pendingOps.isEmpty() &&
+                    !operationInFlight && packetLink18.bufferedPacketSize() == 0 &&
+                    (state == "READY" || state == "WRITING") &&
+                    !a125DelayWaiting && a05InputPendingTarget == null
+                if (!idle) {
+                    mainHandler.postDelayed(this, 250L)
+                    return
+                }
+                a1274SourceWaiting = false
+                a1274SourceAttempted = true
+                val testKey = "tested_" + startGatt.device.address + "_" + desired
+                if (prefs.getBoolean(testKey, false)) {
+                    android.util.Log.w("AtomRemoteAudioA1274", "REJECT reason=target-already-tested tx=false target=$desired")
+                    return
+                }
+                if (!prefs.edit().putBoolean(lock, true).putBoolean(testKey, true).commit()) {
+                    android.util.Log.e("AtomRemoteAudioA1274", "LOCK_FAILURE tx=false")
+                    return
+                }
+                // Offline macOS two-field AudioRecordMsg hypothesis, NOT source-selection proof.
+                val payload = byteArrayOf(0x08, desired.toByte(), 0x10, 0x01)
+                android.util.Log.w("AtomRemoteAudioA1274", "TX_INTENT opcode=0x06A7 body=${payload.toHex()} " +
+                    "sourceBefore=$currentSource target=$desired recEnabledBefore=$startRecIds " +
+                    "unverifiedProtocol=true singleAttempt=true")
+                val queued = enqueueOfficialRemoteCommandProtoPayload(
+                    commandId = 0x06A7, proto = payload,
+                    purpose = "a1274-shared-headphone-source:$desired",
+                    label = "A1274 HEADPHONE SOURCE UNVERIFIED PILOT", local = true)
+                android.util.Log.w("AtomRemoteAudioA1274", "QUEUE_RESULT queued=$queued " +
+                    "recorderConfirmed=false txDeliveryNotProven=true")
+                if (!queued) return
+                // Collector is requested only after the previous packet can drain.
+                val readTick = object : Runnable {
+                    var tries = 0
+                    override fun run() {
+                        if (gatt !== startGatt || !_tcsPairingState.value.acceptWritten) return
+                        if (pendingRemotePacket != null || !pendingOps.isEmpty() ||
+                            packetLink18.bufferedPacketSize() > 0 || operationInFlight) {
+                            if (++tries < 45) mainHandler.postDelayed(this, 500L)
+                            else android.util.Log.w("AtomRemoteAudioA1274", "POST_GET_DEFERRED packet-not-idle recorderConfirmed=false")
+                            return
+                        }
+                        val requested = startAudioR26RecoveredCollector()
+                        android.util.Log.i("AtomRemoteAudioA1274", "POST_GET requested=$requested opcode=0x0647")
+                    }
+                }
+                mainHandler.postDelayed(readTick, 1800L)
+                mainHandler.postDelayed({
+                    if (gatt === startGatt && _tcsPairingState.value.acceptWritten) {
+                        val snap = _audioR26Live.value
+                        val rx = snap.values["AudioMetersPageGet"]
+                        val after = rx?.takeIf { it.status == "TYPED_RX" &&
+                            it.responseType == 0x8647 && snap.generation > startGeneration &&
+                            it.rawHex != initialRaw }?.rawHex?.let {
+                            com.atomosremote.nativeapp.audio.AudioR26PageSnapshot.decode(it)
+                        }
+                        android.util.Log.w("AtomRemoteAudioA1274", "RESULT " +
+                            "freshChangedPage=${after != null} before=$currentSource " +
+                            "after=${after?.monitor ?: "unknown"} target=$desired " +
+                            "matched=${after?.monitor?.toInt() == desired} " +
+                            "recEnabledBefore=$startRecIds " +
+                            "recEnabledAfter=${after?.recordEnabledList?.joinToString(",") ?: "unknown"} " +
+                            "physicalCheckRequired=true causeNotAssumed=true")
+                        if (after?.monitor?.toInt() == desired) {
+                            // This unlocks manual testing of OTHER IDs only after real changed GET.
+                            // It does not make the control production-verified or auto-apply changes.
+                            prefs.edit().putBoolean("confirmed_" + startGatt.device.address, true).commit()
+                            a1274SourceAttempted = false
+                            android.util.Log.w("AtomRemoteAudioA1274", "GET_MATCH_UNLOCK oneId=$desired " +
+                                "additionalIdsStillManual=true physicalCheckRequired=true")
+                        }
+                    }
+                }, 28_000L)
+            }
+        }
+        mainHandler.post(tick)
+        android.util.Log.w("AtomRemoteAudioA1274", "ARMED tx=false target=$desired " +
+            "before=$currentSource maxWaitMs=25000 oneShotPerRecorder=true")
+        return true // Armed only, NOT transmitted/confirmed.
+    }
+
+    // A12.8 SAFE LOCK: real AG2 A12.5/A12.7 hardware observations contradict
+    // success assumptions for these two prototype opcodes. Do NOT guess another
+    // command ID or silently bypass official transport guards.
+    // Preserve proven GET and A07 independently verified setters unchanged.
+    // A12.24: Deliberate experimental 0 -> 1 frame SET PILOT only.
+    // Static ARM64 and x86_64 constructors show FrameDelaySet = 0x06BA;
+    // ARM64 AudioFrameDelayMsg SwiftProtobuf traverse uses field number 1.
+    // The exact AG2 acceptance is still UNVERIFIED until physical + fresh GET.
+    // No set on GET, tab entry, BLE reconnect, backend, or any automatic event.
+    private var a124DelayLastRxAtMs = 0L
+    private var a124DelayLastFrames: Int? = null
+    private var a124DelayLastRxGatt: android.bluetooth.BluetoothGatt? = null
+    private var a124DelayPendingGet = false
+    private var a125DelayTargetFrames: Int? = null
+    private var a124DelayPendingGatt: android.bluetooth.BluetoothGatt? = null
+    private var a124DelaySetQueuedAtMs = 0L
+
+    @SuppressLint("MissingPermission")
+    // A12.75 HARDWARE-FIRST diagnostic only: alternative MONITOR hypothesis.
+    // 0x06A6 field-1 source ID inferred from historical command catalog, NOT recorder-verified.
+    // Prior A12.74 0x06A7 candidate did not change recorder headphone source.
+    // ONE manual trial per recorder; no automatic retries or bulk source sweeps.
+    private var a1275SourceWaiting = false
+    private var a1275SourceAttempted = false
+
+    @SuppressLint("MissingPermission")
+    private fun a1275HardwareFirstPilot(desired: Int): Boolean {
+        // A12.76: 1 is a VALID target. Never conflate validity with one-shot / busy safety locks.
+        if (desired !in 0..7) {
+            android.util.Log.w("AtomRemoteAudioA1276", "REJECT reason=INVALID_ID tx=false target=$desired validRange=0..7")
+            return false
+        }
+        if (a1275SourceWaiting) {
+            android.util.Log.w("AtomRemoteAudioA1276", "REJECT reason=WAITING_ALREADY_ARMED tx=false target=$desired validTarget=true")
+            return false
+        }
+        if (a1275SourceAttempted) {
+            android.util.Log.w("AtomRemoteAudioA1276", "REJECT reason=ONE_SHOT_SESSION_SPENT tx=false target=$desired validTarget=true")
+            return false
+        }
+        android.util.Log.i("AtomRemoteAudioA1276", "VALID_TARGET id=$desired tx=false validationOnly=true")
+        val startGatt = gatt
+        if (startGatt == null || !_tcsPairingState.value.acceptWritten ||
+            !_tcsRemoteState.value.available) {
+            android.util.Log.w("AtomRemoteAudioA1276", "REJECT reason=NOT_CONNECTED tx=false target=$desired validTarget=true")
+            return false
+        }
+        val prefs = appContext.getSharedPreferences("a1275_one_shot_source", Context.MODE_PRIVATE)
+        val address = startGatt.device.address
+        if (prefs.getBoolean("attempted_$address", false)) {
+            android.util.Log.w("AtomRemoteAudioA1276", "REJECT reason=ONE_SHOT_DURABLE_SPENT tx=false target=$desired validTarget=true")
+            return false
+        }
+        val last = _audioR26Live.value.values["AudioMetersPageGet"]
+        val before = last?.takeIf { it.status == "TYPED_RX" && it.responseType == 0x8647 }
+            ?.rawHex?.let { com.atomosremote.nativeapp.audio.AudioR26PageSnapshot.decode(it) }
+        val current = before?.monitor?.toInt()
+        if (current == null || current !in 0..7 || current == desired) {
+            android.util.Log.w("AtomRemoteAudioA1276", "REJECT reason=NO_CHANGED_CONFIRMED_SOURCE tx=false current=$current target=$desired validTarget=true")
+            return false
+        }
+        val startGeneration = _audioR26Live.value.generation
+        val startEnabled = before!!.recordEnabledList.joinToString(",")
+        a1275SourceWaiting = true
+        val deadline = android.os.SystemClock.elapsedRealtime() + 25_000L
+        android.util.Log.w("AtomRemoteAudioA1276", "ARMED tx=false sourceBefore=$current target=$desired validTarget=true " +
+            "opcode=0x06A6 HYPOTHESIS_ONLY=true oneShot=true")
+        var lastBusyLogAtMs = 0L
+        val tick = object : Runnable {
+            override fun run() {
+                if (!a1275SourceWaiting) return
+                if (gatt !== startGatt || !_tcsPairingState.value.acceptWritten ||
+                    !_tcsRemoteState.value.available) {
+                    a1275SourceWaiting = false
+                    android.util.Log.w("AtomRemoteAudioA1275", "ABORT reason=disconnected tx=false")
+                    return
+                }
+                if (android.os.SystemClock.elapsedRealtime() >= deadline) {
+                    a1275SourceWaiting = false
+                    android.util.Log.w("AtomRemoteAudioA1275", "TIMEOUT tx=false")
+                    return
+                }
+                val latest = _audioR26Live.value.values["AudioMetersPageGet"]
+                val currentPage = latest?.takeIf { it.status == "TYPED_RX" && it.responseType == 0x8647 }
+                    ?.rawHex?.let { com.atomosremote.nativeapp.audio.AudioR26PageSnapshot.decode(it) }
+                if (currentPage?.monitor?.toInt() != current) {
+                    a1275SourceWaiting = false
+                    android.util.Log.w("AtomRemoteAudioA1275", "ABORT reason=source-changed-before-send tx=false")
+                    return
+                }
+                val plState = packetLink18.state().toString()
+                val idle = !_audioR26Live.value.running && !remoteBootstrapActive &&
+                    !inputCollectorRunning && !inputExtendedRunning &&
+                    r2706MicActive == null && r2706MicReads.isEmpty() &&
+                    pendingRemotePacket == null && pendingOps.isEmpty() &&
+                    !operationInFlight && packetLink18.bufferedPacketSize() == 0 &&
+                    (plState == "READY" || plState == "WRITING") &&
+                    !a125DelayWaiting && a05InputPendingTarget == null
+                if (!idle) {
+                    val now = android.os.SystemClock.elapsedRealtime()
+                    if (now - lastBusyLogAtMs >= 2_000L) {
+                        lastBusyLogAtMs = now
+                        android.util.Log.i("AtomRemoteAudioA1276", "WAIT_BUSY tx=false target=$desired " +
+                            "plink=$plState pendingPacket=${pendingRemotePacket != null} " +
+                            "pendingOps=${pendingOps.size} attBusy=$operationInFlight " +
+                            "audioRunning=${_audioR26Live.value.running} " +
+                            "micActive=${r2706MicActive != null} " +
+                            "collector=${inputCollectorRunning || inputExtendedRunning}")
+                    }
+                    mainHandler.postDelayed(this, 250L)
+                    return
+                }
+                a1275SourceWaiting = false
+                // Write the durable one-shot lock BEFORE any possible send. Never clear it
+                // after a successful enqueue, timeout, disconnect or missing readback.
+                if (!prefs.edit().putBoolean("attempted_$address", true).commit()) {
+                    android.util.Log.e("AtomRemoteAudioA1276", "ABORT reason=LOCK_WRITE_FAILED tx=false target=$desired")
+                    return
+                }
+                // Different hypothesis from failed 0x06A7 / field1+field2. Not a proven command.
+                val proto = byteArrayOf(0x08, desired.toByte())
+                android.util.Log.w("AtomRemoteAudioA1275", "TX_INTENT opcode=0x06A6 proto=${proto.toHex()} sourceBefore=$current sourceTarget=$desired RECbefore=$startEnabled hypothesis=true")
+                val queued = enqueueOfficialRemoteCommandProtoPayload(
+                    commandId = 0x06A6, proto = proto,
+                    purpose = "a1275-headphone-hardware-first:$desired",
+                    label = "A1275 UNVERIFIED HEADPHONE-SOURCE PILOT", local = true)
+                android.util.Log.w("AtomRemoteAudioA1276", "QUEUE_RESULT queued=$queued target=$desired " +
+                    "txDeliveryUnconfirmed=true hardwareUnconfirmed=true")
+                if (!queued) {
+                    // enqueue=false means there was NO accepted transport request.
+                    // Restore only the guard for this rejected submission, never when queued=true.
+                    val released = prefs.edit().remove("attempted_$address").commit()
+                    a1275SourceAttempted = !released
+                    android.util.Log.w("AtomRemoteAudioA1276", "NOT_QUEUED tx=false target=$desired " +
+                        "oneShotReleased=$released explicitRetryRequired=true")
+                    return
+                }
+                a1275SourceAttempted = true
+                android.util.Log.w("AtomRemoteAudioA1276", "ONE_SHOT_SPENT queued=true " +
+                    "target=$desired noAutoRetry=true GET_AND_PHYSICAL_VERIFY_REQUIRED=true")
+                val poll = object : Runnable {
+                    var tries = 0
+                    override fun run() {
+                        if (gatt !== startGatt || !_tcsPairingState.value.acceptWritten) return
+                        if (pendingRemotePacket != null || !pendingOps.isEmpty() ||
+                            packetLink18.bufferedPacketSize() > 0 || operationInFlight) {
+                            if (++tries < 45) mainHandler.postDelayed(this, 500L)
+                            else android.util.Log.w("AtomRemoteAudioA1275", "POST_GET_DEFERRED packet-busy")
+                            return
+                        }
+                        val requested = startAudioR26RecoveredCollector()
+                        android.util.Log.i("AtomRemoteAudioA1275", "POST_GET requested=$requested expectedOpcode=0x0647")
+                    }
+                }
+                mainHandler.postDelayed(poll, 1800L)
+                mainHandler.postDelayed({
+                    if (gatt === startGatt && _tcsPairingState.value.acceptWritten) {
+                        val snap = _audioR26Live.value
+                        val rx = snap.values["AudioMetersPageGet"]
+                        val after = rx?.takeIf { it.status == "TYPED_RX" &&
+                            it.responseType == 0x8647 && snap.generation > startGeneration }
+                            ?.rawHex?.let { com.atomosremote.nativeapp.audio.AudioR26PageSnapshot.decode(it) }
+                        android.util.Log.w("AtomRemoteAudioA1275", "READBACK current=$current target=$desired after=${after?.monitor ?: "unknown"} " +
+                            "matched=${after?.monitor?.toInt() == desired} " +
+                            "RECbefore=$startEnabled RECafter=${after?.recordEnabledList?.joinToString(",") ?: "unknown"} " +
+                            "physicalConfirmationRequired=true notProductionVerified=true")
+                    }
+                }, 19_000L)
+            }
+        }
+        mainHandler.post(tick)
+        return true
+    }
+
+    // A12.77 operator-only reset of the persisted experiment guard. NO RECORDER TX.
+    // A successful reset only authorizes a NEW manual attempt after checking hardware.
+    private fun a1277OperatorRearmHeadphonePilot(target: Int): Boolean {
+        if (target !in 0..7 || a1275SourceWaiting) {
+            android.util.Log.w("AtomRemoteAudioA1277", "REARM_REJECT badTargetOrWaiting target=$target tx=false")
+            return false
+        }
+        val activeGatt = gatt
+        if (activeGatt == null || !_tcsPairingState.value.acceptWritten ||
+            !_tcsRemoteState.value.available) {
+            android.util.Log.w("AtomRemoteAudioA1277", "REARM_REJECT disconnected tx=false")
+            return false
+        }
+        val snapshot = _audioR26Live.value.values["AudioMetersPageGet"]
+        val parsed = snapshot?.takeIf { it.status == "TYPED_RX" && it.responseType == 0x8647 }
+            ?.rawHex?.let { com.atomosremote.nativeapp.audio.AudioR26PageSnapshot.decode(it) }
+        val actual = parsed?.monitor?.toInt()
+        if (actual == null || actual !in 0..7 || actual == target) {
+            android.util.Log.w("AtomRemoteAudioA1277", "REARM_REJECT noDifferentTypedGET current=$actual target=$target tx=false")
+            return false
+        }
+        val address = activeGatt.device.address
+        val prefs = appContext.getSharedPreferences("a1275_one_shot_source", Context.MODE_PRIVATE)
+        val wasSpent = prefs.getBoolean("attempted_$address", false)
+        val cleared = prefs.edit().remove("attempted_$address").commit()
+        if (cleared) a1275SourceAttempted = false
+        android.util.Log.w("AtomRemoteAudioA1277", "REARM_RESULT cleared=$cleared oldSpent=$wasSpent target=$target " +
+            "current=$actual tx=false noAutomaticSET=true unverifiedProtocol=true")
+        return cleared
+    }
+
+    // B01.30: official macOS x86_64 outbound command reconstruction.
+    // Audio UI selectedSegmentIndex -> 0x10001B20E -> 0x10007C6C0
+    // -> 0x1000820F7 writes 0x06AF to outbound packet +0x10.
+    // Embedded selector -> 0x10001C6E0 -> 0x10007C770
+    // -> 0x100087FE3 writes 0x06B1 to outbound packet +0x10.
+    // These are binary-grounded OPCODES, not recorder-proven SETs;
+    // protobuf field-1 scalar tag 0x08 remains a hardware test hypothesis.
+    // Distinct from FAILED 0x06B0 / 0x06B2. No automatic retries.
+    private data class B0130AudioTrial(
+        val session: BluetoothGatt, val key: String, val target: Int,
+        val generationBeforeTx: Int
+    )
+    private var b0130QueuedAudio: B0130AudioTrial? = null
+    private var b0130AudioArming = false
+    // B01.33: Meter Orientation is GET-gated and repeatable after successful readback.
+    // Do NOT change Embedded's durable one-shot reservation or REC transport.
+    private var b0133OrientationSession: BluetoothGatt? = null
+    private var b0133OrientationFailedTarget: Int? = null
+    private var b0133OrientationLastTxMs: Long = 0L
+    // B01.36: Embedded SET is also repeatable *only after recorder GET settles*.
+    // Earlier durable one-shot preference is retired; it must not block a
+    // physically verified Off/1/2 control in the production UI.
+    private var b0136EmbedSession: BluetoothGatt? = null
+    private var b0136EmbedFailedTarget: Int? = null
+    private var b0136EmbedLastTxMs: Long = 0L
+
+    @SuppressLint("MissingPermission")
+    private fun b0130TryBinaryBackedOneShot(key: String, desired: Int): Boolean {
+        if (key != "orientation" && key != "embed") return false
+        val currentLive = _audioR26Live.value
+        val rxProof = currentLive.values["AudioMetersPageGet"]
+        val page = rxProof?.takeIf { it.status == "TYPED_RX" && it.responseType == 0x8647 }
+            ?.rawHex?.let { com.atomosremote.nativeapp.audio.AudioR26PageSnapshot.decode(it) }
+        val session = gatt
+        if (key == "orientation" && b0133OrientationSession !== session) {
+            b0133OrientationSession = session
+            b0133OrientationFailedTarget = null
+            b0133OrientationLastTxMs = 0L
+            android.util.Log.i("AtomRemoteAudioB0133", "ORIENTATION_SESSION_RESET transientGates=true")
+        }
+        if (key == "embed" && b0136EmbedSession !== session) {
+            b0136EmbedSession = session
+            b0136EmbedFailedTarget = null
+            b0136EmbedLastTxMs = 0L
+            android.util.Log.i("AtomRemoteAudioB0136", "EMBED_SESSION_RESET transientGates=true")
+        }
+        val before = when (key) {
+            "embed" -> page?.analogEmbed?.toInt()
+            else -> page?.orientation?.toInt()
+        }
+        val currentFresh = page != null && rxProof != null &&
+            rxProof.status == "TYPED_RX" && rxProof.responseType == 0x8647 &&
+            !currentLive.running
+        // Previous REC and old failed Embedded queue are settled with GET
+        // before allowing one of the NEW audio controls to transmit.
+        val olderRec = b0121LastQueuedRecord
+        if (olderRec != null) {
+            if (olderRec.session !== session) {
+                b0121LastQueuedRecord = null
+            } else if (currentFresh && currentLive.generation > olderRec.baselineGeneration &&
+                page!!.recordValidList.contains(olderRec.id.toLong()) &&
+                page.recordEnabledList.contains(olderRec.id.toLong()) == olderRec.expectedOn) {
+                b0121LastQueuedRecord = null
+                android.util.Log.i("AtomRemoteAudioB0130", "PRIOR_REC_GET_CONFIRMED id=${olderRec.id} tx=false")
+            }
+        }
+        val oldEmbed = b0123EmbedQueued
+        if (oldEmbed != null && (oldEmbed.session !== session ||
+                (currentFresh && currentLive.generation > oldEmbed.baselineGeneration))) {
+            b0123EmbedQueued = null
+            android.util.Log.i("AtomRemoteAudioB0130", "OLD_EMBED_QUEUE_CLEARED tx=false")
+        }
+        val previous = b0130QueuedAudio
+        if (previous != null && (previous.session !== session ||
+                (currentFresh && currentLive.generation > previous.generationBeforeTx))) {
+            val observed = if (previous.key == "embed") page?.analogEmbed?.toInt()
+                else page?.orientation?.toInt()
+            val matched = previous.session === session && observed == previous.target && currentFresh
+            android.util.Log.w("AtomRemoteAudioB0130", "SET_FRESH_GET_CHECK " +
+                "key=${previous.key} wanted=${previous.target} observed=$observed " +
+                "matched=$matched recorderConfirmed=$matched " +
+                "physicalRecorderMustAlsoMatch=true noRetry=true")
+            if (previous.key == "orientation" && previous.session === session && currentFresh) {
+                b0133OrientationFailedTarget = if (matched) null else previous.target
+                android.util.Log.w("AtomRemoteAudioB0133", "ORIENTATION_SETTLED wanted=${previous.target} " +
+                    "observed=$observed matched=$matched blockedDirection=$b0133OrientationFailedTarget " +
+                    "recorderProofRequiresPhysicalMatch=true")
+            }
+            if (previous.key == "embed" && previous.session === session && currentFresh) {
+                b0136EmbedFailedTarget = if (matched) null else previous.target
+                android.util.Log.w("AtomRemoteAudioB0136", "EMBED_SETTLED wanted=${previous.target} " +
+                    "observed=$observed matched=$matched blockedDirection=$b0136EmbedFailedTarget " +
+                    "recorderProofRequiresPhysicalMatch=true")
+            }
+            b0130QueuedAudio = null
+        }
+        val opcode = if (key == "embed") 0x06B1 else 0x06AF
+        // Physical A/B mapping: f11=0 Off, f11=1 1/2; f9=0 Vertical, f9=1 Horizontal.
+        // A queued GATT write is not recorder confirmation.
+        val allowed = before != null && before in 0..1 && desired in 0..1 &&
+            before != desired && page != null &&
+            if (key == "embed") page.analogEmbedList.contains(desired.toLong())
+            else page.orientationChangeable != 0L
+        val ready = currentFresh && allowed && session != null &&
+            _tcsPairingState.value.acceptWritten && _tcsRemoteState.value.available &&
+            !remoteBootstrapActive && !inputCollectorRunning && !inputExtendedRunning &&
+            !b0120RecordPending && b0121LastQueuedRecord == null &&
+            !b0123EmbedArming && b0123EmbedQueued == null &&
+            !b0130AudioArming && b0130QueuedAudio == null
+        // Both production controls use one queued SET followed by a fresh GET.
+        // Never auto-retry; failed target stays blocked for this BLE session.
+        val blockedDirection = if (key == "orientation")
+            b0133OrientationFailedTarget == desired else b0136EmbedFailedTarget == desired
+        val lastTxMs = if (key == "orientation") b0133OrientationLastTxMs else b0136EmbedLastTxMs
+        val cooldown = lastTxMs > 0L &&
+            android.os.SystemClock.elapsedRealtime() - lastTxMs < 700L
+        if (!ready || blockedDirection || cooldown) {
+            android.util.Log.w("AtomRemoteAudioB0136", "SET_BLOCK " +
+                "key=$key current=$before desired=$desired ready=$ready " +
+                "failedDirection=$blockedDirection cooldown=$cooldown " +
+                "awaitingGet=${b0130QueuedAudio != null} " +
+                "recPending=${b0121LastQueuedRecord != null} tx=false")
+            return false
+        }
+        b0130AudioArming = true
+        val generationAtArm = currentLive.generation
+        val armedAt = android.os.SystemClock.elapsedRealtime()
+        val payload = byteArrayOf(0x08, desired.toByte())
+        android.util.Log.w("AtomRemoteAudioB0130", "BINARY_SET_ARMED " +
+            "key=$key current=$before desired=$desired opcode=0x${opcode.toString(16)} " +
+            "protoHypothesis=${payload.toHex()} binaryOpcodeProof=true " +
+            "protoHardwareVerified=false tx=false")
+        val worker = object : Runnable {
+            override fun run() {
+                if (!b0130AudioArming) return
+                val age = android.os.SystemClock.elapsedRealtime() - armedAt
+                val liveNow = _audioR26Live.value
+                val sessionOkay = gatt === session &&
+                    _tcsPairingState.value.acceptWritten && _tcsRemoteState.value.available
+                if (!sessionOkay || age > 12000L || remoteBootstrapActive ||
+                    liveNow.generation != generationAtArm) {
+                    b0130AudioArming = false
+                    android.util.Log.w("AtomRemoteAudioB0130", "BINARY_SET_ABORT " +
+                        "key=$key ageMs=$age sessionOkay=$sessionOkay " +
+                        "generationChanged=${liveNow.generation != generationAtArm} tx=false")
+                    return
+                }
+                val idle = !liveNow.running && !inputCollectorRunning &&
+                    !inputExtendedRunning && r2706MicActive == null &&
+                    r2706MicReads.isEmpty() && !operationInFlight &&
+                    pendingRemotePacket == null && pendingOps.isEmpty() &&
+                    packetLink18.bufferedPacketSize() == 0 &&
+                    packetLink18.state().toString() == "READY" &&
+                    !b0120RecordPending && b0121LastQueuedRecord == null
+                if (!idle) {
+                    if (age > 11000L) android.util.Log.i("AtomRemoteAudioB0130",
+                        "BINARY_SET_WAIT_IDLE key=$key ageMs=$age tx=false")
+                    mainHandler.postDelayed(this, 70L)
+                    return
+                }
+                b0130AudioArming = false
+                // A queued SET is the only transmission. Neither control writes
+                // a persistent attempted flag; recorder GET / per-session guards own safety.
+                val queued = enqueueOfficialRemoteCommandProtoPayload(
+                    commandId = opcode, proto = payload,
+                    purpose = "audio-${key}-set:$desired",
+                    label = "Audio $key $before to $desired",
+                    local = true
+                )
+                if (queued && session != null) {
+                    b0130QueuedAudio = B0130AudioTrial(session, key, desired, liveNow.generation)
+                    if (key == "orientation") {
+                        b0133OrientationLastTxMs = android.os.SystemClock.elapsedRealtime()
+                    } else {
+                        b0136EmbedLastTxMs = android.os.SystemClock.elapsedRealtime()
+                    }
+                    android.util.Log.w("AtomRemoteAudioB0136", "AUDIO_SET_QUEUED " +
+                        "key=$key from=$before target=$desired command=0x${opcode.toString(16)} " +
+                        "payload=${payload.toHex()} verified=false next=AUTO_GET noAutoRetry=true")
+                    // One bounded automatic READBACK for both production controls;
+                    // never a second SET and never an optimistic success label.
+                    if (key == "orientation" || key == "embed") {
+                        val sessionAtTx = session
+                        val postTxGeneration = liveNow.generation
+                        val postTxTarget = desired
+                        val startPostTxMs = android.os.SystemClock.elapsedRealtime()
+                        val autoRefresh = object : Runnable {
+                            override fun run() {
+                                if (gatt !== sessionAtTx || !_tcsPairingState.value.acceptWritten) {
+                                    android.util.Log.w("AtomRemoteAudioB0131", "ORIENTATION_AUTO_GET_ABORT reason=SESSION_CHANGED tx=false")
+                                    return
+                                }
+                                val elapsed = android.os.SystemClock.elapsedRealtime() - startPostTxMs
+                                val snapshot = _audioR26Live.value
+                                val idle = !snapshot.running && !remoteBootstrapActive &&
+                                    !inputCollectorRunning && !inputExtendedRunning &&
+                                    r2706MicActive == null && r2706MicReads.isEmpty() &&
+                                    pendingRemotePacket == null && pendingOps.isEmpty() &&
+                                    !operationInFlight && packetLink18.bufferedPacketSize() == 0 &&
+                                    packetLink18.state().toString() == "READY"
+                                if (!idle) {
+                                    if (elapsed > 14000L) {
+                                        android.util.Log.w("AtomRemoteAudioB0131", "ORIENTATION_AUTO_GET_DEFERRED busy=true noAutoSet=true")
+                                        return
+                                    }
+                                    mainHandler.postDelayed(this, 120L)
+                                    return
+                                }
+                                val accepted = startAudioR26RecoveredCollector()
+                                android.util.Log.i("AtomRemoteAudioB0136", "AUDIO_AUTO_GET_REQUEST " +
+                                    "key=$key accepted=$accepted target=$postTxTarget " +
+                                    "afterSetCmd=0x${opcode.toString(16)} noAutoSet=true")
+                                if (!accepted) return
+                                val verifyStart = android.os.SystemClock.elapsedRealtime()
+                                val verifier = object : Runnable {
+                                    override fun run() {
+                                        if (gatt !== sessionAtTx) return
+                                        val now = _audioR26Live.value
+                                        val proof = now.values["AudioMetersPageGet"]
+                                        val fresh = now.generation > postTxGeneration && !now.running &&
+                                            proof?.status == "TYPED_RX" && proof.responseType == 0x8647
+                                        if (fresh) {
+                                            val readback = proof?.rawHex?.let {
+                                                com.atomosremote.nativeapp.audio.AudioR26PageSnapshot.decode(it)
+                                            }
+                                            val actual = if (key == "embed")
+                                                readback?.analogEmbed?.toInt() else readback?.orientation?.toInt()
+                                            val matched = actual == postTxTarget
+                                            val pending = b0130QueuedAudio
+                                            if (pending != null && pending.key == key &&
+                                                pending.session === sessionAtTx &&
+                                                pending.generationBeforeTx == postTxGeneration) {
+                                                b0130QueuedAudio = null
+                                                if (key == "embed") b0136EmbedFailedTarget = if (matched) null else postTxTarget
+                                                else b0133OrientationFailedTarget = if (matched) null else postTxTarget
+                                            }
+                                            android.util.Log.w("AtomRemoteAudioB0136", "AUDIO_POST_GET_RESULT " +
+                                                "key=$key requested=$postTxTarget observed=$actual matched=$matched " +
+                                                "physicalRecorderMustAlsoMatch=true noAutoRetry=true tx=false")
+                                            return
+                                        }
+                                        if (android.os.SystemClock.elapsedRealtime() - verifyStart > 12000L) {
+                                            android.util.Log.w("AtomRemoteAudioB0131", "ORIENTATION_POST_GET_TIMEOUT " +
+                                                "requested=$postTxTarget freshTypedGET=false noAutoRetry=true tx=false")
+                                            return
+                                        }
+                                        mainHandler.postDelayed(this, 220L)
+                                    }
+                                }
+                                mainHandler.postDelayed(verifier, 220L)
+                            }
+                        }
+                        mainHandler.postDelayed(autoRefresh, 180L)
+                    }
+                } else if (!queued) {
+                    android.util.Log.w("AtomRemoteAudioB0136", "AUDIO_SET_QUEUE_REFUSED " +
+                        "key=$key transientReservationReleased=true tx=false")
+                }
+                android.util.Log.w("AtomRemoteAudioB0130", "BINARY_SET_QUEUE_RESULT " +
+                    "key=$key command=0x${opcode.toString(16)} payload=${payload.toHex()} " +
+                    "queued=$queued recorderConfirmed=false verifyF=${if (key == "embed") 11 else 9} " +
+                    "manualFreshGETRequired=true noRetry=true")
+            }
+        }
+        mainHandler.post(worker)
+        return true // Armed only, do not display as confirmed.
+    }
+
+
+    // B01.35 Headphone Source: the macOS monitor-selection ACTION path
+    // calls 0x10007C0A0 with chosen source in EDI (from 0x10001AB53).
+    // That constructor passes outgoing opcode 0x06A5 to 0x100087FB0;
+    // helper at 0x100087FE3 writes the opcode into the outbound packet.
+    // Encoder field-1 scalar is a hardware TRIAL until AG2 GET f1 and
+    // physical monitoring agree. This is NEVER Channel REC (f3/0x06A7).
+    // Source f1 == 0: Mic/Line headphone monitor ON; nonzero: OFF.
+    private data class B0135SourcePending(
+        val session: BluetoothGatt, val target: Int, val generationBeforeTx: Int,
+        val enabledRecIds: List<Long>
+    )
+    private var b0135SourceSession: BluetoothGatt? = null
+    private var b0135SourceArming = false
+    private var b0135SourcePending: B0135SourcePending? = null
+    private var b0135SourceFailedTarget: Int? = null
+
+    @SuppressLint("MissingPermission")
+    private fun b0135TryHeadphoneSourceSet(desired: Int): Boolean {
+        val session = gatt
+        if (session == null || !_tcsPairingState.value.acceptWritten ||
+            !_tcsRemoteState.value.available) {
+            android.util.Log.w("AtomRemoteAudioB0135", "SOURCE_BLOCK reason=NOT_LINKED target=$desired tx=false")
+            return false
+        }
+        if (b0135SourceSession !== session) {
+            b0135SourceSession = session
+            b0135SourceArming = false
+            b0135SourcePending = null
+            b0135SourceFailedTarget = null
+            android.util.Log.i("AtomRemoteAudioB0135", "SOURCE_SESSION_RESET noTx=true")
+        }
+        val live = _audioR26Live.value
+        val rx = live.values["AudioMetersPageGet"]
+        val page = rx?.takeIf { it.status == "TYPED_RX" && it.responseType == 0x8647 }
+            ?.rawHex?.let { com.atomosremote.nativeapp.audio.AudioR26PageSnapshot.decode(it) }
+        val earlier = b0135SourcePending
+        if (earlier != null) {
+            if (live.generation <= earlier.generationBeforeTx || live.running || page == null) {
+                android.util.Log.w("AtomRemoteAudioB0135", "SOURCE_WAIT_FRESH_GET target=${earlier.target} tx=false")
+                return false
+            }
+            val recUnchanged = page.recordEnabledList == earlier.enabledRecIds
+            val match = page.monitor.toInt() == earlier.target && recUnchanged
+            b0135SourceFailedTarget = if (match) null else earlier.target
+            b0135SourcePending = null
+            android.util.Log.w("AtomRemoteAudioB0135", "SOURCE_PREVIOUS_GET_SETTLED target=${earlier.target} actual=${page.monitor} " +
+                "recUnchanged=$recUnchanged matched=$match physicalCheckRequired=true")
+        }
+        val current = page?.monitor?.toInt()
+        val valid = page?.monitorList?.contains(desired.toLong()) == true
+        // A REC readback latch may remain allocated after its GET was already confirmed.
+        // Read it without modifying the working REC subsystem.
+        val earlierRec = b0121LastQueuedRecord
+        val recSettled = earlierRec == null || earlierRec.session !== session ||
+            (live.generation > earlierRec.baselineGeneration && !live.running &&
+                page?.recordValidList?.contains(earlierRec.id.toLong()) == true &&
+                page.recordEnabledList.contains(earlierRec.id.toLong()) == earlierRec.expectedOn)
+        val earlierOrientation = b0130QueuedAudio
+        val orientationSettled = earlierOrientation == null ||
+            earlierOrientation.session !== session ||
+            (live.generation > earlierOrientation.generationBeforeTx && !live.running &&
+                page != null && ((earlierOrientation.key == "orientation" &&
+                    page.orientation.toInt() == earlierOrientation.target) ||
+                    (earlierOrientation.key == "embed" &&
+                    page.analogEmbed.toInt() == earlierOrientation.target)))
+        // B01.37: Older Audio/REC transactions may retain an allocated latch
+        // even AFTER a newer typed Audio GET already proves their target.
+        // Do not modify their state machines; only evaluate whether their
+        // pending readback is settled before allowing an independent SOURCE SET.
+        val phonesPending = b0134PhonesPending
+        val phonesSettled = phonesPending == null || phonesPending.session !== session ||
+            (live.generation > phonesPending.generationBeforeTx && !live.running &&
+                page?.phonesLevel?.toInt() == phonesPending.target)
+        val recGateClear = !b0120RecordPending || recSettled
+        val ready = desired in 0..4 && valid && current != null && current != desired &&
+            b0135SourceFailedTarget != desired && !b0135SourceArming &&
+            !live.running && !remoteBootstrapActive && !inputCollectorRunning &&
+            !inputExtendedRunning && recGateClear && recSettled &&
+            orientationSettled && phonesSettled
+        if (!ready) {
+            android.util.Log.w("AtomRemoteAudioB0137", "SOURCE_GATE_BLOCK target=$desired current=$current valid=$valid " +
+                "arming=$b0135SourceArming failedTarget=$b0135SourceFailedTarget " +
+                "audioRunning=${live.running} recPending=$b0120RecordPending " +
+                "recSettled=$recSettled orientationSettled=$orientationSettled " +
+                "phonesSettled=$phonesSettled phonesLatch=${phonesPending != null} " +
+                "bootstrap=$remoteBootstrapActive inputRunning=$inputCollectorRunning " +
+                "inputExtended=$inputExtendedRunning tx=false")
+            return false
+        }
+        b0135SourceArming = true
+        val deadline = android.os.SystemClock.elapsedRealtime() + 20_000L
+        val initialGeneration = live.generation
+        android.util.Log.w("AtomRemoteAudioB0135", "SOURCE_ARMED current=$current target=$desired cmd=0x06A5 " +
+            "protoCandidate=08${"%02x".format(desired)} binaryOpcodeProof=true " +
+            "protoHardwareVerified=false tx=false")
+        val worker = object : Runnable {
+            override fun run() {
+                if (!b0135SourceArming) return
+                if (gatt !== session || !_tcsPairingState.value.acceptWritten ||
+                    !_tcsRemoteState.value.available) {
+                    b0135SourceArming = false
+                    android.util.Log.w("AtomRemoteAudioB0135", "SOURCE_ABORT sessionChanged=true tx=false")
+                    return
+                }
+                if (android.os.SystemClock.elapsedRealtime() > deadline) {
+                    b0135SourceArming = false
+                    android.util.Log.w("AtomRemoteAudioB0135", "SOURCE_IDLE_TIMEOUT tx=false noAutoRetry=true")
+                    return
+                }
+                val latest = _audioR26Live.value
+                val proof = latest.values["AudioMetersPageGet"]
+                val latestPage = proof?.takeIf { it.status == "TYPED_RX" && it.responseType == 0x8647 }
+                    ?.rawHex?.let { com.atomosremote.nativeapp.audio.AudioR26PageSnapshot.decode(it) }
+                if (latestPage == null || latestPage.monitor.toInt() != current ||
+                    latestPage.monitorList.contains(desired.toLong()) != true) {
+                    b0135SourceArming = false
+                    android.util.Log.w("AtomRemoteAudioB0135", "SOURCE_ABORT baselineOrChoicesChanged=true tx=false")
+                    return
+                }
+                val idle = !latest.running && !remoteBootstrapActive &&
+                    !inputCollectorRunning && !inputExtendedRunning &&
+                    r2706MicActive == null && r2706MicReads.isEmpty() &&
+                    !b0120RecordPending && pendingRemotePacket == null &&
+                    pendingOps.isEmpty() && !operationInFlight &&
+                    packetLink18.bufferedPacketSize() == 0 &&
+                    packetLink18.state().toString() == "READY"
+                if (!idle) {
+                    mainHandler.postDelayed(this, 90L)
+                    return
+                }
+                val payload = byteArrayOf(0x08, desired.toByte())
+                b0135SourceArming = false
+                val queued = enqueueOfficialRemoteCommandProtoPayload(
+                    commandId = 0x06A5, proto = payload,
+                    purpose = "b0135-headphone-source:$current->$desired",
+                    label = "B01.35 HEADPHONE SOURCE SET TEST", local = true)
+                android.util.Log.w("AtomRemoteAudioB0135", "SOURCE_SET_QUEUED from=$current target=$desired " +
+                    "cmd=0x06A5 proto=${payload.toHex()} queued=$queued " +
+                    "recorderConfirmed=false recIdsUntouched=true noAutoRetry=true")
+                if (!queued) return
+                val generationAtTx = latest.generation
+                b0135SourcePending = B0135SourcePending(session, desired, generationAtTx,
+                    latestPage.recordEnabledList.toList())
+                val startMs = android.os.SystemClock.elapsedRealtime()
+                val autoRead = object : Runnable {
+                    override fun run() {
+                        if (gatt !== session) return
+                        val now = _audioR26Live.value
+                        val idleRead = !now.running && !remoteBootstrapActive &&
+                            !inputCollectorRunning && !inputExtendedRunning &&
+                            r2706MicActive == null && r2706MicReads.isEmpty() &&
+                            pendingRemotePacket == null && pendingOps.isEmpty() &&
+                            !operationInFlight && packetLink18.bufferedPacketSize() == 0 &&
+                            packetLink18.state().toString() == "READY"
+                        if (!idleRead) {
+                            if (android.os.SystemClock.elapsedRealtime() - startMs > 18_000L) {
+                                android.util.Log.w("AtomRemoteAudioB0135", "SOURCE_AUTO_GET_DEFERRED busy=true manualRefresh=true")
+                                return
+                            }
+                            mainHandler.postDelayed(this, 90L)
+                            return
+                        }
+                        val accepted = startAudioR26RecoveredCollector()
+                        android.util.Log.i("AtomRemoteAudioB0135", "SOURCE_AUTO_GET_REQUEST accepted=$accepted target=$desired tx=false")
+                        if (!accepted) return
+                        val verifyFromMs = android.os.SystemClock.elapsedRealtime()
+                        val verifier = object : Runnable {
+                            override fun run() {
+                                if (gatt !== session) return
+                                val freshLive = _audioR26Live.value
+                                val f = freshLive.values["AudioMetersPageGet"]
+                                val fresh = freshLive.generation > generationAtTx && !freshLive.running &&
+                                    f?.status == "TYPED_RX" && f.responseType == 0x8647
+                                if (fresh) {
+                                    val readback = f?.rawHex?.let {
+                                        com.atomosremote.nativeapp.audio.AudioR26PageSnapshot.decode(it)
+                                    }
+                                    val observed = readback?.monitor?.toInt()
+                                    val last = b0135SourcePending
+                                    val recUnchanged = readback?.recordEnabledList == last?.enabledRecIds
+                                    val match = observed == desired && recUnchanged
+                                    if (last != null && last.session === session &&
+                                        last.generationBeforeTx == generationAtTx) {
+                                        b0135SourcePending = null
+                                        b0135SourceFailedTarget = if (match) null else desired
+                                    }
+                                    android.util.Log.w("AtomRemoteAudioB0135", "SOURCE_POST_GET_RESULT " +
+                                        "requested=$desired observed=$observed matched=$match " +
+                                        "micLineMonitor=${if (observed == 0) "On" else "Off"} " +
+                                        "physicalRecorderMustMatch=true recUnchanged=$recUnchanged")
+                                    return
+                                }
+                                if (android.os.SystemClock.elapsedRealtime() - verifyFromMs > 17_000L) {
+                                    android.util.Log.w("AtomRemoteAudioB0135", "SOURCE_POST_GET_TIMEOUT " +
+                                        "target=$desired manualRefreshRequired=true noAutoSetRetry=true")
+                                    return
+                                }
+                                mainHandler.postDelayed(this, 200L)
+                            }
+                        }
+                        mainHandler.postDelayed(verifier, 200L)
+                    }
+                }
+                mainHandler.postDelayed(autoRead, 180L)
+            }
+        }
+        mainHandler.post(worker)
+        return true  // Armed, not proof of delivered SET.
+    }
+
+    fun a12ExperimentalOneShotSet(key: String, desired: Int): Boolean {
+        if (key == "orientation" || key == "embed")
+            return b0130TryBinaryBackedOneShot(key, desired)
+        if (key == "headphonePilotRearm") return a1277OperatorRearmHeadphonePilot(desired)
+        if (key == "headphoneSource" || key == "headphoneMonitor") return b0135TryHeadphoneSourceSet(desired) // B01.35 source f1; REC separate
+        if (key != "delay") {
+            android.util.Log.w("AtomRemoteAudioA124", "SET_HOLD key=$key desired=$desired " +
+                "reason=NO_VERIFIED_SAFE_WIRE_FOR_THIS_CONTROL tx=false")
+            return false
+        }
+        if (desired !in 0..20) {
+            android.util.Log.w("AtomRemoteAudioA124", "DELAY_SET_BLOCK target=$desired " +
+                "reason=OUTSIDE_0_TO_20 tx=false")
+            return false
+        }
+        val now = android.os.SystemClock.elapsedRealtime()
+        val currentGatt = gatt
+        val fresh = a124DelayLastFrames != null &&
+            a124DelayLastRxAtMs > 0L &&
+            (now - a124DelayLastRxAtMs) in 0L..30_000L &&
+            a124DelayLastRxGatt === currentGatt
+        // A12.26.1: An old GET is not a failed SET attempt. Request an existing
+        // typed GET in the armed window and keep the operator-selected target.
+        if (currentGatt == null || !_tcsPairingState.value.acceptWritten ||
+            !_tcsRemoteState.value.available || "delay" in a12PilotAttempted ||
+            a125DelayWaiting || a124DelayPendingGet) {
+            android.util.Log.w("AtomRemoteAudioA124", "DELAY_SET_BLOCK " +
+                "freshCurrentGet=$fresh paired=${_tcsPairingState.value.acceptWritten} " +
+                "available=${_tcsRemoteState.value.available} " +
+                "attempted=${"delay" in a12PilotAttempted} " +
+                "waiting=$a125DelayWaiting pendingReadback=$a124DelayPendingGet tx=false")
+            return false
+        }
+        a125DelayWaiting = true
+        a125DelayDeadlineMs = now + 30_000L
+        var lastRefreshRequestAtMs = 0L
+        val initialGatt = currentGatt
+        val tick = object : Runnable {
+            override fun run() {
+                if (!a125DelayWaiting) return
+                val tickMs = android.os.SystemClock.elapsedRealtime()
+                if (gatt !== initialGatt || !_tcsPairingState.value.acceptWritten ||
+                    !_tcsRemoteState.value.available) {
+                    a125DelayWaiting = false
+                    android.util.Log.w("AtomRemoteAudioA124", "DELAY_SET_ABORT session_changed tx=false")
+                    return
+                }
+                if (tickMs >= a125DelayDeadlineMs) {
+                    a125DelayWaiting = false
+                    android.util.Log.w("AtomRemoteAudioA1261", "DELAY_SET_ABORT reason=refresh_or_idle_timeout " +
+                        "attemptConsumed=false setTx=false target=$desired")
+                    return
+                }
+                val getIsFresh = a124DelayLastFrames != null &&
+                    a124DelayLastRxGatt === initialGatt &&
+                    (tickMs - a124DelayLastRxAtMs) in 0L..30_000L
+                if (!getIsFresh) {
+                    if (tickMs - lastRefreshRequestAtMs >= 3_000L || lastRefreshRequestAtMs == 0L) {
+                        // Calls the EXISTING read-only GET dispatch; no new GET parser.
+                        val requested = r2672TryMicLineCandidateGet("delay")
+                        lastRefreshRequestAtMs = tickMs
+                        android.util.Log.i("AtomRemoteAudioA1261", "DELAY_PRE_SET_GET " +
+                            "queued=$requested target=$desired consumed=false tx=false")
+                    }
+                    mainHandler.postDelayed(this, 150L)
+                    return
+                }
+                val idle = !audioR26Live.value.running && !remoteBootstrapActive &&
+                    !inputCollectorRunning && !inputExtendedRunning &&
+                    pendingRemotePacket == null && pendingOps.isEmpty() &&
+                    !operationInFlight && packetLink18.bufferedPacketSize() == 0 &&
+                    r2706MicActive == null && r2706MicReads.isEmpty() &&
+                    packetLink18.state().toString() == "READY"
+                if (!idle) {
+                    val why = buildString {
+                        if (audioR26Live.value.running) append("audioCollector,")
+                        if (remoteBootstrapActive) append("bootstrap,")
+                        if (inputCollectorRunning || inputExtendedRunning) append("inputCollector,")
+                        if (pendingRemotePacket != null) append("pendingRemote,")
+                        if (pendingOps.isNotEmpty() || operationInFlight) append("attBusy,")
+                        if (packetLink18.bufferedPacketSize() != 0) append("packetBuffer,")
+                        if (r2706MicActive != null || r2706MicReads.isNotEmpty()) append("micGet,")
+                        if (packetLink18.state().toString() != "READY") append("plink=${packetLink18.state()},")
+                    }
+                    android.util.Log.i("AtomRemoteAudioA126", "DELAY_WAIT_IDLE target=$desired " +
+                        "elapsedMs=${tickMs - now} blockedBy=$why tx=false")
+                    // A12.34: quicker idle re-check, never preempt active ATT/PacketLink.
+                    mainHandler.postDelayed(this, 100L)
+                    return
+                }
+                android.util.Log.i("AtomRemoteAudioA126", "DELAY_IDLE_PASS target=$desired " +
+                    "elapsedMs=${tickMs - now} ready=true")
+                a125DelayWaiting = false
+                // Attempt is consumed ONLY after PacketLink accepts the SET.
+                val proto = com.atomosremote.nativeapp.audio.AudioA124DelayWire.framesPayload(desired)
+                android.util.Log.w("AtomRemoteAudioA124", "DELAY_SET_ONE_SHOT " +
+                    "cmd=0x06BA proto=${proto.toHex()} baseline=${a124DelayLastFrames} desired=$desired " +
+                    "operatorAction=true staticProtoField1=true " +
+                    "ag2SetSuccessUnverified=true")
+                // Reuse the proven Gain pilot's isolated PacketLink queue path,
+                // with cleanup if the queue refuses. No scheduler changes.
+                val pilotCmd = com.atomosremote.nativeapp.audio.AudioA124DelayWire.COMMAND
+                val body = buildOfficialAtomMessageBodyWithProtoPayload(0, pilotCmd, proto)
+                val packet = PendingRemotePacket(body, "a125-one-shot-delay-$desired",
+                    "A125 DELAY 0 TO $desired", pilotCmd, 0)
+                pendingRemotePacket = packet
+                pendingRemoteFrameWritten = false
+                val queued = queueRemotePacket18_8(packet, local = true)
+                if (!queued && pendingRemotePacket === packet) {
+                    pendingRemotePacket = null
+                    pendingRemoteFrameWritten = false
+                }
+                android.util.Log.w("AtomRemoteAudioA124", "DELAY_SET_QUEUE accepted=$queued " +
+                    "physicalTxNotEstablished=true recorderApplied=UNKNOWN noSetRetry=true")
+                android.util.Log.i("AtomRemoteAudioA126", "DELAY_PACKET_TRACE " +
+                    "cmd=0x06BA target=$desired body=${body.toHex()} " +
+                    "queueAccepted=$queued local=true packetId=0")
+                if (queued) {
+                    a12PilotAttempted.add("delay")
+                    android.util.Log.w("AtomRemoteAudioA1261", "DELAY_ATTEMPT_COMMITTED " +
+                        "target=$desired queueAccepted=true attemptConsumed=true")
+                    a125DelayTargetFrames = desired
+                    a124DelayPendingGet = true
+                    a124DelayPendingGatt = initialGatt
+                    a124DelaySetQueuedAtMs = tickMs
+                    // A12.28: Extend the GET-only verification window to 65s.
+                    // GET queue can be delayed by Gain and Input Level refreshes.
+                    // NEVER resend SET automatically; a fresh matching 0x86B3
+                    // remains the sole verified-state signal.
+                    listOf(250L, 900L, 1_800L, 3_000L, 4_500L, 7_000L, 11_000L, 16_000L, 23_000L, 35_000L, 49_000L).forEachIndexed { index, delayMs ->
+                        mainHandler.postDelayed({
+                            if (gatt === initialGatt && _tcsPairingState.value.acceptWritten &&
+                                a124DelayPendingGet) {
+                                val requested = r2672TryMicLineCandidateGet("delay")
+                                android.util.Log.i("AtomRemoteAudioA126", "DELAY_POST_SET_GET_REQUEST " +
+                                    "attempt=${index + 1} queued=$requested expectedResponse=0x86B3 " +
+                                    "noSetRetry=true")
+                            }
+                        }, delayMs)
+                    }
+                    mainHandler.postDelayed({
+                        if (a124DelayPendingGet && a124DelayPendingGatt === initialGatt) {
+                            android.util.Log.w("AtomRemoteAudioA124", "DELAY_SET_UNCONFIRMED " +
+                                "reason=no_fresh_matching_get_after_65s queuedOnly=true " +
+                                "recorderMayHaveApplied=true requestManualGet=true")
+                            a124DelayPendingGet = false
+                            // Permit a NEW operator action after timeout. Never resend
+                            // the previous SET automatically, and always require a
+                            // fresh typed GET before the next SET can dispatch.
+                            a12PilotAttempted.remove("delay")
+                            android.util.Log.w("AtomRemoteAudioA127", "DELAY_SET_TIMEOUT " +
+                                "target=$desired nextManualSetEnabled=true " +
+                                "recorderApplied=UNKNOWN noAutoRetry=true")
+                        }
+                    }, 65_000L)
+                } else {
+                    android.util.Log.w("AtomRemoteAudioA1261", "DELAY_QUEUE_REJECTED " +
+                        "target=$desired attemptConsumed=false setTx=false")
+                }
+            }
+        }
+        mainHandler.post(tick)
+        android.util.Log.w("AtomRemoteAudioA124", "DELAY_IDLE_WINDOW_ARMED " +
+            "baselineFresh=$fresh target=$desired maxMs=30000 noAutoSet=true")
+        android.util.Log.i("AtomRemoteAudioA126", "DELAY_SET_ARMED " +
+            "target=$desired freshGet=$fresh baseline=${a124DelayLastFrames} " +
+            "plink=${packetLink18.state()} pendingOps=${pendingOps.size} " +
+            "audioRunning=${audioR26Live.value.running} tx=false")
+        return true // armed only, not a verified hardware change
     }
 
     // AUDIO R26: read-only AppPolling.AudioMetersPageGet, source-mapped 0x0647.
@@ -6112,6 +9314,28 @@ class GattClient(context: Context) {
         return out.toByteArray()
     }
 
+    private fun encodeProtoVarintField(fieldNumber: Int, value: Int): ByteArray {
+        require(fieldNumber in 1..15)
+        require(value >= 0)
+        val out = java.io.ByteArrayOutputStream()
+        out.write((fieldNumber shl 3) or 0)
+        var v = value.toLong()
+        do {
+            val next = v ushr 7
+            var b = (v and 0x7F).toInt()
+            if (next != 0L) b = b or 0x80
+            out.write(b)
+            v = next
+        } while (v != 0L)
+        return out.toByteArray()
+    }
+
+    private fun buildProtoVarintFields(vararg pairs: Pair<Int, Int>): ByteArray {
+        val out = java.io.ByteArrayOutputStream()
+        pairs.forEach { (field, value) -> out.writeBytes(encodeProtoVarintField(field, value)) }
+        return out.toByteArray()
+    }
+
     private fun displaySetInt32(commandId: Int, value: Int, key: String, label: String): Boolean {
         if (!canQueueOfficialMonitorCommand("display-$key")) return false
         val proto = encodeProtoInt32Field1(value)
@@ -7450,8 +10674,16 @@ class GattClient(context: Context) {
     @SuppressLint("MissingPermission")
     private fun queueRemotePacket18_8(packet: PendingRemotePacket, local: Boolean): Boolean {
         if (!packetLink18.sendPacket(local, packet.body)) {
+            if (packet.purpose.startsWith("r2665-audio-set-trial:phones:")) {
+                android.util.Log.w("AtomRemoteAudioB011", "SET_BUFFER_REJECT command=0x${packet.commandId.toString(16)} " +
+                    "state=${packetLink18.state()} buffered=${packetLink18.bufferedPacketSize()} physicalWrite=false")
+            }
             appendEvent("TCS18.8 PLINK BUFFER BUSY label=${packet.label} state=${packetLink18.state()} buffered=${packetLink18.bufferedPacketSize()}")
             return false
+        }
+        if (packet.purpose.startsWith("r2665-audio-set-trial:phones:")) {
+            android.util.Log.i("AtomRemoteAudioB011", "SET_BUFFER_ACCEPT command=0x${packet.commandId.toString(16)} " +
+                "body=${packet.body.toHex()} state=${packetLink18.state()} physicalWriteNotYetConfirmed=true")
         }
         if (outputR7IsTrackedPurpose(packet.purpose)) {
             outputR7Trace("BUFFER_ACCEPTED purpose=${packet.purpose} cmd=0x${packet.commandId.toString(16)} packetId=${packet.packetId} local=$local")
@@ -7525,6 +10757,10 @@ class GattClient(context: Context) {
                 PLINK18_WRITE_PURPOSE
             )
         )
+        if (subpacket.includesPacketPayload && pendingRemotePacket?.purpose?.startsWith("r2665-audio-set-trial:phones:") == true) {
+            android.util.Log.i("AtomRemoteAudioB011", "SET_DATA_ATT_QUEUED frame=${subpacket.bytes.toHex()} " +
+                "command=0x${pendingRemotePacket?.commandId?.toString(16)} callbackNotYetConfirmed=true")
+        }
         if (subpacket.includesPacketPayload && outputR7IsTrackedPurpose(pendingRemotePacket?.purpose)) {
             outputR7Trace("PLINK18_DATA_TX_ENQUEUED purpose=${pendingRemotePacket?.purpose} " +
                 "packetId=${pendingRemotePacket?.packetId} bytes=${subpacket.bytes.toHex()}")
@@ -7576,6 +10812,12 @@ class GattClient(context: Context) {
             appendEvent("TCS18.8 PLINK WRITE FAIL status=$status; returning transport to READY")
             return true
         }
+        if (pendingRemotePacket?.purpose?.startsWith("r2665-audio-set-trial:phones:") == true && op.value.size > 1) {
+            android.util.Log.i("AtomRemoteAudioB011", "SET_ATT_WRITE_CALLBACK status=$status frame=${op.value.toHex()} " +
+                "gattAccepted=true recorderAppliedUnverified=true")
+        }
+        // R27.06: Mic/Line evidence only; does not change PacketLink write flow.
+        r2706MicOnAttWrite(op.value)
         // R26.17: Audio-only confirmation of a physical ATT packet write; passive.
         if (op.value.size > 1) audioR26OnGATTWritten()
         // OUTPUT R8: successful ATT callback for the *active* PLINK18 route.
@@ -7652,10 +10894,14 @@ class GattClient(context: Context) {
             scheduleStateSyncRecoveryWatchdog("prime", 4500L)
         }
 
+        // R27.07: read-only pre-demux observation of complete assembled packets.
+        // Does NOT change existing demux acceptance, credits or packet ownership.
+        result.packet?.let { r2707MicOnAssembled(it, result.packetLocal) }
         result.packet?.let { handlePacketLink18_8Payload(it, result.packetLocal) }
 
         if (result.txPacketCompletedThisTurn) {
             val sent = pendingRemotePacket
+            r2706MicOnDelivered(sent)
             audioR26OnTransportComplete(sent)
             pendingRemotePacket = null
             pendingRemoteFrameWritten = false
@@ -7891,6 +11137,28 @@ class GattClient(context: Context) {
             }
         }
 
+        // R27.22.3: offer the just-completed READY boundary only to an
+        // explicitly armed, time-bounded Mic/Line gain pilot. Does not alter
+        // PacketLink state/credit/timer or request any extra E0 turn.
+        if (r2722IdleWindowPending) r2722OfferIdleWindowAtCompletedRead(g)
+        if (a051SetIntent?.kind == "INPUT") a051OfferInputAtCompletedRead(g)
+
+        // A12.6: a Mic/Line GET already queued by the user gets one chance at
+        // this genuinely completed ATT read boundary, rather than waiting for
+        // the 300 ms UI polling timer while the 10 ms PLINK tick may take READY.
+        // The existing Mic pump owns all transport checks, Input/Audio exclusions,
+        // and request serialization. Do not preempt any pending packet or SET.
+        if (r2706MicActive == null && r2706MicReads.isNotEmpty() &&
+            !operationInFlight && pendingOps.isEmpty() && pendingRemotePacket == null &&
+            !audioR26Live.value.running && !inputCollectorRunning &&
+            !inputExtendedRunning && !remoteBootstrapActive &&
+            packetLink18.bufferedPacketSize() == 0 &&
+            packetLink18.state().toString() == "READY") {
+            android.util.Log.i("AtomRemoteAudioA126", "MIC_READY_BOUNDARY " +
+                "queued=${r2706MicReads.size} attIdle=true preemption=false")
+            r2706MicPump()
+        }
+
         // Exact TCSPacketLinkProcess is timer-driven from READY. Do not immediately
         // force an extra E0 turn here; the 10 ms tick owns that transition.
         return true
@@ -8008,7 +11276,28 @@ class GattClient(context: Context) {
             }
         }
 
+        // R27.02: passive, request-agnostic evidence observer for independent
+        // Mic/Line typed response opcodes. NO commands are initiated here.
+        // Also guard against treating Audio 0x8647 or generic 0x8000 as Mic/Line.
+        val r2702Pending = pendingRemotePacket
+        val r2702Typed = com.atomosremote.nativeapp.audio.AudioR2702TypedRxEvidence.inspect(
+            messageType, body, local, packetId,
+            r2702Pending?.packetId == packetId,
+            r2702Pending?.purpose ?: "none")
+        if (r2702Typed != null) {
+            android.util.Log.i("AtomRemoteAudioR2702", r2702Typed)
+        }
+
+        // R27.06 uses a unique operator intent token, ATT success and exact
+        // typed response to avoid treating unrelated PacketLink packets as GET.
+        r2706MicOnRx(messageType, body, local, packetId)
         val pending = pendingRemotePacket
+        if (pending?.purpose?.startsWith("r2672-micline-") == true) {
+            android.util.Log.i("AtomRemoteAudioR2672",
+                "MICLINE_CANDIDATE_RX purpose=${pending.purpose} packetId=$packetId " +
+                    "responseType=0x${messageType.toString(16).uppercase()} local=$local " +
+                    "bytes=${body.size} raw=${body.toHex()}")
+        }
 
         val wl32Correlated = wl32PendingByPacketId.remove(packetId)
         if (wl32Correlated != null) {
@@ -11739,8 +15028,12 @@ class GattClient(context: Context) {
     @SuppressLint("MissingPermission")
     private fun processNext(g: BluetoothGatt) {
         if (operationInFlight) return
-        while (pendingOps.isNotEmpty()) {
-            val op = pendingOps.removeFirst()
+        // R27.10: GATT callbacks may mutate this deque between its empty check
+        // and removeFirst(). A single non-throwing dequeue removes that TOCTOU
+        // NoSuchElementException without changing operation order or retries.
+        // This does NOT make java.util.ArrayDeque fully thread-safe.
+        while (true) {
+            val op = pendingOps.pollFirst() ?: break
             val label = when (op) {
                 is PendingOp.OutputR21Mtu -> "output-r21-mtu"
                 is PendingOp.Read -> "${op.purpose ?: "read"} ${op.characteristic.uuid}"
@@ -11762,6 +15055,9 @@ class GattClient(context: Context) {
                     }
                 }
                 is PendingOp.WriteCharacteristic -> {
+                    if (op.characteristic.uuid.toString().equals(TCS_PACKET_WRITE_UUID, true)) {
+                        android.util.Log.i("AtomRemoteA1280", "ATT_WRITE_INTENT purpose=${op.purpose} bytes=${op.value.size} hex=${op.value.toHex()}")
+                    }
                     op.characteristic.writeType = op.writeType
                     if (Build.VERSION.SDK_INT >= 33) {
                         g.writeCharacteristic(op.characteristic, op.value, op.writeType) == BluetoothStatusCodes.SUCCESS
@@ -12505,6 +15801,9 @@ class GattClient(context: Context) {
             cancelOperationTimeout()
             operationInFlight = false
             val op = activeOp as? PendingOp.WriteCharacteristic
+            if (op != null && c.uuid.toString().equals(TCS_PACKET_WRITE_UUID, true)) {
+                android.util.Log.i("AtomRemoteA1280", "ATT_WRITE_CALLBACK purpose=${op.purpose} status=$status bytes=${op.value.size} hex=${op.value.toHex()}")
+            }
             activeOp = null
             if (op != null && handleConnectedDataTransferWritePurpose(g, op, status)) {
                 processNext(g)

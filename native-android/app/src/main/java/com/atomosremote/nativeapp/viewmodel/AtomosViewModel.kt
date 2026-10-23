@@ -3020,6 +3020,93 @@ class AtomosViewModel(app: Application) : AndroidViewModel(app) {
         return queued
     }
 
+    /** B01.21: operator REC toggle; repeat only after new hardware-confirmed GET. */
+    fun b0119TryRecordOneShot(recordId: Int, enable: Boolean): Boolean {
+        val queued = gatt.b0119TryRecordOneShot(recordId, enable)
+        Log.w("AtomRemoteAudioB0121", "REC_UI_TRIAL id=$recordId enable=$enable armed=$queued " +
+            "awaitFreshGet=true otherChannelMappingsUnverified=true")
+        _commandStatus.value = if (queued)
+            "REC request armed. Wait for TX, then refresh Audio GET. Next toggle needs confirmed readback."
+        else "REC blocked; refresh Audio GET and check B0121 guard log. No SET assumed."
+        return queued
+    }
+
+    /** R26.65 one-shot candidate Audio SET, only invoked by deliberate UI trial button. */
+    fun r2665TryAudioSet(key: String, desired: Int): Boolean {
+        val queued = gatt.r2665TryAudioScalarSet(key, desired)
+        Log.i("AtomRemoteAudioR2665", "UI_SET_TRIAL key=$key desired=$desired queued=$queued")
+        _commandStatus.value = if (queued) "Experimental Audio SET sent to transport; verify recorder and refresh GET"
+            else "Audio SET trial blocked: refresh GET, check supported option or wait for transport"
+        return queued
+    }
+    /** R26.72 experimental Mic/Line candidate GET, explicit UI action only. */
+    fun r2672TryMicLineGet(key: String): Boolean {
+        val queued = gatt.r2672TryMicLineCandidateGet(key)
+        Log.i("AtomRemoteAudioR2672", "UI_MICLINE_GET key=$key queued=$queued")
+        _commandStatus.value = if (queued) "Experimental Mic/Line GET sent; watch logcat and refresh Audio GET"
+            else "Mic/Line GET trial blocked: wait for transport or reconnect"
+        return queued
+    }
+
+    /** A12.37 operator-triggered one-channel Gain SET, always unverified until typed GET. */
+    fun a137GainValueSet(selector: Boolean, raw: Int): Boolean {
+        val accepted = gatt.a137RequestGainSet(selector, raw)
+        Log.i("AtomRemoteAudioA137Gain", "UI_GAIN_RANGE_REQUEST selector=$selector raw=$raw accepted=$accepted")
+        _commandStatus.value = if (accepted) "Gain SET pending. Wait for recorder GET; never assume applied."
+            else "Gain SET blocked: refresh GET or wait for previous Gain SET verification."
+        return accepted
+    }
+
+    /** R27.22: gain selector pilot only, never the older R26.72 SET catalog. */
+    fun r2722GainPilot(selector: Boolean, restore: Boolean): Boolean {
+        val status = gatt.a051RequestGainPilot(selector, restore)
+        Log.i("AtomRemoteAudioR2722", "UI_PILOT_WINDOW selector=$selector restore=$restore status=$status")
+        _commandStatus.value = when (status) {
+            "PREPARING_GET_IDLE" -> "A05.1 Gain pilot PREPARING: waiting for Mic/Line GET queue, " +
+                "fresh typed Gain readback and safe PacketLink turn. It may ABORT without SET."
+            "WAITING_IDLE" -> "Gain pilot WAITING up to 1 second for a safe ATT idle window. " +
+                "May ABORT without SET. See IDLE_WINDOW_RESULT / IDLE_WINDOW_ABORT logs."
+            "QUEUED_UNVERIFIED" -> "Gain pilot queued, NOT confirmed. REFRESH Gain GET and check physical recorder."
+            else -> "Gain pilot BLOCKED, no SET: GET, link or transport guard not met."
+        }
+        // A05.1: Follow-up Gain GET is scheduled by GATT ONLY after the
+        // guarded one-shot pilot reaches queued/armed transport state.
+        // A fixed delay from the initial UI tap used to race the GET queue.
+        return status != "BLOCKED_NO_TX"
+    }
+
+    /** A05: explicit, guarded one-shot Input Level pilot. NOT production SET. */
+    fun a05InputLevelSetPilot(desired: Int): Boolean {
+        val accepted = gatt.a051RequestInputPilot(desired)
+        Log.i("AtomRemoteAudioA051", "UI_INPUT_SET_PREP desired=$desired accepted=$accepted " +
+            "transmitted=false pendingReadback=true")
+        _commandStatus.value = if (accepted)
+            "Input Level pilot PREPARING: wait for safe ATT boundary and fresh GET. " +
+                "A05.1 log will distinguish SET queue from actual recorder readback."
+        else "Input Level SET blocked: another SET pending or session unsafe. No TX."
+        return accepted
+    }
+
+    fun a12ExperimentalOneShotSet(key: String, desired: Int): Boolean {
+        val queued = gatt.a12ExperimentalOneShotSet(key, desired)
+        Log.w("AtomRemoteAudioA12", "UI_PILOT key=$key desired=$desired queued=$queued recorderVerified=false")
+        _commandStatus.value = if (key == "headphoneMonitor" || key == "headphoneSource") {
+            if (queued) "A12.76 valid source ID $desired: one-shot ARMED only. Await TX logs and fresh recorder GET. Not a confirmed SET."
+            else "A12.76 source ID $desired is valid when in 0..7, but request BLOCKED by GET/connection/pending/one-shot guard. No TX; inspect A1276 REJECT reason."
+        } else if (queued) "Experimental A12 command queued. Inspect recorder and refresh GET; NOT confirmed."
+        else "A12 pilot blocked or already attempted."
+        return queued
+    }
+
+    /** R26.72 experimental Mic/Line candidate SET, explicit UI action only. */
+    fun r2672TryMicLineSet(key: String, desired: Int): Boolean {
+        val queued = gatt.r2672TryMicLineCandidateSet(key, desired)
+        Log.i("AtomRemoteAudioR2672", "UI_MICLINE_SET key=$key desired=$desired queued=$queued")
+        _commandStatus.value = if (queued) "Experimental Mic/Line SET sent; verify on recorder and refresh GET"
+            else "Mic/Line SET trial blocked: refresh readback, wait for transport or reconnect"
+        return queued
+    }
+
     /** R26.13: sequential confirmed-opcode Audio getter collector. */
     fun refreshRecoveredAudioR26(): Boolean = gatt.startAudioR26RecoveredCollector()
     fun stopRecoveredAudioR26() = gatt.cancelAudioR26RecoveredCollector()

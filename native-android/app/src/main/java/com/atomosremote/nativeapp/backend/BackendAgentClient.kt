@@ -120,6 +120,7 @@ class BackendAgentClient(
                             registered = false
                             Log.e(TAG, "agent server error=${obj.optString("error")}")
                         }
+                        else -> Unit // Unknown WebSocket message types remain ignored.
                     }
                 }.onFailure {
                     Log.e(TAG, "bad websocket message", it)

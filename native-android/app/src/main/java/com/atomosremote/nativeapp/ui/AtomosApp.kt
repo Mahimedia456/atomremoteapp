@@ -140,6 +140,38 @@ private fun ndi16LocalIpv4(value: String): Boolean {
 @Composable
 fun AtomosApp(vm: AtomosViewModel = viewModel()) {
     val screen by vm.screen.collectAsState()
+    val selectedRecorder by vm.selected.collectAsState()
+    val connectedRecorderName by vm.connectedRecorderName.collectAsState()
+    val tcsPairState by vm.tcsPairingState.collectAsState()
+    // R26.50 UI-only post-pair interstitial. Background RemoteScreen composition
+    // remains active so existing GATT, NDI and collector work is never delayed.
+    var prepareArmed by remember { mutableStateOf(false) }
+    var prepareShowing by remember { mutableStateOf(false) }
+    var prepareTick by remember { mutableIntStateOf(0) }
+    LaunchedEffect(screen, selectedRecorder?.address, tcsPairState.acceptWritten) {
+        if (screen == AtomosViewModel.Screen.PAIR) {
+            prepareArmed = true
+            prepareShowing = false
+            prepareTick = 0
+        } else if (screen == AtomosViewModel.Screen.REMOTE &&
+            prepareArmed && tcsPairState.acceptWritten) {
+            prepareArmed = false
+            prepareShowing = true
+            prepareTick = 0
+            val deviceKey = selectedRecorder?.address.orEmpty()
+            Log.i("AtomRemotePrepare", "PREPARE_START device=$deviceKey durationMs=10000 transportUntouched=true")
+            // This is a presentation hold, NOT a hardware-ready acknowledgement.
+            for (i in 1..100) {
+                delay(100L)
+                prepareTick = i
+            }
+            prepareShowing = false
+            Log.i("AtomRemotePrepare", "PREPARE_END device=$deviceKey durationMs=10000")
+        } else if (screen != AtomosViewModel.Screen.REMOTE) {
+            prepareShowing = false
+            prepareTick = 0
+        }
+    }
     if (!AtomRemoteStartupGate()) return
     Surface(Modifier.fillMaxSize()) {
         when (screen) {
@@ -163,6 +195,47 @@ fun AtomosApp(vm: AtomosViewModel = viewModel()) {
             AtomosViewModel.Screen.PRESETS -> PresetsScreen(vm)
             AtomosViewModel.Screen.CAPTURE -> CaptureScreen(vm)
             AtomosViewModel.Screen.QA -> FinalQaScreen(vm)
+        }
+        if (prepareShowing && screen == AtomosViewModel.Screen.REMOTE) {
+            val preparedDeviceName = connectedRecorderName?.trim()?.takeIf { it.isNotBlank() }
+                ?: selectedRecorder?.let { vm.displayNameFor(it) }?.trim()?.takeIf { it.isNotBlank() }
+                ?: "ATOMOS Recorder"
+            Dialog(
+                onDismissRequest = { /* 10-second pairing presentation, not user-dismissible */ },
+                properties = androidx.compose.ui.window.DialogProperties(
+                    dismissOnBackPress = false, dismissOnClickOutside = false,
+                    usePlatformDefaultWidth = false)
+            ) {
+                Column(
+                    Modifier.fillMaxWidth(0.90f)
+                        .background(Color(0xFF091418), RoundedCornerShape(22.dp))
+                        .border(1.dp, Color(0xFF305056), RoundedCornerShape(22.dp))
+                        .padding(horizontal = 26.dp, vertical = 32.dp),
+                    horizontalAlignment = Alignment.CenterHorizontally,
+                    verticalArrangement = Arrangement.spacedBy(14.dp)
+                ) {
+                    Box(Modifier.size(64.dp)
+                        .background(Color(0xFF113C3C), CircleShape),
+                        contentAlignment = Alignment.Center) {
+                        CircularProgressIndicator(modifier = Modifier.size(38.dp),
+                            strokeWidth = 3.dp, color = AtomosCyan)
+                    }
+                    Text("PREPARING YOUR REMOTE", color = Color.White, fontSize = 17.sp,
+                        fontWeight = FontWeight.Bold, letterSpacing = 0.7.sp)
+                    Text(preparedDeviceName, color = AtomosCyan, fontSize = 15.sp,
+                        fontWeight = FontWeight.SemiBold, maxLines = 2,
+                        textAlign = androidx.compose.ui.text.style.TextAlign.Center)
+                    Text("It may take about 10 seconds. Hold tight while we prepare your recorder.",
+                        color = Color(0xFFADBBC0), fontSize = 12.sp, lineHeight = 18.sp,
+                        textAlign = androidx.compose.ui.text.style.TextAlign.Center)
+                    LinearProgressIndicator(progress = { prepareTick.coerceIn(0, 100) / 100f },
+                        modifier = Modifier.fillMaxWidth().height(9.dp)
+                            .clip(RoundedCornerShape(9.dp)),
+                        color = AtomosCyan, trackColor = Color(0xFF243E42))
+                    Text("${10 - (prepareTick / 10)}s remaining",
+                        color = Color(0xFF9BB4B7), fontSize = 11.sp)
+                }
+            }
         }
     }
 }
@@ -1738,7 +1811,7 @@ private fun RemoteScreen(vm: AtomosViewModel) {
                             loading = recordPending,
                             modifier = Modifier.weight(1f)
                         ) {
-                            if (transportUi.mode != RemoteTransportUiController.Mode.RECORD) {
+                            if (transportUi.mode == RemoteTransportUiController.Mode.PLAYBACK) {
                                 startUiAction(
                                     "return-record-mode",
                                     "Return to Record mode",
@@ -6690,27 +6763,107 @@ private fun AudioModuleScreen(vm: AtomosViewModel) {
     val gattState by vm.gattState.collectAsState()
     val snapshot by vm.remoteStateSnapshot.collectAsState()
     val audioReadback by vm.audioR26Live.collectAsState()
+    val micLineEvidence by vm.gatt.r2697MicLineEvidence.collectAsState()
     val linked = pairing.acceptWritten && remote.available &&
         gattState != "idle" && gattState != "disconnected" &&
         !gattState.startsWith("error:") && !gattState.startsWith("service-error:")
     // R26.11.3: only a linked recorder's typed 0x8647 state page can claim readback.
     // The UI does NOT map protobuf field numbers to audio options or dB values.
     val meters = if (linked) snapshot.pages[0x0647] else null
-    val wireInspection = remember(meters?.rawHex) { AudioR26WireInspector.inspect(meters?.rawHex.orEmpty()) }
-    val haveMeterPayload = linked && meters?.responseType == 0x8647 &&
-        !meters?.rawHex.isNullOrEmpty() && wireInspection.status == "RAW_PARSED_UNMAPPED" &&
-        wireInspection.fields.isNotEmpty()
+    // R26.21: typed collector RX is an independent Flow. In some sessions it
+    // arrives while the broader remote snapshot is still updating. Use the
+    // RX already observed by this same paired Audio collector as a fallback.
+    // Never accept a non-0x8647 reply or a disconnected session's cache.
+    val collectorPage = audioReadback.values["AudioMetersPageGet"]
+    // R26.27: a successful older state-page cannot silently substitute for a
+    // failed new collector generation. Require a TYPED_RX from THIS run.
+    val pageFromCollector = if (linked && collectorPage?.status == "TYPED_RX" &&
+        collectorPage.responseType == 0x8647) collectorPage.rawHex else ""
+    // R26.30: keep last genuine typed RX readable during a subsequent collector
+    // refresh. Clear when disconnected or another recorder is selected. A cached
+    // page is NEVER labelled a fresh GET. The general snapshot is from GATT's
+    // current connection (GattClient resets it on disconnect).
+    var r2630LastTypedInView by remember(selected?.address) { mutableStateOf("") }
+    LaunchedEffect(linked, pageFromCollector) {
+        if (!linked) r2630LastTypedInView = ""
+        else if (com.atomosremote.nativeapp.audio.AudioR26PageSnapshot.decode(pageFromCollector) != null)
+            r2630LastTypedInView = pageFromCollector
+    }
+    val r2630Source = com.atomosremote.nativeapp.audio.AudioR2630Readable.select(
+        linked, pageFromCollector, r2630LastTypedInView,
+        if (linked && meters?.responseType == 0x8647) meters?.rawHex.orEmpty() else "")
+    val audioPageRawHex = r2630Source.hex
+    val r2627Diagnosis = com.atomosremote.nativeapp.audio.AudioR2627_29Evidence
+        .diagnose(linked, audioReadback.running, collectorPage?.status,
+            audioReadback.status, pageFromCollector.isNotEmpty())
+    val wireInspection = remember(audioPageRawHex) { AudioR26WireInspector.inspect(audioPageRawHex) }
+    val haveMeterPayload = linked && audioPageRawHex.isNotEmpty() &&
+        wireInspection.status == "RAW_PARSED_UNMAPPED" && wireInspection.fields.isNotEmpty()
     var pane by remember(selected?.address) { mutableStateOf("AUDIO") }
     var sheetKey by remember(selected?.address) { mutableStateOf<String?>(null) }
     var refreshGeneration by remember(selected?.address) { mutableIntStateOf(0) }
     var lastRequestQueued by remember(selected?.address) { mutableStateOf<Boolean?>(null) }
+    // R26.31-33: A/B comparison state is per recorder, not shared with NDI.
+    var r2631BaselineHex by remember(selected?.address) { mutableStateOf("") }
+    var r2631BaselineGeneration by remember(selected?.address) { mutableIntStateOf(-1) }
+    LaunchedEffect(linked) {
+        if (!linked) { r2631BaselineHex = ""; r2631BaselineGeneration = -1 }
+    }
+    // R26.51: local-only one-field A/B SET-readiness evidence per paired recorder.
+    // A/B observes physical AG2 changes; it must never be called an Android SET.
+    var r2651BaseKey by remember(selected?.address) { mutableStateOf("") }
+    var r2651BaseHex by remember(selected?.address) { mutableStateOf("") }
+    var r2651BaseGen by remember(selected?.address) { mutableIntStateOf(-1) }
+    LaunchedEffect(linked) {
+        if (!linked) { r2651BaseKey = ""; r2651BaseHex = ""; r2651BaseGen = -1 }
+    }
+    val r2631Comparison = com.atomosremote.nativeapp.audio.AudioR2631_33Proof.compare(
+        r2631BaselineHex, audioPageRawHex, r2631BaselineGeneration,
+        audioReadback.generation, r2630Source.isCurrentRx, audioReadback.running)
+
+    // R26.34-36: evidence-only calibration tied to this BLE recorder, never NDI.
+    // Correlations are operator-labelled observations, not a verified GET/SET mapping.
+    var r2634Target by remember(selected?.address) { mutableStateOf("Other Audio setting") }
+    var r2634Observations by remember(selected?.address) {
+        mutableStateOf<List<com.atomosremote.nativeapp.audio.AudioR2634_36Calibration.Observation>>(emptyList())
+    }
+    LaunchedEffect(linked) { if (!linked) r2634Observations = emptyList() }
+    val r2634Assessment = com.atomosremote.nativeapp.audio.AudioR2634_36Calibration
+        .assess(r2634Target, r2634Observations)
+
+    var priorAudioPageRaw by remember(selected?.address) { mutableStateOf("") }
+    var lastChangedWireFields by remember(selected?.address) { mutableStateOf<List<Int>>(emptyList()) }
+    var r2625LastRawDeltas by remember(selected?.address) { mutableStateOf<List<String>>(emptyList()) }
+    LaunchedEffect(linked, audioPageRawHex) {
+        if (!linked) {
+            priorAudioPageRaw = ""
+            lastChangedWireFields = emptyList()
+            r2625LastRawDeltas = emptyList()
+        } else if (haveMeterPayload && r2630Source.isCurrentRx && audioPageRawHex != priorAudioPageRaw) {
+            if (priorAudioPageRaw.isNotEmpty()) {
+                lastChangedWireFields = com.atomosremote.nativeapp.audio.AudioR2620_22Evidence
+                    .changedRawFields(priorAudioPageRaw, audioPageRawHex)
+                r2625LastRawDeltas = com.atomosremote.nativeapp.audio.AudioR2624_26Protocol
+                    .diff(priorAudioPageRaw, audioPageRawHex)
+                if (lastChangedWireFields.isNotEmpty()) {
+                    Log.i("AtomRemoteAudioR2621", "AUDIO_PAGE_RAW_FIELD_CHANGE " +
+                        "fields=${lastChangedWireFields.joinToString(",")} " +
+                        "notCalibrated=true")
+                }
+            }
+            priorAudioPageRaw = audioPageRawHex
+        }
+    }
     // R26.12: no Save A/B, no non-local diagnostic buttons in the normal Audio UI.
 
     // Raw evidence logging is keyed to a changed, strictly parsed readback.
-    LaunchedEffect(linked, meters?.rawHex) {
-        if (haveMeterPayload) {
+    LaunchedEffect(linked, audioPageRawHex, r2630Source.origin) {
+        Log.i("AtomRemoteAudioR2630", "UI_READBACK origin=${r2630Source.origin} " +
+            "available=$haveMeterPayload linked=$linked running=${audioReadback.running} " +
+            "bytes=${audioPageRawHex.length / 2}")
+        if (haveMeterPayload && r2630Source.isCurrentRx) {
             Log.i("AtomRemoteAudioR26Map",
-                "PAGE_8647_VERIFIED size=${meters?.rawHex?.length?.div(2) ?: 0} " +
+                "PAGE_8647_VERIFIED size=${audioPageRawHex.length / 2} " +
                     "fields=${wireInspection.fields.size} " +
                     wireInspection.fields.joinToString(";") { "f${it.number}/w${it.wireType}=${it.detail}" })
         }
@@ -6718,219 +6871,1214 @@ private fun AudioModuleScreen(vm: AtomosViewModel) {
 
     // R26.13: actual recovered GET opcodes, one sequential collector per screen/refresh.
     // Collector itself waits for MTU and other feature owners; no Save A/B.
+    // R26.28: Audio-only settle window after opening a session. Existing
+    // Input/Output prefetch is not modified. Explicit Refresh skips the wait.
+    // Never start a second GET while the original Audio collector is running.
     LaunchedEffect(selected?.address, linked, refreshGeneration) {
-        if (linked) vm.refreshRecoveredAudioR26()
+        if (linked) {
+            if (refreshGeneration == 0) delay(350L)
+            val accepted = vm.refreshRecoveredAudioR26()
+            Log.i("AtomRemoteAudioR2628",
+                "AUDIO_REFRESH_REQUEST accepted=$accepted manual=${refreshGeneration > 0} " +
+                    "selected=${selected?.address.orEmpty()} linked=$linked " +
+                    "collectorRunning=${audioReadback.running} noExtraGet=true")
+        }
     }
 
     DisposableEffect(vm, selected?.address) {
         onDispose { vm.stopRecoveredAudioR26() }
     }
 
-    ModuleShell(vm, AtomosViewModel.Screen.AUDIO, "Audio", recorderName) {
-        Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
-            Text("AUDIO STATUS", color = Color(0xFF91A4A8), fontSize = 10.sp, fontWeight = FontWeight.Bold)
-            Spacer(Modifier.weight(1f))
-            Text(
-                when {
-                    !linked -> "CONNECTING"
-                    audioReadback.values.values.any { it.status == "TYPED_RX" } -> "LIVE AUDIO GET RX"
-                    audioReadback.running -> "READING AUDIO SETTINGS"
-                    haveMeterPayload -> "AUDIO PAGE VERIFIED"
-                    else -> "CURRENT READBACK PENDING"
-                },
-                color = if (haveMeterPayload) AtomosCyan else Color(0xFF91A4A8),
-                fontSize = 10.sp, fontWeight = FontWeight.Bold
-            )
+    // R26.42: ALL settings visible on both panes, regardless of RX status.
+    // Only real device-reported data can populate a value; missing telemetry
+    // never deletes the row or activates an unverified Audio SET command.
+    val r2641Display = remember(audioPageRawHex) {
+        com.atomosremote.nativeapp.audio.AudioR2641Presentation.decode(audioPageRawHex)
+    }
+    var r2641Advanced by remember(selected?.address) { mutableStateOf(false) }
+    // REC channel calibration stays on this BLE recorder only. Every mapping
+    // requires an observed single-ID toggle on the physical recorder.
+    val recCalibrationContext = LocalContext.current
+    val recCalibrationPrefs = remember(recCalibrationContext) {
+        recCalibrationContext.getSharedPreferences("atomremote_rec_routing_v1", android.content.Context.MODE_PRIVATE)
+    }
+    val recDeviceAddress = selected?.address.orEmpty()
+    val recMappingPrefKey = "rec_mapping_" + recDeviceAddress
+    var recLearnedPairs by remember(recDeviceAddress) {
+        mutableStateOf(com.atomosremote.nativeapp.audio.AudioRecCalibratedChannels.decodeSaved(
+            recCalibrationPrefs.getString(recMappingPrefKey, null)))
+    }
+    var recPendingPair by remember(recDeviceAddress) { mutableStateOf<Pair<String, String>?>(null) }
+    var recPendingGeneration by remember(recDeviceAddress) { mutableIntStateOf(-1) }
+    var recCandidate by remember(recDeviceAddress) {
+        mutableStateOf<com.atomosremote.nativeapp.audio.AudioR2647RecProof.Candidate?>(null)
+    }
+    var recCalibrationNotice by remember(recDeviceAddress) { mutableStateOf("") }
+    LaunchedEffect(linked, recDeviceAddress) {
+        if (!linked) {
+            recPendingPair = null
+            recCandidate = null
+            recPendingGeneration = -1
         }
-        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-            listOf("AUDIO" to "Audio", "MIC_LINE" to "Mic / Line").forEach { (key, label) ->
-                Surface(
-                    modifier = Modifier.weight(1f).clickable { pane = key; sheetKey = null },
-                    shape = RoundedCornerShape(10.dp),
-                    color = if (pane == key) Color(0xFF134044) else Color(0xFF101A1D),
+    }
+    val recLiveStates = remember(audioPageRawHex) {
+        com.atomosremote.nativeapp.audio.AudioRecCalibratedChannels.idStates(audioPageRawHex)
+    }
+    // R26.47: observe only a NEW completed typed GET. Do not auto-save an ID.
+    LaunchedEffect(recDeviceAddress, audioPageRawHex, recPendingPair, recPendingGeneration,
+        linked, r2630Source.isCurrentRx, audioReadback.running, audioReadback.generation) {
+        val pending = recPendingPair
+        if (recCandidate == null && pending != null && linked && recDeviceAddress.isNotEmpty() &&
+            r2630Source.isCurrentRx && !audioReadback.running &&
+            audioReadback.generation > recPendingGeneration) {
+            val result = com.atomosremote.nativeapp.audio.AudioR2647RecProof.evaluate(
+                pending.first, pending.second, audioPageRawHex, recPendingGeneration,
+                audioReadback.generation, true, false)
+            recCalibrationNotice = result.message
+            recCandidate = result.candidate
+            if (result.candidate != null) {
+                Log.i("AtomRemoteAudioR2647", "REC_CANDIDATE target=${pending.first} " +
+                    "id=${result.candidate.rawId} generation=${audioReadback.generation} " +
+                    "operatorConfirmationRequired=true audioSetTx=false")
+            }
+        }
+    }
+    // R26.57: user can inspect available options and stage a UI-only choice.
+    // This is intentionally NOT a control transaction or a recorder SET.
+    var r2657PreviewKey by remember(selected?.address) { mutableStateOf("") }
+    var r2657PreviewValue by remember(selected?.address) { mutableStateOf<Long?>(null) }
+    // R26.65: explicit trial selection. Never auto-sends after GET or connect.
+    var r2665TrialArmed by remember(selected?.address) { mutableStateOf(false) }
+    var r2665PhonesDraft by remember(selected?.address) { mutableIntStateOf(-1) }
+    var r2665LastTrialStatus by remember(selected?.address) { mutableStateOf("") }
+
+    val r2657NameContext = LocalContext.current
+    val r2657NamePrefs = remember(r2657NameContext) {
+        r2657NameContext.getSharedPreferences("atomremote_audio_r2657_modes", android.content.Context.MODE_PRIVATE)
+    }
+    val r2657Device = selected?.address.orEmpty()
+    val r2657NameOptions = listOf(
+        "AUDIO_ORIENTATION:Vertical", "AUDIO_ORIENTATION:Horizontal",
+        "AUDIO_EMBED:Off", "AUDIO_EMBED:1/2", "AUDIO_EMBED:3/4")
+    var r2657NamedRaw by remember(r2657Device) {
+        mutableStateOf(r2657NameOptions.mapNotNull { k ->
+            val n = r2657NamePrefs.getLong("$r2657Device/$k", Long.MIN_VALUE)
+            if (n == Long.MIN_VALUE) null else k to n
+        }.toMap())
+    }
+    var r2653ProofKey by remember(selected?.address) { mutableStateOf("analogMonitor") }
+    // R26.54: optional, low-rate GET-only level tracking while Audio is visible.
+    // Uses the established shared collector. NEVER a PhonesLevelSet / Audio SET.
+    var r2654LiveGet by remember(selected?.address) { mutableStateOf(false) }
+    LaunchedEffect(selected?.address, linked, pane, r2654LiveGet, audioReadback.running) {
+        if (linked && pane == "AUDIO" && r2654LiveGet && !audioReadback.running) {
+            delay(6_000L)
+            if (linked && pane == "AUDIO" && r2654LiveGet) {
+                refreshGeneration += 1
+                Log.i("AtomRemoteAudioR2654", "LIVE_GET_TICK linked=true " +
+                    "sharedCollector=true audioSetTx=false")
+            }
+        }
+    }
+    ModuleShell(vm, AtomosViewModel.Screen.AUDIO, "Audio", recorderName) {
+        // R27.19: Audio + Mic/Line Input/Output-style options-list presentation.
+        // Legacy audio UI (including experimental SET controls) is NOT rendered.
+        // All former GET flows and hardware paths remain intact. No SET here.
+        if (true) {
+            AudioR2719FinalOptionLists(
+                deviceKey = selected?.address.orEmpty(),
+                linked = linked,
+                pane = pane,
+                onPane = { pane = it; sheetKey = null },
+                audioBusy = audioReadback.running,
+                audioPageHex = audioPageRawHex,
+                freshTypedAudio = linked && !audioReadback.running &&
+                    collectorPage?.status == "TYPED_RX" &&
+                    collectorPage.responseType == 0x8647 &&
+                    r2630Source.isCurrentRx &&
+                    com.atomosremote.nativeapp.audio.AudioR26PageSnapshot.decode(pageFromCollector) != null,
+                evidenceFlow = vm.gatt.r2697MicLineEvidence,
+                onAudioRefresh = { refreshGeneration += 1 },
+                onGainRefresh = { vm.r2672TryMicLineGet("gainLeft") },
+                onGainPilot = { selector, restore -> vm.r2722GainPilot(selector, restore) },
+                onGainValueSet = { selector, raw -> vm.a137GainValueSet(selector, raw) },
+                onInputPilot = { desired -> vm.a05InputLevelSetPilot(desired) },
+                onInputRefresh = { vm.r2672TryMicLineGet("inputLevel") },
+                onDelayRefresh = { vm.r2672TryMicLineGet("delay") },
+                onPhonesTrial = { target -> vm.r2665TryAudioSet("phones", target) },
+                onA12Pilot = { key, desired -> vm.a12ExperimentalOneShotSet(key, desired) },
+                onRecordOneShot = { recordId, enable -> vm.b0119TryRecordOneShot(recordId, enable) }
+            )
+        } else {
+        Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+            Column(Modifier.weight(1f)) {
+                Text("RECORDER AUDIO", color = Color.White, fontSize = 16.sp,
+                    fontWeight = FontWeight.Bold)
+                Text(when {
+                    !linked -> "Disconnected - values unavailable"
+                    r2630Source.isCurrentRx && r2641Display.verified -> "Verified Audio page. Individual settings may be pending"
+                    r2641Display.verified -> "Last verified value - refresh pending"
+                    audioReadback.running -> "GET in progress - settings remain visible"
+                    else -> "Readback unavailable - settings remain visible"
+                }, fontSize = 11.sp, color = if (r2641Display.verified) AtomosCyan else Color(0xFF99AFB2))
+            }
+            TextButton(onClick = { refreshGeneration += 1 },
+                enabled = linked && !audioReadback.running) {
+                Text("REFRESH", fontSize = 11.sp, fontWeight = FontWeight.Bold,
+                    color = if (linked && !audioReadback.running) AtomosCyan else Color.Gray)
+            }
+        }
+        if (audioReadback.running) {
+            LinearProgressIndicator(modifier = Modifier.fillMaxWidth().height(3.dp),
+                color = AtomosCyan, trackColor = Color(0xFF244044))
+        }
+        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(9.dp)) {
+            listOf("AUDIO" to "Audio", "MIC_LINE" to "Mic / Line").forEach { (key, title) ->
+                Surface(modifier = Modifier.weight(1f)
+                    .clickable { pane = key; sheetKey = null },
+                    shape = RoundedCornerShape(11.dp),
+                    color = if (pane == key) Color(0xFF0E3639) else Color(0xFF0A181B),
                     border = androidx.compose.foundation.BorderStroke(
-                        1.dp, if (pane == key) AtomosCyan else Color(0xFF30474E)
-                    )
-                ) {
+                        1.dp, if (pane == key) AtomosCyan else Color(0xFF2D454A))) {
                     Box(Modifier.padding(vertical = 14.dp), contentAlignment = Alignment.Center) {
-                        Text(label, color = if (pane == key) AtomosCyan else Color(0xFFBBC9CA),
+                        Text(title, color = if (pane == key) AtomosCyan else Color(0xFFA2B5B8),
                             fontSize = 13.sp, fontWeight = FontWeight.Bold)
                     }
                 }
             }
         }
-        AudioR26VerifiedPagePanel(haveMeterPayload, meters?.rawHex.orEmpty(), wireInspection)
-        if (haveMeterPayload) {
-            Text("Live recorder Audio page is available. Named values below use macOS Swift metadata and inferred protobuf tag mapping; dB/channel meanings remain unverified.",
-                color = Color(0xFFD5B47C), fontSize = 10.sp, lineHeight = 15.sp)
-        }
-        Text("macOS recovered GET collector: ${audioReadback.status}",
-            color = AtomosCyan, fontSize = 11.sp)
-        Text("Audio GET audit: ${audioReadback.values.size} / " +
-            "${com.atomosremote.nativeapp.audio.AudioR26RecoveredMap.auditCandidates.size + 1} checked; " +
-            "RX=${audioReadback.values.values.count { it.status == "TYPED_RX" }} " +
-            "rejected=${audioReadback.values.values.count { it.status.startsWith("RECORDER_REJECT") }} " +
-            "skipped=${audioReadback.values.values.count { it.status.startsWith("SKIPPED_") }}",
-            color = Color(0xFF95B9BC), fontSize = 10.sp)
-        var showKeyAudit by remember { mutableStateOf(false) }
-        Text(if (showKeyAudit) "33 macOS Audio keys (tap to hide)" else "33 macOS Audio keys (tap to expand)",
-            color = AtomosCyan, fontSize = 11.sp,
-            modifier = Modifier.fillMaxWidth().clickable { showKeyAudit = !showKeyAudit }.padding(vertical = 8.dp))
-        if (showKeyAudit) {
-            com.atomosremote.nativeapp.audio.AudioR26RecoveredMap.allKeys.forEach { key ->
-                val observed = audioReadback.values[key.method]?.status
-                val result = when {
-                    key.kind == "SET" -> "SET LOCKED"
-                    observed != null -> observed
-                    key.kind != "GET" -> "NOT A GET"
-                    key.requiresArguments -> "ARGUMENT SCHEMA PENDING"
-                    key.confidence != "DIRECT_BINARY" -> "UNVERIFIED OPCODE"
-                    else -> "PENDING"
+        // R2695_UNIFIED_SOURCE_BATCH: replace only Audio/MicLine presentation.
+        val r2695UnifiedUiActive = true
+        AudioR2695UnifiedPanel(
+            pane = pane, linked = linked, running = audioReadback.running,
+            audioPageHex = audioPageRawHex,
+            micEvidence = if (linked) micLineEvidence else com.atomosremote.nativeapp.audio.AudioR2697MicLineSnapshot(),
+            onRefresh = { refreshGeneration += 1 },
+            onMicLineReadAttempt = { key -> vm.r2672TryMicLineGet(key) }
+        )
+        // MICLINE_VISIBLE_PHASE02: explicit Mic/Line readback screen; no unverified GET/SET.
+        if (pane == "MIC_LINE" && !r2695UnifiedUiActive) {
+            MicLineGetPhase01Panel(
+                linked = linked,
+                running = audioReadback.running,
+                onRefresh = { refreshGeneration += 1 },
+                onCandidateGet = { key -> vm.r2672TryMicLineGet(key) },
+                onCandidateSet = { key, value ->
+                    val queued = vm.r2672TryMicLineSet(key, value)
+                    if (queued) refreshGeneration += 1
                 }
-                Text("${key.method}  ${if (key.opcode > 0) "0x${key.opcode.toString(16)}" else "?"}  $result",
-                    fontSize = 10.sp, color = Color(0xFF9FB6B9),
-                    modifier = Modifier.fillMaxWidth().padding(vertical = 2.dp))
-            }
+            )
         }
-
-        if (pane == "AUDIO") {
-            Text("AUDIO METERS", color = Color(0xFF91A4A8), fontSize = 11.sp,
-                fontWeight = FontWeight.Bold, modifier = Modifier.padding(top = 8.dp))
-            AudioR26MetersPlaceholder(haveMeterPayload, meters?.rawHex.orEmpty(), wireInspection)
-            Text("MONITOR & RECORD", color = Color(0xFF91A4A8), fontSize = 11.sp,
-                fontWeight = FontWeight.Bold, modifier = Modifier.padding(top = 12.dp))
-            AudioR26Catalog.settings.filter { it.pane == "AUDIO" && it.key in listOf(
-                "phones", "analogMonitor", "analogRecord", "ch12", "ch34", "ch56", "ch78", "ch910", "ch1112"
-            ) }.forEach { spec -> AudioR26SettingRow(spec, audioReadback.values, meters?.rawHex.orEmpty()) { sheetKey = spec.key } }
-            Text("ROUTING & METER SETTINGS", color = Color(0xFF91A4A8), fontSize = 11.sp,
-                fontWeight = FontWeight.Bold, modifier = Modifier.padding(top = 12.dp))
-            AudioR26Catalog.settings.filter { it.pane == "AUDIO" && it.key in listOf(
-                "embed", "orientation", "fill", "speaker", "speakerMute", "dropouts"
-            ) }.forEach { spec -> AudioR26SettingRow(spec, audioReadback.values, meters?.rawHex.orEmpty()) { sheetKey = spec.key } }
-        } else {
-            Text("MIC / LINE INPUT", color = Color(0xFF91A4A8), fontSize = 11.sp,
-                fontWeight = FontWeight.Bold, modifier = Modifier.padding(top = 8.dp))
-            AudioR26Catalog.forPane("MIC_LINE").forEach { spec ->
-                AudioR26SettingRow(spec, audioReadback.values, meters?.rawHex.orEmpty()) { sheetKey = spec.key }
-            }
+        // R27.14: read-only, existing-session gain evidence. Never change 0x06B6 TX,
+        // PacketLink framing, any SET or other Audio/Settings screen.
+        if (pane == "MIC_LINE") {
+            AudioR2714GainReadOnlyPanel(
+                linked = linked,
+                evidenceFlow = vm.gatt.r2697MicLineEvidence,
+                onReadGain = { vm.r2672TryMicLineGet("gainLeft") }
+            )
         }
-        Text(
-            if (haveMeterPayload) "AudioMetersPage GET 0x0647 / response 0x8647 verified. Named scalar/list readbacks are inferred from official macOS reflection; controls and SET remain locked."
-            else "Audio page readback not available in this connection. Retry Refresh after pairing and MTU negotiation.",
-            color = Color(0xFF91A4A8), fontSize = 11.sp, lineHeight = 16.sp
-        )
-        Text(
-            "R26.04 protocol inspection: ${wireInspection.status}. " +
-                "${wireInspection.fields.size} top-level protobuf wire fields detected; " +
-                "names inferred from macOS metadata; not verified as writable recorder controls.",
-            color = Color(0xFF91A4A8), fontSize = 10.sp, lineHeight = 15.sp
-        )
-
-        TextButton(
-            onClick = { refreshGeneration += 1 },
-            enabled = linked,
-            modifier = Modifier.fillMaxWidth()
-        ) {
-            Text("Refresh audio readback", color = if (linked) AtomosCyan else Color.Gray,
-                fontSize = 12.sp, fontWeight = FontWeight.Bold)
+        // R27.16: input mode is scoped to its own verified 0x06B3 / 0x86AE RX.
+        // No transport or other Audio/Settings UI modifications.
+        if (pane == "MIC_LINE") {
+            AudioR2716InputLevelReadOnlyPanel(
+                linked = linked,
+                evidenceFlow = vm.gatt.r2697MicLineEvidence,
+                onReadInputLevel = { vm.r2672TryMicLineGet("inputLevel") }
+            )
         }
-        HorizontalDivider(color = Color(0xFF254048))
-        Text("LIVE DEVICE READBACK", color = AtomosCyan,
-            fontSize = 11.sp, fontWeight = FontWeight.Bold)
-        Text(
-            "Recorder GET 0x0647 / typed response 0x8647 is enabled after pairing " +
-                "and successful MTU negotiation. Busy requests retry while this Audio " +
-                "screen is open. Unverified individual GET payload candidates are disabled after four AG2 hardware timeouts. Gain, Mic/Line and Speaker need official request/response schemas.",
-            color = Color(0xFFB7C4C6), fontSize = 11.sp, lineHeight = 16.sp
-        )
-        Text("Audio SET commands remain locked. Remote, Input, Output and Monitor are unchanged.",
-            color = Color(0xFFD5B47C), fontSize = 10.sp, lineHeight = 15.sp)
-    }
-    if (sheetKey != null) {
-        val spec = AudioR26Catalog.find(sheetKey.orEmpty())
-        if (spec != null) {
-            ModalBottomSheet(
-                onDismissRequest = { sheetKey = null },
-                containerColor = Color(0xFF06161B),
-                contentColor = Color.White
-            ) {
-                Column(
-                    modifier = Modifier.fillMaxWidth().verticalScroll(rememberScrollState())
-                        .padding(horizontal = 20.dp, vertical = 6.dp),
-                    verticalArrangement = Arrangement.spacedBy(12.dp)
-                ) {
-                    Text(spec.label, fontSize = 19.sp, color = Color.White, fontWeight = FontWeight.Bold)
+        // R27.18: headphone monitoring shared Audio page readback. Candidate f1 only;
+        // original R27.17 B0 contradicted the physical icon, so this is not SET-ready.
+        // Existing 0x0647 GET collector and settings remain untouched.
+        if (pane == "MIC_LINE") {
+            AudioR2718MonitorReadOnlyRow(
+                linked = linked,
+                typedPageHex = pageFromCollector,
+                currentTypedPage = linked && !audioReadback.running &&
+                    collectorPage?.status == "TYPED_RX" &&
+                    collectorPage.responseType == 0x8647 &&
+                    r2630Source.isCurrentRx &&
+                    com.atomosremote.nativeapp.audio.AudioR26PageSnapshot.decode(pageFromCollector) != null,
+                refreshBusy = audioReadback.running,
+                onRefreshPage = { refreshGeneration += 1 }
+            )
+        }
+        // R26.53: recorder-focused compact UI. One REC sheet only. The verified
+        // common page supplies status, never a speculative per-control SET.
+        val r2653Page = com.atomosremote.nativeapp.audio.AudioR26PageSnapshot.decode(audioPageRawHex)
+        val r2653Enabled = r2653Page?.recordEnabledList.orEmpty().toSet()
+        val r2653Valid = r2653Page?.recordValidList.orEmpty().toSet()
+        val r2653Count = if (r2653Page == null) "-- / --" else
+            "${r2653Enabled.size} / ${r2653Valid.size}"
+        val r2653Fresh = linked && r2630Source.isCurrentRx && !audioReadback.running
+        val visibleRows = com.atomosremote.nativeapp.audio.AudioR2650ReadbackUi.enrich(
+            if (pane == "AUDIO") r2641Display.audio else r2641Display.micLine,
+            recLearnedPairs, audioPageRawHex)
+        if (pane == "AUDIO" && !r2695UnifiedUiActive) {
+            Text(com.atomosremote.nativeapp.audio.AudioR2673BatchAudit.synopsis(), color = Color(0xFF9FB7BB), fontSize = 10.sp)
+            // Headphones is the one level supported by a real value and min/max.
+            Surface(modifier = Modifier.fillMaxWidth().clickable { sheetKey = "AUDIO_PHONES" },
+                shape = RoundedCornerShape(14.dp), color = Color(0xFF0A2529),
+                border = androidx.compose.foundation.BorderStroke(1.dp, Color(0xFF31585E))) {
+                Column(Modifier.fillMaxWidth().padding(15.dp),
+                    verticalArrangement = Arrangement.spacedBy(10.dp)) {
                     Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
-                        Text("CURRENT VALUE", modifier = Modifier.weight(1f),
-                            color = Color(0xFF92A6AA), fontSize = 10.sp, fontWeight = FontWeight.Bold)
-                        Text(AudioR26ReadbackLabel(spec, audioReadback.values, meters?.rawHex.orEmpty()),
-                            color = Color(0xFFCCDBDE), fontSize = 12.sp)
+                        Column(Modifier.weight(1f)) {
+                            Text("HEADPHONES", color = Color.White, fontSize = 14.sp,
+                                fontWeight = FontWeight.Bold)
+                            Text("Recorder level", color = Color(0xFF9DB7BA), fontSize = 11.sp)
+                        }
+                        Text(if (r2653Page == null) "--" else "${r2653Page.phonesLevel}",
+                            color = AtomosCyan, fontWeight = FontWeight.Bold, fontSize = 21.sp)
                     }
-                    HorizontalDivider(color = Color(0xFF254048))
-                    Text("DEVICE UI OPTIONS", color = Color(0xFF91A4A8),
-                        fontSize = 10.sp, fontWeight = FontWeight.Bold)
-                    if (spec.deviceOptions.isEmpty()) {
-                        Text("Available values/range must be read from the recorder.",
-                            fontSize = 12.sp, color = Color(0xFFB4C0C3))
+                    val span = ((r2653Page?.phonesLevelMax ?: 1L) -
+                        (r2653Page?.phonesLevelMin ?: 0L)).coerceAtLeast(1L)
+                    val frac = if (r2653Page != null)
+                        ((r2653Page.phonesLevel - r2653Page.phonesLevelMin).toFloat() /
+                            span.toFloat()).coerceIn(0f, 1f) else 0f
+                    LinearProgressIndicator(progress = { frac },
+                        modifier = Modifier.fillMaxWidth().height(13.dp)
+                            .clip(RoundedCornerShape(7.dp)),
+                        color = AtomosCyan, trackColor = Color(0xFF29434A))
+                    Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+                        Text("${r2653Page?.phonesLevelMin ?: "--"}",
+                            color = Color(0xFF99B0B4), fontSize = 11.sp)
+                        Text("${r2653Page?.phonesLevelMax ?: "--"}",
+                            color = Color(0xFF99B0B4), fontSize = 11.sp)
+                    }
+                    Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.SpaceBetween) {
+                        Text(if (r2653Fresh) "Level synced from recorder" else "Last verified level",
+                            color = Color(0xFFAFC5C5), fontSize = 11.sp)
+                        TextButton(onClick = { refreshGeneration += 1 },
+                            enabled = linked && !audioReadback.running) {
+                            Text("READ NOW", color = if (linked) AtomosCyan else Color.Gray,
+                                fontSize = 10.sp, fontWeight = FontWeight.Bold)
+                        }
+                    }
+                    TextButton(onClick = { r2654LiveGet = !r2654LiveGet },
+                        enabled = linked, modifier = Modifier.fillMaxWidth()) {
+                        Text(if (r2654LiveGet) "LIVE LEVEL GET  /  ON  (6s)" else
+                            "LIVE LEVEL GET  /  OFF",
+                            color = if (r2654LiveGet) AtomosCyan else Color(0xFFBAC9CA),
+                            fontSize = 11.sp)
+                    }
+                    Text("The bar follows real AG2 headphone-level GET values (f2). " +
+                        "Touch-to-change volume is locked until PhonesLevelSet has " +
+                        "verified wire bytes, acknowledgement and GET-after-SET.",
+                        color = Color(0xFFAFC5C5), fontSize = 10.sp, lineHeight = 14.sp)
+                }
+            }
+            // One REC card replaces the old 6 tiles, duplicated raw list and individual sheets.
+            Surface(modifier = Modifier.fillMaxWidth().clickable { sheetKey = "REC_GROUP" },
+                shape = RoundedCornerShape(14.dp), color = Color(0xFF08272B),
+                border = androidx.compose.foundation.BorderStroke(1.dp, Color(0xFF39666B))) {
+                Row(Modifier.fillMaxWidth().padding(16.dp), verticalAlignment = Alignment.CenterVertically) {
+                    Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(5.dp)) {
+                        Text("CHANNEL REC", color = Color.White, fontSize = 14.sp,
+                            fontWeight = FontWeight.Bold)
+                        Text("$r2653Count enabled / valid", color = AtomosCyan,
+                            fontSize = 17.sp, fontWeight = FontWeight.Bold)
+                        Text("REC states + headphones monitor options",
+                            color = Color(0xFF9DB8BA), fontSize = 11.sp)
+                    }
+                    Text("VIEW  ›", color = AtomosCyan, fontSize = 12.sp,
+                        fontWeight = FontWeight.Bold)
+                }
+            }
+            // These are physically A/B-correlated field readbacks, NOT Android SETs.
+            Text("AUDIO ROUTING", color = Color(0xFF8EA9AD), fontSize = 11.sp,
+                fontWeight = FontWeight.Bold)
+            // Names are stable UI vocabulary. Do not invent physical mode meanings.
+            // The single-field A/B proved f9/f11 and f2. The f1 multi-field A/B
+            // was skipped; it remains a recorder-reported selector, not SET proof.
+            val monitorName = r2653Page?.let { pg -> "Source ${pg.monitor}" } ?: "Readback pending"
+            val orientationName = r2653Page?.let { pg ->
+                r2657NamedRaw.entries.firstOrNull { it.key.startsWith("AUDIO_ORIENTATION:") &&
+                    it.value == pg.orientation }?.key?.substringAfter(":") ?: "Position ${pg.orientation}"
+            } ?: "Readback pending"
+            val embedName = r2653Page?.let { pg ->
+                r2657NamedRaw.entries.firstOrNull { it.key.startsWith("AUDIO_EMBED:") &&
+                    it.value == pg.analogEmbed }?.key?.substringAfter(":") ?: "Option ${pg.analogEmbed}"
+            } ?: "Readback pending"
+            listOf(
+                Triple("AUDIO_MONITOR", "Analog monitor", monitorName),
+                Triple("AUDIO_ORIENTATION", "Meters orientation", orientationName),
+                Triple("AUDIO_EMBED", "Audio embedded", embedName),
+                Triple("AUDIO_DROPOUT", "Ignore Audio Dropouts", "GET pending")
+            ).forEach { (key, label, displayValue) ->
+                Surface(modifier = Modifier.fillMaxWidth().clickable {
+                        sheetKey = key; r2657PreviewKey = ""; r2657PreviewValue = null
+                    },
+                    shape = RoundedCornerShape(10.dp), color = Color(0xFF0A1F23),
+                    border = androidx.compose.foundation.BorderStroke(1.dp, Color(0xFF29464C))) {
+                    Row(Modifier.fillMaxWidth().padding(horizontal = 14.dp, vertical = 12.dp),
+                        verticalAlignment = Alignment.CenterVertically) {
+                        Text(label, modifier = Modifier.weight(1f), color = Color.White,
+                            fontSize = 12.sp)
+                        Text(displayValue, color = if (r2653Page == null)
+                            Color(0xFF8D9D9F) else AtomosCyan,
+                            fontSize = 12.sp, fontWeight = FontWeight.SemiBold)
+                        Text("  ›", color = AtomosCyan, fontSize = 12.sp)
+                    }
+                }
+            }
+            Text("Tap a setting to view the recorder-supported values. " +
+                "Recorder changes are reflected by GET; Android SET is still unverified.",
+                color = Color(0xFFAFC4C4), fontSize = 10.sp, lineHeight = 15.sp)
+        } else if (pane == "MIC_LINE" && !r2695UnifiedUiActive) {
+            Surface(shape = RoundedCornerShape(14.dp), color = Color(0xFF102328),
+                border = androidx.compose.foundation.BorderStroke(1.dp, Color(0xFF47575A))) {
+                Column(Modifier.fillMaxWidth().padding(16.dp),
+                    verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Text("MIC / LINE", color = Color.White, fontSize = 16.sp,
+                        fontWeight = FontWeight.Bold)
+                    Text("Independent recorder GET not yet verified", color = Color(0xFFD8BC81),
+                        fontSize = 13.sp, fontWeight = FontWeight.SemiBold)
+                    Text("Use the Mic/Line cards above to open bottom-sheet trials for " +
+                        "Left gain, Right gain, Audio delay and Audio-in level. " +
+                        "These are experimental candidate GET/SET actions based on " +
+                        "official macOS method names; refresh the shared Audio GET " +
+                        "after every trial to verify any recorder-side change.",
+                        color = Color(0xFFB9CBCB), fontSize = 12.sp, lineHeight = 18.sp)
+                }
+            }
+        }
+        // R26.57: Additive bottom sheets. Existing three routing cards, one REC
+        // sheet and headphones bar stay in exactly their R26.54 locations.
+        // NEVER present a local radio choice as sent to AG2. The only GET remains 0x0647.
+        if (pane == "AUDIO" && sheetKey in setOf("AUDIO_MONITOR", "AUDIO_ORIENTATION",
+                "AUDIO_EMBED", "AUDIO_DROPOUT", "AUDIO_PHONES")) {
+            val openedKey = sheetKey.orEmpty()
+            val title = when (openedKey) {
+                "AUDIO_MONITOR" -> "ANALOG MONITOR"
+                "AUDIO_ORIENTATION" -> "METERS ORIENTATION"
+                "AUDIO_EMBED" -> "AUDIO EMBEDDED"
+                "AUDIO_DROPOUT" -> "IGNORE AUDIO DROPOUTS"
+                else -> "HEADPHONES LEVEL"
+            }
+            val getValue: Long? = r2653Page?.let { pg ->
+                when (openedKey) {
+                    "AUDIO_MONITOR" -> pg.monitor
+                    "AUDIO_ORIENTATION" -> pg.orientation
+                    "AUDIO_EMBED" -> pg.analogEmbed
+                    "AUDIO_PHONES" -> pg.phonesLevel
+                    else -> null
+                }
+            }
+            val optionIds: List<Long> = r2653Page?.let { pg ->
+                when (openedKey) {
+                    "AUDIO_MONITOR" -> pg.monitorList.map { it.toLong() }.distinct()
+                    "AUDIO_ORIENTATION" -> if (pg.orientationChangeable != 0L) listOf(0L, 1L) else listOf(pg.orientation)
+                    "AUDIO_EMBED" -> pg.analogEmbedList.map { it.toLong() }.distinct()
+                    else -> emptyList()
+                }
+            } ?: emptyList()
+            val isPreviewing = r2657PreviewKey == openedKey && r2657PreviewValue != null
+            ModalBottomSheet(onDismissRequest = { sheetKey = null; r2665TrialArmed = false },
+                containerColor = Color(0xFF071B20), contentColor = Color.White) {
+                Column(Modifier.fillMaxWidth().fillMaxHeight(0.75f)
+                    .verticalScroll(rememberScrollState()).padding(18.dp),
+                    verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                    Text(title, fontSize = 19.sp, fontWeight = FontWeight.Bold, color = Color.White)
+                    Text(if (r2653Fresh) "Connected AG2 | fresh Audio GET" else "Readback pending / last verified",
+                        color = if (r2653Fresh) AtomosCyan else Color(0xFFB4A17E), fontSize = 12.sp)
+                    Text(if (getValue == null) "Recorder status: Not reported by current Audio GET"
+                        else "Recorder status: $getValue (wire value)",
+                        color = Color(0xFFB9D3D3), fontSize = 12.sp)
+                    if (openedKey == "AUDIO_PHONES") {
+                        val minimum = r2653Page?.phonesLevelMin ?: 0L
+                        val maximum = r2653Page?.phonesLevelMax ?: 1L
+                        val level = r2653Page?.phonesLevel ?: minimum
+                        val fraction = ((level - minimum).toFloat() /
+                            (maximum - minimum).coerceAtLeast(1L).toFloat()).coerceIn(0f, 1f)
+                        LinearProgressIndicator(progress = { fraction },
+                            modifier = Modifier.fillMaxWidth().height(9.dp), color = AtomosCyan,
+                            trackColor = Color(0xFF2F464C))
+                        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+                            Text("Min $minimum", color = Color(0xFFADC3C5), fontSize = 11.sp)
+                            Text("$level / $maximum", color = AtomosCyan, fontSize = 13.sp)
+                        }
+                        Text("Experimental Audio SET test: value uses recorder GET range. " +
+                            "Opcode/payload candidate is NOT official-ACK verified. " +
+                            "Only press TEST when recorder is idle; confirm physical result.",
+                            color = Color(0xFFE4C391), fontSize = 11.sp)
+                        val minInt = minimum.toInt().coerceIn(0, 127)
+                        val maxInt = maximum.toInt().coerceIn(minInt, 127)
+                        if (maxInt > minInt) {
+                            val draft = if (r2665PhonesDraft in minInt..maxInt) r2665PhonesDraft
+                                else level.toInt().coerceIn(minInt, maxInt)
+                            Slider(value = draft.toFloat(),
+                                onValueChange = { r2665PhonesDraft = it.toInt().coerceIn(minInt, maxInt) },
+                                valueRange = minInt.toFloat()..maxInt.toFloat(),
+                                steps = (maxInt - minInt - 1).coerceAtLeast(0),
+                                enabled = linked && r2653Fresh && !audioReadback.running)
+                            Text("Trial target $draft | Recorder GET $level", color = AtomosCyan,
+                                fontSize = 12.sp)
+                            Button(onClick = {
+                                val sent = vm.r2665TryAudioSet("phones", draft)
+                                r2665LastTrialStatus = if (sent)
+                                    "TRIAL QUEUED: inspect recorder, then READ NOW to verify"
+                                    else "BLOCKED: refresh GET, choose different value, or wait for idle"
+                                r2665TrialArmed = false
+                            }, enabled = r2665TrialArmed && linked && r2653Fresh &&
+                                !audioReadback.running && draft.toLong() != level,
+                                modifier = Modifier.fillMaxWidth()) {
+                                Text("TEST PHONES SET (ONE COMMAND)")
+                            }
+                        }
+                    } else if (openedKey == "AUDIO_DROPOUT") {
+                        Text("OFF / ON", color = Color.White, fontSize = 15.sp)
+                        Text("The exact separate recorder GET/SET for Ignore Audio Dropouts " +
+                            "has not been isolated. No guessed switch is enabled.",
+                            color = Color(0xFFE4C391), fontSize = 11.sp)
                     } else {
-                        spec.deviceOptions.forEach { option ->
-                            Surface(
-                                shape = RoundedCornerShape(11.dp),
-                                color = Color(0xFF0A1B20),
-                                border = androidx.compose.foundation.BorderStroke(1.dp, Color(0xFF30474E))
-                            ) {
-                                Row(Modifier.fillMaxWidth().padding(horizontal = 14.dp, vertical = 14.dp),
+                        Text("RECORDER-REPORTED OPTIONS", color = AtomosCyan,
+                            fontSize = 12.sp, fontWeight = FontWeight.Bold)
+                        val visibleChoices = (optionIds + listOfNotNull(getValue)).distinct()
+                        if (visibleChoices.isEmpty()) {
+                            Text("No independently verified choices in current readback.",
+                                color = Color(0xFFE4C391), fontSize = 12.sp)
+                        } else {
+                            visibleChoices.forEach { code ->
+                                val selectedByRecorder = code == getValue
+                                val label = when (openedKey) {
+                                    "AUDIO_ORIENTATION" -> when (code) {
+                                        0L -> "Orientation option 0"
+                                        1L -> "Orientation option 1"
+                                        else -> "Orientation option $code"
+                                    }
+                                    "AUDIO_EMBED" -> "Embed option $code (Off / 1/2 / 3/4 need physical label mapping)"
+                                    else -> "Monitor source $code"
+                                }
+                                Surface(modifier = Modifier.fillMaxWidth().clickable {
+                                        r2657PreviewKey = openedKey
+                                        r2657PreviewValue = code
+                                        Log.i("AtomRemoteAudioR2657", "LOCAL_OPTION_PREVIEW key=$openedKey " +
+                                            "choice=$code recorderValue=$getValue setTx=false")
+                                    }, color = if (selectedByRecorder) Color(0xFF143C40)
+                                        else Color(0xFF0A2227), shape = RoundedCornerShape(9.dp),
+                                    border = androidx.compose.foundation.BorderStroke(1.dp,
+                                        if (selectedByRecorder) AtomosCyan else Color(0xFF28474B))) {
+                                    Row(Modifier.fillMaxWidth().padding(10.dp),
+                                        verticalAlignment = Alignment.CenterVertically) {
+                                        RadioButton(selected = selectedByRecorder,
+                                            onClick = null, enabled = false)
+                                        Text(label, color = Color.White, fontSize = 12.sp,
+                                            modifier = Modifier.weight(1f))
+                                        if (selectedByRecorder) Text("RECORDER", color = AtomosCyan,
+                                            fontSize = 10.sp)
+                                    }
+                                }
+                            }
+                        }
+                        val physicalNames = when (openedKey) {
+                            "AUDIO_ORIENTATION" -> listOf("Vertical", "Horizontal")
+                            "AUDIO_EMBED" -> listOf("Off", "1/2", "3/4")
+                            else -> emptyList()
+                        }
+                        if (physicalNames.isNotEmpty()) {
+                            HorizontalDivider(color = Color(0xFF315358))
+                            Text("CALIBRATE PHYSICAL RECORDER LABEL", color = AtomosCyan,
+                                fontSize = 12.sp, fontWeight = FontWeight.Bold)
+                            Text("First select the named mode on the physical recorder, " +
+                                "tap READ NOW, then confirm the matching name below. " +
+                                "This only saves a display label for this BLE recorder.",
+                                color = Color(0xFFAFC4C4), fontSize = 11.sp)
+                            physicalNames.forEach { name ->
+                                val compound = "$openedKey:$name"
+                                val stored = r2657NamedRaw[compound]
+                                TextButton(onClick = {
+                                    if (r2653Fresh && getValue != null &&
+                                        getValue in visibleChoices && r2657Device.isNotEmpty()) {
+                                        val conflicting = r2657NamedRaw.keys.filter { k ->
+                                            k.startsWith("$openedKey:") &&
+                                                (k == compound || r2657NamedRaw[k] == getValue)
+                                        }
+                                        val editor = r2657NamePrefs.edit()
+                                        conflicting.forEach { k -> editor.remove("$r2657Device/$k") }
+                                        editor.putLong("$r2657Device/$compound", getValue).apply()
+                                        r2657NamedRaw = (r2657NamedRaw - conflicting.toSet()) + (compound to getValue)
+                                        Log.i("AtomRemoteAudioR2657", "PHYSICAL_LABEL_LOCAL " +
+                                            "device=$r2657Device key=$openedKey name=$name " +
+                                            "raw=$getValue generation=${audioReadback.generation} setTx=false")
+                                    }
+                                }, enabled = r2653Fresh && getValue != null &&
+                                    getValue in visibleChoices && r2657Device.isNotEmpty()) {
+                                    Text("${if (stored == getValue) "✓ " else ""}Confirm $name = current recorder value " +
+                                        "${getValue ?: "--"}", color = AtomosCyan, fontSize = 12.sp)
+                                }
+                            }
+                        }
+                        if (isPreviewing) {
+                            Text("Selected option ${r2657PreviewValue} is staged for an explicit trial. " +
+                                "Recorder has NOT changed yet.",
+                                color = Color(0xFFE4C391), fontSize = 12.sp)
+                            val trialKey = when (openedKey) {
+                                "AUDIO_MONITOR" -> "monitor"
+                                "AUDIO_ORIENTATION" -> "orientation"
+                                "AUDIO_EMBED" -> "embed"
+                                else -> ""
+                            }
+                            val selectedTrial = r2657PreviewValue?.toInt()
+                            if (trialKey.isNotEmpty() && selectedTrial != null) {
+                                Button(onClick = {
+                                    val queued = vm.r2665TryAudioSet(trialKey, selectedTrial)
+                                    r2665LastTrialStatus = if (queued)
+                                        "TRIAL QUEUED: check recorder, then READ NOW"
+                                        else "BLOCKED: refresh GET, different value or busy transport"
+                                    r2665TrialArmed = false
+                                }, enabled = r2665TrialArmed && linked && r2653Fresh &&
+                                    !audioReadback.running && r2657PreviewValue != getValue,
+                                    modifier = Modifier.fillMaxWidth()) {
+                                    Text("TEST DEVICE SET (ONE COMMAND)")
+                                }
+                            }
+                        }
+                        Text("For physical change, select on Shogun Ultra and tap READ NOW. " +
+                            "Android SET will unlock only after TX + ACK + GET-after-SET proof.",
+                            color = Color(0xFFA9C3C4), fontSize = 11.sp)
+                    }
+                    HorizontalDivider(color = Color(0xFF315358))
+                    Text("R26.65 EXPERIMENTAL SET PILOT (NOT YET DEVICE-VERIFIED)",
+                        color = Color(0xFFE4C391), fontSize = 11.sp, fontWeight = FontWeight.Bold)
+                    Text("Stops at one candidate command. Never automatic. " +
+                        "Use only while recorder is NOT recording. Physical result and fresh GET " +
+                        "must both be checked. No NDI commands are involved.",
+                        color = Color(0xFFA9C3C4), fontSize = 11.sp)
+                    Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                        Checkbox(checked = r2665TrialArmed,
+                            onCheckedChange = { r2665TrialArmed = it })
+                        Text("Arm ONE Audio SET test", color = Color.White, fontSize = 12.sp)
+                    }
+                    if (r2665LastTrialStatus.isNotEmpty())
+                        Text(r2665LastTrialStatus, color = AtomosCyan, fontSize = 11.sp)
+                    Button(onClick = { if (linked && !audioReadback.running) refreshGeneration += 1 },
+                        enabled = linked && !audioReadback.running, modifier = Modifier.fillMaxWidth()) {
+                        Text("READ NOW (RECORDER GET)")
+                    }
+                    Text("Experimental candidate SET, no verified AG2 ACK yet. " +
+                        "REC and Dropouts SET are NOT enabled.",
+                        color = Color(0xFFE4C391), fontSize = 11.sp)
+                    TextButton(onClick = { sheetKey = null }) { Text("CLOSE", color = AtomosCyan) }
+                }
+            }
+        }
+        // All channel statuses and headphone-source choices live in ONE REC sheet.
+        if (pane == "AUDIO" && sheetKey == "REC_GROUP") {
+            ModalBottomSheet(onDismissRequest = { sheetKey = null },
+                containerColor = Color(0xFF071B20), contentColor = Color.White) {
+                Column(Modifier.fillMaxWidth().fillMaxHeight(0.84f)
+                    .verticalScroll(rememberScrollState()).padding(18.dp),
+                    verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                    Text("CHANNEL REC & HEADPHONES", fontSize = 19.sp,
+                        fontWeight = FontWeight.Bold, color = Color.White)
+                    Text("$r2653Count recorder-enabled / valid IDs",
+                        color = AtomosCyan, fontSize = 14.sp)
+                    Text(if (r2653Fresh) "Fresh 0x8647 readback" else "Last verified readback - refresh Audio",
+                        color = Color(0xFF91AAAE), fontSize = 10.sp)
+                    Text("REC statuses are read from f3 and f4. ID names require " +
+                        "one-switch physical calibration. No hardware SET is sent by these controls.",
+                        color = Color(0xFFAFC3C5), fontSize = 11.sp, lineHeight = 16.sp)
+                    if (recLiveStates.isEmpty()) {
+                        Text("No valid recorder REC list in current GET.",
+                            color = Color(0xFFD2B47B), fontSize = 12.sp)
+                    } else {
+                        recLiveStates.forEach { item ->
+                            val match = recLearnedPairs.entries.firstOrNull { it.value == item.id }
+                            val name = when (match?.key) {
+                                "ch12" -> "CH 1/2"; "ch34" -> "CH 3/4"
+                                "ch56" -> "CH 5/6"; "ch78" -> "CH 7/8"
+                                "ch910" -> "CH 9/10"; "ch1112" -> "CH 11/12"
+                                else -> "Recorder ID ${item.id}"
+                            }
+                            Surface(shape = RoundedCornerShape(9.dp),
+                                color = Color(0xFF112C30)) {
+                                Row(Modifier.fillMaxWidth().padding(10.dp),
                                     verticalAlignment = Alignment.CenterVertically) {
-                                    Text("○", color = Color(0xFF78888C), fontSize = 18.sp)
-                                    Spacer(Modifier.width(13.dp))
-                                    Text(option, color = Color(0xFFB6C2C5), fontSize = 14.sp)
-                                    Spacer(Modifier.weight(1f))
-                                    Text("LOCKED", color = Color(0xFF637980), fontSize = 9.sp)
+                                    Column(Modifier.weight(1f)) {
+                                        Text(name, color = Color.White, fontSize = 12.sp,
+                                            fontWeight = FontWeight.SemiBold)
+                                        Text("ID ${item.id} | ${if (item.enabled) "REC ON" else "REC OFF"}",
+                                            color = if (item.enabled) AtomosCyan else Color(0xFF9EAEB0),
+                                            fontSize = 11.sp)
+                                    }
+                                    Switch(checked = item.enabled, onCheckedChange = null,
+                                        enabled = false)
                                 }
                             }
                         }
                     }
-                    Text("OFFICIAL macOS AUDIO KEYS", color = Color(0xFF91A4A8),
-                        fontSize = 10.sp, fontWeight = FontWeight.Bold)
-                    if (spec.macMethods.isEmpty()) {
-                        Text("Exact method not established from supplied RemoteApi class list.",
-                            color = Color(0xFFB5C3C6), fontSize = 11.sp)
-                    } else {
-                        spec.macMethods.forEach { name ->
-                            Text("Audio.$name", color = AtomosCyan, fontSize = 11.sp)
+                    HorizontalDivider(color = Color(0xFF315358))
+                    Text("HEADPHONES MONITOR SOURCE", color = AtomosCyan,
+                        fontWeight = FontWeight.Bold, fontSize = 12.sp)
+                    Text("This is the recorder's reported monitor-source selector. " +
+                        "Its choices are not confirmed REC channel labels. " +
+                        "Selection remains read-only until exact MonitorSet is verified.",
+                        color = Color(0xFFADBDC0), fontSize = 11.sp, lineHeight = 16.sp)
+                    r2653Page?.monitorList?.distinct()?.forEach { choice ->
+                        Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                            RadioButton(selected = r2653Page?.monitor == choice,
+                                onClick = null, enabled = false)
+                            Text("Source option $choice", color = Color(0xFFD7E4E5),
+                                fontSize = 12.sp)
                         }
                     }
-                    val part2Plans = AudioR26Part2Plan.forKey(spec.key)
-                    if (part2Plans.isNotEmpty()) {
-                        HorizontalDivider(color = Color(0xFF254048))
-                        Text("PART 2 IMPLEMENTATION GATES", color = AtomosCyan,
-                            fontSize = 10.sp, fontWeight = FontWeight.Bold)
-                        part2Plans.forEach { plan ->
-                            Text("${plan.phase} - ${plan.title}", color = Color.White,
-                                fontSize = 12.sp, fontWeight = FontWeight.Bold)
-                            Text(plan.acceptance, color = Color(0xFF9BB0B5),
-                                fontSize = 11.sp, lineHeight = 16.sp)
+                    HorizontalDivider(color = Color(0xFF315358))
+                    Text("REC CHANNEL LABEL CALIBRATION", color = AtomosCyan,
+                        fontWeight = FontWeight.Bold, fontSize = 12.sp)
+                    Text("Optional: choose a channel below, toggle exactly that " +
+                        "physical REC option on AG2, tap Audio REFRESH, then confirm its ID.",
+                        color = Color(0xFFA5BDC0), fontSize = 11.sp, lineHeight = 15.sp)
+                    val channelLabels = listOf("ch12" to "CH 1/2", "ch34" to "CH 3/4",
+                        "ch56" to "CH 5/6", "ch78" to "CH 7/8",
+                        "ch910" to "CH 9/10", "ch1112" to "CH 11/12")
+                    channelLabels.chunked(2).forEach { group ->
+                        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                            group.forEach { (key, label) ->
+                                val mappedId = recLearnedPairs[key]
+                                OutlinedButton(onClick = {
+                                    if (r2653Fresh && recLiveStates.isNotEmpty()) {
+                                        recPendingPair = key to audioPageRawHex
+                                        recPendingGeneration = audioReadback.generation
+                                        recCandidate = null
+                                        recCalibrationNotice = "Change physical $label, then REFRESH"
+                                    } else recCalibrationNotice = "Wait for fresh Audio GET"
+                                }, modifier = Modifier.weight(1f), enabled = mappedId == null && r2653Fresh) {
+                                    Text(if (mappedId == null) "LEARN $label" else "$label = ID $mappedId",
+                                        fontSize = 10.sp, maxLines = 1)
+                                }
+                            }
                         }
                     }
-                    Text(AudioR26Part2Plan.readiness(spec.key),
-                        color = Color(0xFFD5B47C), fontSize = 10.sp)
-                    Text(spec.evidenceNote, color = Color(0xFF91A4A8), fontSize = 11.sp)
-                    Text(
-                        "Read-only until exact command/response IDs, payload schema and AG2 readback are proven. " +
-                            "Options shown above come from device/macOS screenshots; tapping cannot send a SET.",
-                        color = Color(0xFFD5B47C), fontSize = 11.sp, lineHeight = 16.sp
-                    )
-                    TextButton(onClick = { sheetKey = null }, modifier = Modifier.fillMaxWidth()) {
-                        Text("CLOSE", color = AtomosCyan, fontWeight = FontWeight.Bold)
+                    if (recPendingPair != null) {
+                        Text("Learning ${recPendingPair?.first}: ${recCalibrationNotice}",
+                            color = AtomosCyan, fontSize = 11.sp)
+                        val candidate = recCandidate
+                        if (candidate != null) {
+                            val canConfirm = com.atomosremote.nativeapp.audio.AudioR2647RecProof.canConfirm(
+                                candidate, recPendingPair!!.first, recLearnedPairs, linked,
+                                audioReadback.generation, audioPageRawHex) && r2653Fresh
+                            Text("Physical change: ID ${candidate.rawId} → ${if (candidate.switchedOn) "ON" else "OFF"}",
+                                color = Color(0xFFDDC78C), fontSize = 11.sp)
+                            TextButton(onClick = {
+                                if (canConfirm) {
+                                    val updated = recLearnedPairs + (candidate.targetKey to candidate.rawId)
+                                    recCalibrationPrefs.edit().putString(recMappingPrefKey,
+                                        com.atomosremote.nativeapp.audio.AudioRecCalibratedChannels
+                                            .encodeSaved(updated)).apply()
+                                    recLearnedPairs = updated
+                                    recPendingPair = null; recCandidate = null
+                                    recPendingGeneration = -1
+                                    recCalibrationNotice = "Mapped ID ${candidate.rawId} locally, no SET"
+                                    Log.i("AtomRemoteAudioR2647", "REC_MAPPING_CONFIRMED " +
+                                        "label=${candidate.targetKey} rawId=${candidate.rawId} " +
+                                        "generation=${candidate.observedGeneration} audioSetTx=false")
+                                }
+                            }, enabled = canConfirm) {
+                                Text("CONFIRM REC ID", color = if (canConfirm) AtomosCyan else Color.Gray)
+                            }
+                        }
+                        TextButton(onClick = {
+                            recPendingPair = null; recCandidate = null
+                            recPendingGeneration = -1
+                        }) { Text("CANCEL LEARN", color = Color(0xFFBAC8C9)) }
                     }
-                    Spacer(Modifier.height(10.dp))
+                    TextButton(onClick = {
+                        if (linked && !audioReadback.running) refreshGeneration += 1
+                    }, enabled = linked && !audioReadback.running) {
+                        Text("REFRESH RECORDER GET", color = AtomosCyan)
+                    }
+                    Text("REC switch and headphone source selection are shown " +
+                        "as read-only because full AG2 SET bytes and typed replies are unproven.",
+                        color = Color(0xFFCCAE7A), fontSize = 11.sp, lineHeight = 16.sp)
+                    TextButton(onClick = { sheetKey = null }) { Text("CLOSE", color = AtomosCyan) }
                 }
+            }
+        }
+        Text(if (r2641Advanced) "Hide diagnostics" else "Advanced Audio diagnostics",
+            color = Color(0xFF8FA9AB), fontSize = 11.sp,
+            modifier = Modifier.fillMaxWidth().clickable { r2641Advanced = !r2641Advanced }
+                .padding(vertical = 9.dp))
+        if (r2641Advanced) {
+            // Original discovery utilities remain under Advanced, not in the main UI.
+            AudioR2627_29ReadbackStatusPanel(r2627Diagnosis.title, r2627Diagnosis.detail,
+                audioReadback.generation, audioReadback.running)
+            AudioR2630PrimaryPanel(r2630Source)
+            AudioR2631_33ComparePanel(
+                currentPageHex = audioPageRawHex,
+                freshTypedRx = r2630Source.isCurrentRx && haveMeterPayload,
+                running = audioReadback.running, linked = linked,
+                hasBaseline = r2631BaselineGeneration >= 0,
+                generation = audioReadback.generation, comparison = r2631Comparison,
+                saveBaseline = {
+                    if (r2630Source.isCurrentRx && haveMeterPayload && !audioReadback.running) {
+                        r2631BaselineHex = audioPageRawHex
+                        r2631BaselineGeneration = audioReadback.generation
+                    }
+                },
+                refreshAndCompare = { if (linked && !audioReadback.running) refreshGeneration += 1 },
+                clearBaseline = { r2631BaselineHex = ""; r2631BaselineGeneration = -1 }
+            )
+            AudioR2634_36CalibrationPanel(
+                selectedTarget = r2634Target, onTargetSelected = { r2634Target = it },
+                linked = linked, comparison = r2631Comparison,
+                evidence = r2634Observations, assessment = r2634Assessment,
+                onRecord = {
+                    val observation = com.atomosremote.nativeapp.audio.AudioR2634_36Calibration.observe(
+                        r2634Target, r2631BaselineHex, audioPageRawHex,
+                        r2631BaselineGeneration, audioReadback.generation,
+                        r2630Source.isCurrentRx, audioReadback.running)
+                    if (observation != null && r2634Observations.none {
+                            it.currentGeneration == observation.currentGeneration
+                        }) r2634Observations = r2634Observations + observation
+                }, onClear = { r2634Observations = emptyList() }
+            )
+            // Retain R26.51 A/B testing without restoring the removed per-control sheets.
+            Text("PHYSICAL A/B PROOF (NO SET)", color = AtomosCyan,
+                fontWeight = FontWeight.Bold, fontSize = 12.sp)
+            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+                listOf("analogMonitor", "phones", "orientation", "embed").forEach { key ->
+                    TextButton(onClick = { r2653ProofKey = key },
+                        modifier = Modifier.weight(1f)) {
+                        Text(when (key) {
+                            "analogMonitor" -> "Monitor"; "phones" -> "Phones"
+                            "orientation" -> "Meters"; else -> "Embed"
+                        }, color = if (r2653ProofKey == key) AtomosCyan else Color.Gray,
+                            fontSize = 10.sp)
+                    }
+                }
+            }
+            val r2653Verifier = com.atomosremote.nativeapp.audio.AudioR2651SetVerification
+            if (r2651BaseKey == r2653ProofKey) {
+                val proof = r2653Verifier.comparePhysical(r2653ProofKey,
+                    r2651BaseHex, audioPageRawHex, r2651BaseGen,
+                    audioReadback.generation, linked, r2630Source.isCurrentRx,
+                    audioReadback.running, recLearnedPairs)
+                Text("A/B ${proof.status} | ${proof.detail}",
+                    color = if (proof.physicalEvidence) AtomosCyan else Color(0xFFD4BB86),
+                    fontSize = 11.sp, lineHeight = 15.sp)
+                LaunchedEffect(r2653ProofKey, proof.status, proof.before, proof.after) {
+                    if (proof.physicalEvidence) Log.i("AtomRemoteAudioR2651",
+                        "PHYSICAL_AB_CONFIRMED device=${selected?.address.orEmpty()} " +
+                            "key=$r2653ProofKey field=${proof.changedField} " +
+                            "before=${proof.before} after=${proof.after} setTx=false pageRx=0x8647")
+                }
+            }
+            Row(Modifier.fillMaxWidth()) {
+                val canSave = r2653Fresh && audioPageRawHex.isNotEmpty()
+                TextButton(onClick = {
+                    r2651BaseKey = r2653ProofKey
+                    r2651BaseHex = audioPageRawHex
+                    r2651BaseGen = audioReadback.generation
+                    Log.i("AtomRemoteAudioR2651", "PHYSICAL_AB_BASELINE " +
+                        "device=${selected?.address.orEmpty()} key=$r2653ProofKey " +
+                        "generation=$r2651BaseGen payload=$r2651BaseHex setTx=false")
+                }, enabled = canSave) { Text("SAVE BASELINE", color = AtomosCyan, fontSize = 11.sp) }
+                TextButton(onClick = {
+                    val accepted = vm.refreshRecoveredAudioR26()
+                    Log.i("AtomRemoteAudioR2651", "PHYSICAL_AB_REFRESH " +
+                        "device=${selected?.address.orEmpty()} key=$r2653ProofKey " +
+                        "accepted=$accepted setTx=false")
+                }, enabled = linked && !audioReadback.running) {
+                    Text("REFRESH GET", color = AtomosCyan, fontSize = 11.sp)
+                }
+            }
+            Text("A/B only proves a physical recorder change. Android SET is not enabled.",
+                color = Color(0xFFBBA983), fontSize = 10.sp)
+            AudioR26VerifiedPagePanel(haveMeterPayload, audioPageRawHex, wireInspection)
+        }
+        LaunchedEffect(pane, r2641Display.verified, r2630Source.origin) {
+            Log.i("AtomRemoteAudioR2642", "SCREEN pane=$pane verified=${if (pane == "AUDIO") r2641Display.verified else false} " +
+                "origin=${if (pane == "AUDIO") r2630Source.origin else "NO_INDEPENDENT_MICLINE_RX"} rows=${visibleRows.size} " +
+                "compactUi=true audioSetTx=false")
+        }
+        } // R27.19: dormant legacy Audio/MicLine UI
+    }
+
+}
+
+// R26.46: compact Monitor-style channel pairs inside the REC routing module.
+// A raw enabled ID list must not be presented as verified per-pair REC state.
+@Composable
+private fun AudioR2646ChannelPairTile(
+    row: com.atomosremote.nativeapp.audio.AudioR2641Presentation.Row,
+    onClick: () -> Unit
+) {
+    Surface(modifier = Modifier.fillMaxWidth().clickable(onClick = onClick),
+        shape = RoundedCornerShape(11.dp), color = Color(0xFF071B20),
+        border = androidx.compose.foundation.BorderStroke(1.dp, Color(0xFF2F4A51))) {
+        Column(Modifier.fillMaxWidth().padding(horizontal = 13.dp, vertical = 13.dp),
+            verticalArrangement = Arrangement.spacedBy(6.dp)) {
+            Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                Text(row.label, modifier = Modifier.weight(1f), color = Color.White,
+                    fontSize = 12.sp, fontWeight = FontWeight.SemiBold)
+                Text("›", color = Color(0xFFBBD0D3), fontSize = 20.sp)
+            }
+            Text("REC / MONITOR", color = Color(0xFF8CA5A9), fontSize = 9.sp)
+            Text(if (row.evidence == com.atomosremote.nativeapp.audio.AudioR2641Presentation.Evidence.NOT_REPORTED)
+                    "Readback pending" else row.value,
+                color = Color(0xFF9EB6BA), fontSize = 11.sp)
+        }
+    }
+}
+
+// R26.42: all options visible, read-only status is explicit.
+@Composable
+private fun AudioR2641ValueCard(
+    row: com.atomosremote.nativeapp.audio.AudioR2641Presentation.Row,
+    onClick: () -> Unit
+) {
+    val confirmed = row.evidence == com.atomosremote.nativeapp.audio.AudioR2641Presentation.Evidence.AG2_CALIBRATED
+    val pending = row.evidence == com.atomosremote.nativeapp.audio.AudioR2641Presentation.Evidence.NOT_REPORTED
+    Surface(modifier = Modifier.fillMaxWidth().clickable(onClick = onClick),
+        shape = RoundedCornerShape(12.dp), color = Color(0xFF071B20),
+        border = androidx.compose.foundation.BorderStroke(1.dp, Color(0xFF2F4A51))) {
+        Column(Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 14.dp),
+            verticalArrangement = Arrangement.spacedBy(6.dp)) {
+            Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                Text("◇", color = AtomosCyan, fontSize = 18.sp)
+                Spacer(Modifier.width(11.dp))
+                Text(row.label, modifier = Modifier.weight(1f), color = Color.White,
+                    fontSize = 13.sp, fontWeight = FontWeight.SemiBold)
+                Column(horizontalAlignment = Alignment.End) {
+                    Text(row.value, color = when {
+                        confirmed -> AtomosCyan
+                        pending -> Color(0xFF839DA0)
+                        else -> Color(0xFFC6DBDE)
+                    }, fontSize = if (pending) 11.sp else 13.sp,
+                        fontWeight = FontWeight.SemiBold)
+                    Text(when {
+                        confirmed -> "AG2 calibrated"
+                        pending -> "Readback pending"
+                        else -> "Raw recorder value"
+                    }, color = Color(0xFF7F999E), fontSize = 9.sp)
+                }
+                Spacer(Modifier.width(7.dp))
+                Text("›", color = Color(0xFFBCCDD0), fontSize = 22.sp)
             }
         }
     }
 }
 
+@Composable
+private fun AudioR2641NoData(pane: String, linked: Boolean, running: Boolean) {
+    Surface(modifier = Modifier.fillMaxWidth(), shape = RoundedCornerShape(13.dp),
+        color = Color(0xFF081C20),
+        border = androidx.compose.foundation.BorderStroke(1.dp, Color(0xFF29474D))) {
+        Column(Modifier.fillMaxWidth().padding(20.dp),
+            verticalArrangement = Arrangement.spacedBy(10.dp)) {
+            Text(if (pane == "Mic / Line") "Mic / Line" else "Audio readback",
+                color = Color.White, fontSize = 17.sp, fontWeight = FontWeight.Bold)
+            Text(when {
+                !linked -> "Connect to your AG2 to read its current settings."
+                pane == "Mic / Line" -> "AG2 has not supplied independent Mic/Line gain, input source or delay readback. Unsupported controls are hidden."
+                running -> "Waiting for the AG2 configuration response."
+                else -> "No valid configuration reply yet. Use Refresh to retry."
+            }, color = Color(0xFF9CB2B6), fontSize = 12.sp, lineHeight = 18.sp)
+        }
+    }
+}
+
+// R26.31-33: real recorder before/after configuration evidence, not a fake SET slider.
+@Composable
+private fun AudioR2631_33ComparePanel(
+    currentPageHex: String,
+    freshTypedRx: Boolean,
+    running: Boolean,
+    linked: Boolean,
+    hasBaseline: Boolean,
+    generation: Int,
+    comparison: com.atomosremote.nativeapp.audio.AudioR2631_33Proof.Comparison,
+    saveBaseline: () -> Unit,
+    refreshAndCompare: () -> Unit,
+    clearBaseline: () -> Unit
+) {
+    val proof = com.atomosremote.nativeapp.audio.AudioR2631_33Proof
+    Card(
+        modifier = Modifier.fillMaxWidth(),
+        shape = RoundedCornerShape(12.dp),
+        colors = CardDefaults.cardColors(containerColor = Color(0xFF0A2425)),
+        border = androidx.compose.foundation.BorderStroke(1.dp, Color(0xFF316368))
+    ) {
+        Column(Modifier.fillMaxWidth().padding(12.dp),
+            verticalArrangement = Arrangement.spacedBy(7.dp)) {
+            Text("RECORDER AUDIO CHECK | R26.31-33", color = AtomosCyan,
+                fontSize = 11.sp, fontWeight = FontWeight.Bold)
+            Text("Real device page: 0x0647 → 0x8647  |  refresh generation $generation",
+                color = Color(0xFFB5D1D3), fontSize = 10.sp)
+            var showR2631RawRows by remember { mutableStateOf(false) }
+            if (freshTypedRx) {
+                Text(
+                    if (showR2631RawRows) "Hide full recorder configuration" else "Show full recorder configuration",
+                    color = AtomosCyan, fontSize = 10.sp,
+                    modifier = Modifier.clickable { showR2631RawRows = !showR2631RawRows }
+                )
+                if (showR2631RawRows) proof.liveConfiguration(currentPageHex).forEach { row ->
+                    Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                        Text(row.name, color = Color(0xFFB9CACD), fontSize = 10.sp,
+                            modifier = Modifier.weight(0.55f))
+                        Text(row.raw, color = Color(0xFFB1FFFF), fontSize = 10.sp,
+                            modifier = Modifier.weight(0.45f))
+                    }
+                }
+            } else {
+                Text("No fresh Audio GET yet; cached readings are NOT treated as new data.",
+                    color = Color(0xFFD8BB78), fontSize = 10.sp)
+            }
+            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                TextButton(onClick = saveBaseline, enabled = linked && freshTypedRx && !running,
+                    modifier = Modifier.weight(1f)) {
+                    Text("SAVE BASELINE", color = if (freshTypedRx && !running) AtomosCyan else Color.Gray,
+                        fontSize = 10.sp)
+                }
+                TextButton(onClick = refreshAndCompare, enabled = linked && hasBaseline && !running,
+                    modifier = Modifier.weight(1f)) {
+                    Text("REFRESH + COMPARE", color = if (linked && hasBaseline && !running) AtomosCyan else Color.Gray,
+                        fontSize = 10.sp)
+                }
+            }
+            if (hasBaseline) {
+                Text("A/B: ${comparison.code}  |  ${comparison.detail}",
+                    color = if (comparison.newSampleConfirmed) AtomosCyan else Color(0xFFD8BB78),
+                    fontSize = 11.sp, lineHeight = 16.sp)
+                comparison.changes.forEach { change ->
+                    Text(change, color = Color(0xFFE1F0EF), fontSize = 10.sp)
+                }
+                TextButton(onClick = clearBaseline) {
+                    Text("Clear baseline", color = Color(0xFF9FB6BB), fontSize = 10.sp)
+                }
+            }
+            Text("macOS individual Audio GET/SET opcodes are documented but NOT wire-proven. " +
+                "Their protobuf request bodies/AG2 response types still require verification; " +
+                "no individual SET or unverified GET can be transmitted.",
+                color = Color(0xFFD8BB78), fontSize = 10.sp, lineHeight = 14.sp)
+        }
+    }
+}
+
+// R26.34-36: human-labelled calibration is read-only. It never sends SET commands.
+@Composable
+private fun AudioR2634_36CalibrationPanel(
+    selectedTarget: String,
+    onTargetSelected: (String) -> Unit,
+    linked: Boolean,
+    comparison: com.atomosremote.nativeapp.audio.AudioR2631_33Proof.Comparison,
+    evidence: List<com.atomosremote.nativeapp.audio.AudioR2634_36Calibration.Observation>,
+    assessment: com.atomosremote.nativeapp.audio.AudioR2634_36Calibration.Assessment,
+    onRecord: () -> Unit,
+    onClear: () -> Unit
+) {
+    val targets = com.atomosremote.nativeapp.audio.AudioR2634_36Calibration.targetLabels
+    var menuOpen by remember { mutableStateOf(false) }
+    Card(
+        modifier = Modifier.fillMaxWidth(),
+        shape = RoundedCornerShape(12.dp),
+        colors = CardDefaults.cardColors(containerColor = Color(0xFF0B1C1F)),
+        border = androidx.compose.foundation.BorderStroke(1.dp, Color(0xFF315B61))
+    ) {
+        Column(Modifier.fillMaxWidth().padding(12.dp), verticalArrangement = Arrangement.spacedBy(7.dp)) {
+            Text("CALIBRATE AUDIO FIELD | R26.34-36", color = AtomosCyan,
+                fontSize = 11.sp, fontWeight = FontWeight.Bold)
+            Text("1. Select ONE setting you changed directly on the AG2.  " +
+                "2. Save baseline / Refresh + Compare above.  " +
+                "3. Record only after a NEW typed RX changes exactly one field.",
+                color = Color(0xFFB8C9CB), fontSize = 10.sp, lineHeight = 15.sp)
+            Box {
+                TextButton(onClick = { menuOpen = true }) {
+                    Text("Setting: $selectedTarget  ▾", color = AtomosCyan, fontSize = 11.sp)
+                }
+                DropdownMenu(expanded = menuOpen, onDismissRequest = { menuOpen = false }) {
+                    targets.forEach { target ->
+                        DropdownMenuItem(text = { Text(target) }, onClick = {
+                            onTargetSelected(target)
+                            menuOpen = false
+                        })
+                    }
+                }
+            }
+            TextButton(onClick = onRecord, enabled = linked &&
+                comparison.newSampleConfirmed && comparison.changes.size == 1) {
+                Text("RECORD OBSERVATION", color = if (comparison.newSampleConfirmed &&
+                    comparison.changes.size == 1) AtomosCyan else Color.Gray, fontSize = 11.sp)
+            }
+            Text("Mapping: ${assessment.status} | ${assessment.detail}",
+                color = if (assessment.status == "CONFLICT") Color(0xFFFFB1A3) else Color(0xFFD9CD99),
+                fontSize = 10.sp, lineHeight = 15.sp)
+            if (evidence.isNotEmpty()) {
+                Text("This session: ${evidence.size} operator-labelled observation(s)",
+                    color = Color(0xFFB0C8C8), fontSize = 10.sp)
+                evidence.takeLast(4).forEach { item ->
+                    Text("${item.target}: f${item.field} ${item.before} → ${item.after}",
+                        color = Color(0xFFE1F0EF), fontSize = 10.sp)
+                }
+                TextButton(onClick = onClear) {
+                    Text("Clear calibration evidence", color = Color(0xFF9FB6BB), fontSize = 10.sp)
+                }
+            }
+            Text("Evidence is session-only. No GET/SET payload or dB value is inferred; " +
+                "unverified controls remain disabled.", color = Color(0xFFD7BB7F),
+                fontSize = 10.sp, lineHeight = 15.sp)
+        }
+    }
+}
+
+// R26.30: show true recorder 0x8647 config values BEFORE diagnostic panels.
+// Mapping labels are explicitly inferred; never imply working dB/mic controls.
+@Composable
+private fun AudioR2630PrimaryPanel(
+    selection: com.atomosremote.nativeapp.audio.AudioR2630Readable.Selection
+) {
+    Card(
+        modifier = Modifier.fillMaxWidth(),
+        shape = RoundedCornerShape(12.dp),
+        colors = CardDefaults.cardColors(containerColor = Color(0xFF0A2425)),
+        border = androidx.compose.foundation.BorderStroke(1.dp, Color(0xFF316368))
+    ) {
+        Column(Modifier.fillMaxWidth().padding(14.dp),
+            verticalArrangement = Arrangement.spacedBy(8.dp)) {
+            Text("RECORDER AUDIO SETTINGS | READ ONLY", color = AtomosCyan,
+                fontSize = 13.sp, fontWeight = FontWeight.Bold)
+            Text(selection.label,
+                color = if (selection.isCurrentRx) Color(0xFFB8F0DF) else Color(0xFFF0D49B),
+                fontSize = 11.sp, fontWeight = FontWeight.SemiBold)
+            if (selection.available) {
+                com.atomosremote.nativeapp.audio.AudioR2630Readable.primaryRows(selection.hex)
+                    .forEach { (label, value) ->
+                        Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                            Text(label, color = Color(0xFFB5C7C9), fontSize = 11.sp,
+                                modifier = Modifier.weight(0.57f))
+                            Text(value, color = Color.White, fontSize = 11.sp,
+                                modifier = Modifier.weight(0.43f))
+                        }
+                    }
+            } else {
+                Text("Audio readback pending. Connect AG2 and tap Refresh audio readback.",
+                    color = Color(0xFFAEC1C4), fontSize = 11.sp)
+            }
+            Text("* Field labels are inferred from macOS metadata, not hardware-validated meanings. " +
+                "Values are raw recorder configuration, not dB or proven writable controls.",
+                color = Color(0xFFE3C790), fontSize = 10.sp, lineHeight = 14.sp)
+        }
+    }
+}
+
+// R26.27: explicit freshness/timeout diagnostics, Audio UI only.
+@Composable
+private fun AudioR2627_29ReadbackStatusPanel(
+    title: String, detail: String, generation: Int, reading: Boolean
+) {
+    Card(
+        modifier = Modifier.fillMaxWidth(), shape = RoundedCornerShape(12.dp),
+        colors = CardDefaults.cardColors(containerColor = Color(0xFF102126)),
+        border = androidx.compose.foundation.BorderStroke(1.dp, Color(0xFF334C52))
+    ) {
+        Column(Modifier.fillMaxWidth().padding(12.dp),
+            verticalArrangement = Arrangement.spacedBy(5.dp)) {
+            Text("AUDIO RX HEALTH | R26.27-29", color = AtomosCyan,
+                fontSize = 11.sp, fontWeight = FontWeight.Bold)
+            Text(title, color = Color(0xFFE1E9EB), fontSize = 12.sp,
+                fontWeight = FontWeight.Bold)
+            Text(detail, color = Color(0xFFB8C7C9), fontSize = 10.sp,
+                lineHeight = 15.sp)
+            Text("Collector generation $generation | running=$reading. " +
+                "Only the current collector's typed 0x8647 reply can show live readings.",
+                color = Color(0xFF81979C), fontSize = 10.sp)
+        }
+    }
+}
+
+// R26.24-26: strictly decoded current Audio page, and observed raw field changes.
+// No NDI or transport dependency, and no SET control is exposed here.
+@Composable
+private fun AudioR2624_26LivePagePanel(
+    verified: Boolean, pageHex: String, deltas: List<String>
+) {
+    val proto = com.atomosremote.nativeapp.audio.AudioR2624_26Protocol
+    val page = remember(pageHex) { proto.decodeObservedPage(pageHex) }
+    Card(
+        modifier = Modifier.fillMaxWidth(), shape = RoundedCornerShape(12.dp),
+        colors = CardDefaults.cardColors(containerColor = Color(0xFF0C2226)),
+        border = androidx.compose.foundation.BorderStroke(1.dp, Color(0xFF31545A))
+    ) {
+        Column(Modifier.fillMaxWidth().padding(12.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+            Text("OFFICIAL AUDIO PROTOCOL | R26.24-26", color = AtomosCyan,
+                fontSize = 11.sp, fontWeight = FontWeight.Bold)
+            Text(
+                if (verified && page != null) "Recorder GET 0x0647 / RX 0x8647: ${page.fieldCount}/11 typed raw fields"
+                else "Waiting for typed Audio page; no current recorder values claimed",
+                fontSize = 11.sp, color = Color(0xFFD5E8E8)
+            )
+            if (verified && page != null) {
+                page.fields.chunked(2).forEach { fields ->
+                    Text(fields.joinToString("    ") { "f${it.number}=${it.render()}" },
+                        color = Color(0xFFC6D6D9), fontSize = 10.sp)
+                }
+                if (deltas.isNotEmpty()) {
+                    Text("CHANGED ON RECORDER (raw)", color = AtomosCyan,
+                        fontSize = 10.sp, fontWeight = FontWeight.Bold)
+                    deltas.forEach { Text(it, color = Color(0xFFE2CF92), fontSize = 10.sp) }
+                }
+            }
+            Text("macOS: ${proto.getNamedConstructors.size} constructor opcodes verified; " +
+                "individual request bodies/replies not verified. Audio SET blocked.",
+                color = Color(0xFFD5B47C), fontSize = 10.sp, lineHeight = 14.sp)
+            Text("Raw field numbers are real. Names/ranges are inferred from Swift metadata, not calibrated dB or writable control states.",
+                color = Color(0xFF96AAAF), fontSize = 10.sp, lineHeight = 14.sp)
+        }
+    }
+}
+
 // R26.11.3: Live wire evidence only. Do not silently rename fields to Phone/REC/Gain.
+@Composable
+private fun AudioR2620_22EvidencePanel(
+    verified: Boolean,
+    pageHex: String,
+    changedFieldNumbers: List<Int>
+) {
+    val evidence = com.atomosremote.nativeapp.audio.AudioR2620_22Evidence
+    var showProtocolEvidence by remember { mutableStateOf(false) }
+    Card(
+        modifier = Modifier.fillMaxWidth(),
+        shape = RoundedCornerShape(12.dp),
+        colors = CardDefaults.cardColors(containerColor = Color(0xFF0A2023)),
+        border = androidx.compose.foundation.BorderStroke(1.dp, Color(0xFF285159))
+    ) {
+        Column(Modifier.fillMaxWidth().padding(12.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+            Text("AUDIO HARDWARE CAPABILITY", color = AtomosCyan,
+                fontSize = 11.sp, fontWeight = FontWeight.Bold)
+            Text(
+                if (verified) evidence.confirmedReadbackSummary(pageHex)
+                else "No paired-recorder 0x8647 readback in current Audio session",
+                color = Color(0xFFE3EFED), fontSize = 11.sp, lineHeight = 15.sp
+            )
+            Text("Hardware proven: Audio page GET only. Individual Gain, Mic/Line, Phones and Speaker GET/SET: unverified. Live dB meter: unverified.",
+                color = Color(0xFFD5B47C), fontSize = 10.sp, lineHeight = 15.sp)
+            if (changedFieldNumbers.isNotEmpty()) {
+                Text("Recorder change detected in raw field(s): ${changedFieldNumbers.joinToString(", ")}. " +
+                    "This identifies a wire change, not its calibrated control name.",
+                    color = AtomosCyan, fontSize = 10.sp, lineHeight = 15.sp)
+            }
+            Text(
+                if (showProtocolEvidence) "macOS GET constructors: show less" else "macOS GET constructors: ${evidence.getterConstructors.size} verified opcode/argument shapes (details)",
+                color = AtomosCyan, fontSize = 10.sp,
+                modifier = Modifier.fillMaxWidth().clickable { showProtocolEvidence = !showProtocolEvidence }
+                    .padding(vertical = 5.dp)
+            )
+            if (showProtocolEvidence) {
+                evidence.getterConstructors.forEach { getter ->
+                    Text("${getter.method}: 0x${getter.opcode.toString(16).uppercase()} " +
+                        "(${getter.argumentShape}) | ${getter.macOSVA}",
+                        color = Color(0xFFAFC5C7), fontSize = 10.sp)
+                }
+                Text("Constructor args are observed, but serialized protobuf request fields and AG2 replies are NOT verified; these getters are not sent.",
+                    color = Color(0xFFD5B47C), fontSize = 10.sp)
+            }
+        }
+    }
+}
+
+
 @Composable
 private fun AudioR26VerifiedPagePanel(
     verified: Boolean,
@@ -6991,7 +8139,7 @@ private fun AudioR26ReadbackLabel(
     pageHex: String
 ): String {
     // R26.19 current recorder 0x8647 snapshot; do not mistake inferred tags for SET-ready controls.
-    val macPageLabel = com.atomosremote.nativeapp.audio.AudioR26PageSnapshot.rowLabel(spec.key, pageHex)
+    val macPageLabel = com.atomosremote.nativeapp.audio.AudioR2630Readable.compactLabel(spec.key, pageHex)
     if (macPageLabel != null) return macPageLabel
     val pageHint = com.atomosremote.nativeapp.audio.AudioR26ProtoCandidates.pageHint(spec.key, pageHex)
     if (pageHint != null && values[spec.macMethods.firstOrNull()]?.status != "TYPED_RX") return pageHint
@@ -7029,8 +8177,11 @@ private fun AudioR26SettingRow(
         Spacer(Modifier.width(15.dp))
         Text(spec.label, color = Color.White, fontSize = 14.sp, fontWeight = FontWeight.SemiBold,
             modifier = Modifier.weight(1f))
-        Text(AudioR26ReadbackLabel(spec, liveValues, pageHex), color = Color(0xFF82979B), fontSize = 10.sp,
-            maxLines = 1, modifier = Modifier.widthIn(max = 110.dp))
+        Text(AudioR26ReadbackLabel(spec, liveValues, pageHex),
+            color = if (com.atomosremote.nativeapp.audio.AudioR2630Readable.compactLabel(spec.key, pageHex) != null)
+                AtomosCyan else Color(0xFF82979B), fontSize = 10.sp,
+            maxLines = 2, overflow = TextOverflow.Ellipsis,
+            modifier = Modifier.widthIn(max = 142.dp))
         Spacer(Modifier.width(8.dp))
         Text("›", color = Color.White, fontSize = 24.sp)
     }
@@ -7072,105 +8223,12 @@ private fun MediaModuleScreen(vm: AtomosViewModel) {
     LaunchedEffect(recorderName) {
         Log.d(
             "AtomRemoteUI",
-            "TCS19.12.8 TAB MEDIA recorder=$recorderName liveData=NOT_WIRED uiState=PLACEHOLDER destructiveActions=LOCKED"
+            "MEDIA-M02-M04 recorder=$recorderName ui=ISOLATED playback=BROWSER_VIEW_ONLY verifiedGet=NONE writes=LOCKED"
         )
     }
 
     ModuleShell(vm, AtomosViewModel.Screen.MEDIA, "Media", recorderName) {
-        ModuleSection(
-            "Recording Media",
-            "Media status, capacity and remaining record time come directly from the recorder."
-        ) {
-            ModuleValueRow("Media state", "Waiting for recorder data", accent = true)
-            ModuleValueRow("Device", "Not reported")
-            ModuleValueRow("Capacity", "Not reported")
-            ModuleValueRow("Available", "Not reported")
-            ModuleValueRow("Record time remaining", "Not reported")
-            ModuleValueRow("Media change ID", "Not reported")
-        }
-
-        ModuleSection(
-            "Drives",
-            "Only media drives reported by the connected recorder are shown as available."
-        ) {
-            MediaDriveCard("Drive 1")
-            Spacer(Modifier.height(7.dp))
-            MediaDriveCard("Drive 2")
-        }
-
-        ModuleSection(
-            "File Browser",
-            "Browse, preview and playback become available when the recorder exposes file-browser data."
-        ) {
-            ModuleValueRow("Browser mode", "Not active")
-            ModuleValueRow("Directory", "Not reported")
-            ModuleValueRow("Selected file", "None")
-            ModuleValueRow("Video info", "Not reported")
-            ModuleFeatureChips(listOf("Browse Files", "Preview Clip", "Play Clip"))
-        }
-
-        ModuleSection(
-            "Recovery",
-            "File recovery status is shown only when the recorder reports a recoverable file state."
-        ) {
-            ModuleValueRow("Recovery state", "Not reported")
-            ModuleValueRow("Last recording", "Not reported")
-        }
-
-        ModuleSection(
-            "Media Management",
-            "Formatting is destructive. These controls remain locked until recorder-side confirmation is fully validated."
-        ) {
-            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                OutlinedButton(
-                    onClick = {},
-                    enabled = false,
-                    modifier = Modifier.weight(1f),
-                    shape = RoundedCornerShape(12.dp)
-                ) {
-                    Text("FORMAT MEDIA", fontSize = 9.sp, fontWeight = FontWeight.Black)
-                }
-                OutlinedButton(
-                    onClick = {},
-                    enabled = false,
-                    modifier = Modifier.weight(1f),
-                    shape = RoundedCornerShape(12.dp)
-                ) {
-                    Text("SECURE FORMAT", fontSize = 9.sp, fontWeight = FontWeight.Black)
-                }
-            }
-            Text(
-                "Controls unlock only when the connected recorder reports a supported media state.",
-                color = Color(0xFF7F898C),
-                fontSize = 9.sp,
-                lineHeight = 13.sp
-            )
-        }
-    }
-}
-
-@Composable
-private fun MediaDriveCard(label: String) {
-    Surface(
-        modifier = Modifier.fillMaxWidth(),
-        shape = RoundedCornerShape(14.dp),
-        color = Color(0xFF121719),
-        border = androidx.compose.foundation.BorderStroke(1.dp, Color(0xFF242B2E))
-    ) {
-        Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(5.dp)) {
-            Row(
-                Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.SpaceBetween,
-                verticalAlignment = Alignment.CenterVertically
-            ) {
-                Text(label, color = Color(0xFFD7DDDF), fontSize = 11.sp, fontWeight = FontWeight.Bold)
-                Text("NOT REPORTED", color = Color(0xFF707A7D), fontSize = 8.sp, fontWeight = FontWeight.Black)
-            }
-            Divider(color = Color(0xFF202628))
-            ModuleValueRow("Model / media", "Waiting for recorder data")
-            ModuleValueRow("Capacity", "Not reported")
-            ModuleValueRow("Free space", "Not reported")
-        }
+        com.atomosremote.nativeapp.media.MediaPhaseM02Screen()
     }
 }
 
@@ -7539,86 +8597,21 @@ private fun SettingsModuleScreen(vm: AtomosViewModel) {
     val pairing by vm.tcsPairingState.collectAsState()
     val remote by vm.tcsRemoteState.collectAsState()
     val gattState by vm.gattState.collectAsState()
-
     val recorderName = connectedRecorderName?.takeIf { it.isNotBlank() }
         ?: selected?.let { vm.displayNameFor(it) }
         ?: "ATOMOS Recorder"
     val modelCode = selected?.name?.let { recorderModelCode(it) } ?: "Not reported"
     val remoteReady = pairing.acceptWritten && remote.available
 
-    LaunchedEffect(recorderName, modelCode, remoteReady, gattState, selected?.address) {
-        Log.d(
-            "AtomRemoteUI",
-            "TCS19.12.8 TAB SETTINGS recorder=$recorderName model=$modelCode address=${selected?.address ?: "<none>"} gatt=$gattState remoteReady=$remoteReady dateTimeData=NOT_WIRED timecodeData=PARTIAL_SYNC firmwareData=NOT_WIRED"
-        )
-    }
-
     ModuleShell(vm, AtomosViewModel.Screen.SETTINGS, "Settings", recorderName) {
-        ModuleSection(
-            "Recorder Identity",
-            "Recorder identity uses the recorder-reported device name whenever available."
-        ) {
-            ModuleValueRow("Recorder", recorderName, accent = true)
-            ModuleValueRow("Model code", modelCode)
-            ModuleValueRow("BLE address", selected?.address ?: "Not connected")
-            ModuleValueRow("BLE state", gattState.replace('-', ' ').uppercase())
-            ModuleValueRow("Remote session", if (remoteReady) "Ready" else remote.phase.replace('-', ' ').ifBlank { "Not ready" }, accent = remoteReady)
-        }
-
-        ModuleSection(
-            "Date & Time",
-            "Recorder date, time and time zone stay read-only until live values are available."
-        ) {
-            ModuleValueRow("Recorder date", "Not reported")
-            ModuleValueRow("Recorder time", "Not reported")
-            ModuleValueRow("Time zone", "Not reported")
-            ModuleFeatureChips(listOf("Recorder Date", "Recorder Time", "Time Zone"))
-        }
-
-        ModuleSection(
-            "Timecode",
-            "Timecode controls remain read-only until the connected recorder reports supported sources and values."
-        ) {
-            ModuleValueRow("Current timecode", "Sync active - value pending")
-            ModuleValueRow("Source", "Not reported")
-            ModuleValueRow("Frame offset", "Not reported")
-            ModuleValueRow("Drop frame", "Not reported")
-            ModuleFeatureChips(listOf("Source List", "Current TC", "Offset"))
-        }
-
-        ModuleSection(
-            "AirGlu & Sync",
-            "AirGlu provides the current recorder control and synchronization link."
-        ) {
-            ModuleValueRow("Control transport", "AirGlu / TCS")
-            ModuleValueRow("Device name sync", if (connectedRecorderName.isNullOrBlank()) "Waiting" else "Received", accent = !connectedRecorderName.isNullOrBlank())
-            ModuleValueRow("Remote link", if (remoteReady) "Linked" else "Not ready", accent = remoteReady)
-            ModuleFeatureChips(listOf("AirGlu", "Frame Sync", "Device Data"))
-        }
-
-        ModuleSection(
-            "Firmware & Device Info",
-            "Firmware and device information are shown only when reported by the recorder."
-        ) {
-            ModuleValueRow("Recorder firmware", "Not reported")
-            ModuleValueRow("Monitor firmware", "Not reported")
-            ModuleValueRow("Device info", "Waiting for recorder data")
-            ModuleFeatureChips(listOf("Firmware", "Monitor FW", "Device Info"))
-        }
-
-        ModuleSection(
-            "System Actions",
-            "System-changing actions stay locked until recorder confirmation is fully validated."
-        ) {
-            ModuleFeatureChips(listOf("Set Date / Time", "Set TC Source", "Set TC Offset"))
-            ModuleFeatureChips(listOf("Firmware Update", "Recorder Restart"))
-            Text(
-                "Destructive and restart actions are currently locked.",
-                color = Color(0xFF7F898C),
-                fontSize = 9.sp,
-                lineHeight = 13.sp
-            )
-        }
+        com.atomosremote.nativeapp.ui.settings.SettingsS02Panel(
+            recorderName = recorderName,
+            modelCode = modelCode,
+            bleAddress = selected?.address ?: "Not connected",
+            bleState = gattState.replace('-', ' ').uppercase(),
+            linked = remoteReady,
+            remotePhase = remote.phase
+        )
     }
 }
 
