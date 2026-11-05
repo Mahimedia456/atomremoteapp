@@ -3,6 +3,10 @@ package com.atomosremote.nativeapp.ui
 import android.bluetooth.BluetoothAdapter
 import android.bluetooth.BluetoothDevice
 import android.content.Intent
+import android.app.Activity
+import android.content.ContextWrapper
+import android.content.pm.ActivityInfo
+import android.content.res.Configuration
 import android.content.pm.PackageManager
 import android.provider.Settings
 import android.os.SystemClock
@@ -36,11 +40,14 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.onSizeChanged
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.zIndex
 import androidx.compose.ui.unit.IntSize
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
@@ -241,7 +248,7 @@ fun AtomosApp(vm: AtomosViewModel = viewModel()) {
 }
 
 @Composable
-private fun AppHeader(title: String, subtitle: String? = null, onBack: (() -> Unit)? = null) {
+private fun AppHeader(title: String, subtitle: String? = null, onBack: (() -> Unit)? = null, onMultiClick: (() -> Unit)? = null) {
     Surface(
         modifier = Modifier.fillMaxWidth().statusBarsPadding(),
         color = Color(0xFF030B0E),
@@ -300,6 +307,11 @@ private fun AppHeader(title: String, subtitle: String? = null, onBack: (() -> Un
                         maxLines = 1,
                         overflow = TextOverflow.Ellipsis
                     )
+                }
+                if (onMultiClick != null) {
+                    Text("+ ADD", color = RemoteMint, fontSize = 11.sp,
+                        fontWeight = FontWeight.Black,
+                        modifier = Modifier.clickable { onMultiClick() }.padding(top = 3.dp))
                 }
             }
         }
@@ -1447,13 +1459,69 @@ private fun RemoteScreen(vm: AtomosViewModel) {
     }
 
     var showDisconnectConfirmation by remember { mutableStateOf(false) }
-    BackHandler(enabled = true) { showDisconnectConfirmation = true }
 
     var activePanel by remember { mutableStateOf<RemotePanel?>(null) }
     var activeTool by remember { mutableStateOf<RemoteHomeTool?>(null) }
     // 20.03.4.11: Connected modules are panels inside one persistent screen.
     // Changing tabs must not call vm.go(), restart GATT, or start a hardware refresh.
     var connectedTab by remember(selected?.address) { mutableStateOf(ConnectedTopTab.REMOTE) }
+    // NDI-FS01: Remote UI only. Do not touch NDI native receiver or recorder transport.
+    val ndiLandscape = LocalConfiguration.current.orientation == Configuration.ORIENTATION_LANDSCAPE
+    var ndiFullscreenOverride by remember { mutableStateOf<Boolean?>(null) }
+    // NDI-SF02: the single preview remains fullscreen-capable even before sender discovery.
+    // Source availability must never create a second fallback video frame.
+    val ndiFullscreen = connectedTab == ConnectedTopTab.REMOTE &&
+        (ndiFullscreenOverride ?: ndiLandscape)
+    // Sensor-aware rotation is scoped to the Remote tab and restored on exit.
+    val ndiRotationActivity = remember(ndi06Context) {
+        generateSequence(ndi06Context as android.content.Context?) { context ->
+            (context as? ContextWrapper)?.baseContext
+        }.filterIsInstance<Activity>().firstOrNull()
+    }
+    DisposableEffect(ndiRotationActivity, connectedTab) {
+        val activity = ndiRotationActivity
+        val previousOrientation = activity?.requestedOrientation
+        if (activity != null && connectedTab == ConnectedTopTab.REMOTE) {
+            activity.requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_FULL_SENSOR
+        }
+        onDispose {
+            if (activity != null && previousOrientation != null && connectedTab == ConnectedTopTab.REMOTE) {
+                activity.requestedOrientation = previousOrientation
+            }
+        }
+    }
+    LaunchedEffect(ndiLandscape) {
+        // Each physical rotate starts with the landscape auto-fullscreen policy.
+        ndiFullscreenOverride = null
+    }
+    LaunchedEffect(connectedTab) {
+        if (connectedTab != ConnectedTopTab.REMOTE) ndiFullscreenOverride = null
+    }
+    // Back exits manually selected fullscreen before opening disconnect confirmation.
+    // In auto-landscape, rotate portrait or use the exit control to access tools.
+    BackHandler(enabled = true) {
+        if (ndiFullscreen) ndiFullscreenOverride = false
+        else showDisconnectConfirmation = true
+    }
+    // MDP1: isolated secondary sessions. Primary ViewModel GATT/NDI and controls stay untouched.
+    val mdp1Context = LocalContext.current
+    val mdp1 = remember(mdp1Context) { com.atomosremote.nativeapp.multi.MultiHeaderPhase1Manager(mdp1Context) }
+    var mdp1SheetOpen by remember { mutableStateOf(false) }
+    val mdp2Selection by mdp1.ui.collectAsState()
+    val mdp2ReadySelected = mdp2Selection.selected.isNotEmpty() &&
+        mdp2Selection.selected.all { id ->
+            if (id == mdp2Selection.primaryAddress) mdp2Selection.primaryReady
+            else mdp2Selection.secondaries.any { it.address == id && it.ready }
+        }
+    // Keep dock clickable so every tap reaches ROUTE_CLICK/ROUTE_BLOCK diagnostics.
+    // Manager/GATT still fail-closed for unready sessions; no optimistic success.
+    val mdp2DockEnabled = mdp2Selection.selected.isNotEmpty()
+    // Only the transport dock is group-routed in Phase 2, never NDI or existing tabs.
+    DisposableEffect(mdp1) { onDispose { mdp1.close() } }
+    LaunchedEffect(mdp1, selected?.address, recorderName, transportReady) {
+        mdp1.syncPrimary(selected?.address, recorderName, transportReady)
+        mdp1.refreshSaved()
+    }
 
     // AGENT7 20.03.6.2: frozen-Gatt post-pair recovery.
     // If a freshly re-paired session reaches the known cxtic2/cxtic4 readability
@@ -1476,14 +1544,7 @@ private fun RemoteScreen(vm: AtomosViewModel) {
     }
 
     val remoteListState = rememberLazyListState()
-    val density = LocalDensity.current
-    val miniThresholdPx = with(density) { 120.dp.roundToPx() }
-    val ndiMiniPreview by remember(remoteListState, miniThresholdPx) {
-        derivedStateOf {
-            remoteListState.firstVisibleItemIndex > 0 ||
-                remoteListState.firstVisibleItemScrollOffset > miniThresholdPx
-        }
-    }
+    // NDI-FS01: video is pinned above the tool list; scrolling never shrinks or moves it.
     LaunchedEffect(transportReady, selected?.address) {
         if (!transportReady) {
             vm.invalidateMonitorSessionCache("transport-not-ready")
@@ -1524,16 +1585,43 @@ private fun RemoteScreen(vm: AtomosViewModel) {
         }
     }
 
+    if (mdp1SheetOpen) {
+        MultiHeaderPhase1Sheet(mdp1) { mdp1SheetOpen = false }
+    }
+
     Column(
         Modifier
             .fillMaxSize()
             .background(Color(0xFF07090A))
             .navigationBarsPadding()
     ) {
+        if (!ndiFullscreen) {
         AppHeader(
-            title = recorderName,
-            subtitle = if (transportReady) "Connected" else "Connecting",
-            onBack = { showDisconnectConfirmation = true }
+            title = when (mdp2Selection.selected.size) {
+                0 -> recorderName
+                1 -> {
+                    val id = mdp2Selection.selected.first()
+                    if (id == mdp2Selection.primaryAddress) mdp2Selection.primaryName
+                    else mdp2Selection.secondaries.firstOrNull { it.address == id }?.name
+                        ?: mdp2Selection.saved.firstOrNull { it.address.equals(id, true) }?.name
+                        ?: "ATOMOS Recorder"
+                }
+                else -> {
+                    val chosen = listOfNotNull(mdp2Selection.primaryAddress?.takeIf { it in mdp2Selection.selected }) +
+                        mdp2Selection.selected.filterNot { it == mdp2Selection.primaryAddress }.sorted()
+                    val labels = chosen.map { id ->
+                        if (id == mdp2Selection.primaryAddress) mdp2Selection.primaryName
+                        else mdp2Selection.saved.firstOrNull { it.address.equals(id, true) }?.name
+                            ?: mdp2Selection.secondaries.firstOrNull { it.address == id }?.name ?: "ATOMOS"
+                    }
+                    if (labels.size == 2) labels.joinToString(" + ")
+                    else "${labels.firstOrNull() ?: "ATOMOS"} + ${labels.size - 1} more"
+                }
+            },
+            subtitle = if (mdp2Selection.selected.isEmpty()) "Choose recorder" else
+                "${mdp2Selection.selected.size} selected â€¢ ${mdp2Selection.selected.count { id -> if (id == mdp2Selection.primaryAddress) mdp2Selection.primaryReady else mdp2Selection.secondaries.any { it.address == id && it.ready } }} ready",
+            onBack = { showDisconnectConfirmation = true },
+            onMultiClick = { mdp1.refreshSaved(); mdp1SheetOpen = true }
         )
 
         ConnectedTopTabs(
@@ -1546,6 +1634,8 @@ private fun RemoteScreen(vm: AtomosViewModel) {
                 }
             }
         )
+
+        }
 
         if (connectedTab == ConnectedTopTab.REMOTE) {
         LaunchedEffect(monitorDisplayMode, transportReady) {
@@ -1589,39 +1679,110 @@ private fun RemoteScreen(vm: AtomosViewModel) {
         }
     }
 
-    Box(Modifier.weight(1f).fillMaxWidth()) {
-    LazyColumn(
+    // NDI-AR01: one fixed preview, letterboxed FIT on portrait/landscape/fullscreen.
+    // The SurfaceView MUST be measured as 16:9 rather than fill the entire viewport.
+    // No native NDI decoder, transport, sender or recording callback is modified.
+    Column(Modifier.weight(1f).fillMaxWidth()) {
+        Box(
+            modifier = Modifier
+                .fillMaxWidth()
+                .then(
+                    if (ndiFullscreen) Modifier.weight(1f).padding(4.dp)
+                    else Modifier.padding(horizontal = 12.dp, vertical = 5.dp).aspectRatio(16f / 9f)
+                )
+                .background(Color.Black)
+        ) {
+            BoxWithConstraints(Modifier.fillMaxSize()) {
+                // FIT, never FillBounds or Crop: preserve 16:9 within any viewport.
+                // Explicit dp math keeps portrait fullscreen centered with black bars.
+                val videoAspect = 16f / 9f
+                val byWidth = maxHeight <= 0.dp || maxWidth.value <= maxHeight.value * videoAspect
+                val videoWidth = if (byWidth) maxWidth else maxHeight * videoAspect
+                val videoHeight = if (byWidth) maxWidth / videoAspect else maxHeight
+                Box(
+                    modifier = Modifier
+                        .align(Alignment.Center)
+                        .size(width = videoWidth, height = videoHeight)
+                        .background(Color.Black, RoundedCornerShape(if (ndiFullscreen) 3.dp else 10.dp))
+                        .border(1.dp, AtomosCyan.copy(alpha = 0.62f), RoundedCornerShape(if (ndiFullscreen) 3.dp else 10.dp))
+                        .clip(RoundedCornerShape(if (ndiFullscreen) 3.dp else 10.dp))
+                ) {
+                    if (ndi16SelectedSourceName != null && Ndi07Native.available) {
+                        Ndi07InlinePreview(
+                            sourceName = ndi16SelectedSourceName,
+                            enabled = ndi14PreviewActive,
+                            modifier = Modifier.fillMaxSize()
+                        )
+                    } else {
+                        Column(
+                            modifier = Modifier.align(Alignment.Center).padding(horizontal = 16.dp),
+                            horizontalAlignment = Alignment.CenterHorizontally
+                        ) {
+                            Image(
+                                painter = painterResource(R.drawable.atom_remote_brand_mark),
+                                contentDescription = null,
+                                modifier = Modifier.size(36.dp)
+                            )
+                            Text(
+                                if (!Ndi07Native.available) "NDI decoder unavailable" else "Waiting for Recorder NDI",
+                                color = AtomosCyan,
+                                fontSize = 11.sp,
+                                fontWeight = FontWeight.SemiBold,
+                                modifier = Modifier.padding(top = 8.dp)
+                            )
+                        }
+                    }
+                    // Icon-only fullscreen control; independent of recorder BLE/NDI readiness.
+                    IconButton(
+                        onClick = { ndiFullscreenOverride = !ndiFullscreen },
+                        modifier = Modifier.align(Alignment.TopEnd)
+                            .padding(7.dp)
+                            .size(40.dp)
+                            .background(Color(0xDC001719), RoundedCornerShape(9.dp))
+                            .border(1.dp, AtomosCyan.copy(alpha = 0.60f), RoundedCornerShape(9.dp))
+                            .semantics {
+                                contentDescription = if (ndiFullscreen) "Exit NDI fullscreen" else "Enter NDI fullscreen"
+                            }
+                    ) {
+                        Canvas(Modifier.size(22.dp)) {
+                            val m = size.width * 0.16f
+                            val e = size.width * 0.84f
+                            val arm = size.width * 0.24f
+                            val sw = 2.1.dp.toPx()
+                            if (ndiFullscreen) {
+                                // One inner square signals 'exit fullscreen'.
+                                drawRect(
+                                    color = AtomosCyan,
+                                    topLeft = Offset(m + arm / 2f, m + arm / 2f),
+                                    size = Size(e - m - arm, e - m - arm),
+                                    style = Stroke(width = sw)
+                                )
+                            } else {
+                                // Four outward corner brackets signal 'expand fullscreen'.
+                                drawLine(AtomosCyan, Offset(m, m + arm), Offset(m, m), sw)
+                                drawLine(AtomosCyan, Offset(m, m), Offset(m + arm, m), sw)
+                                drawLine(AtomosCyan, Offset(e - arm, m), Offset(e, m), sw)
+                                drawLine(AtomosCyan, Offset(e, m), Offset(e, m + arm), sw)
+                                drawLine(AtomosCyan, Offset(m, e - arm), Offset(m, e), sw)
+                                drawLine(AtomosCyan, Offset(m, e), Offset(m + arm, e), sw)
+                                drawLine(AtomosCyan, Offset(e - arm, e), Offset(e, e), sw)
+                                drawLine(AtomosCyan, Offset(e, e - arm), Offset(e, e), sw)
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if (!ndiFullscreen) {
+            LazyColumn(
             state = remoteListState,
-            modifier = Modifier.fillMaxSize(),
+            modifier = Modifier.weight(1f).fillMaxWidth(),
             contentPadding = PaddingValues(horizontal = 16.dp, vertical = 14.dp),
             verticalArrangement = Arrangement.spacedBy(14.dp)
         ) {
-            // NDI-06C: exact same Remote tab and preview container. TX control
-            // remains locked until verified readback and official setter payload.
-            item {
-                // Same LazyColumn item as the original hero, so existing scroll targets
-                // and tool-sheet indices do not change.
-                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                    RemoteWirelessHomeHero(
-                    recorderName = recorderName,
-                    recorderAddress = recorderAddress,
-                    transportReady = transportReady,
-                    inputLabel = inputFormatInfo ?: "HDMI",
-                    codecLabel = codecSummary(codecProfile),
-                    monitorLabel = monitorModeSummary(monitorDisplayMode),
-                    pairingCode = pairingCode,
-                    wirelessStatus = wirelessFoundationStatus,
-                    wirelessDetail = wirelessFoundationDetail,
-                    sameNetworkReady = sameNetworkReady,
-                    networkTransport = networkStatus.transport,
-                    networkHost = streamProbeTarget?.host,
-                    networkHostConfirmed = streamProbeTargetConfirmed,
-                    bleLinked = transportReady,
-                    streamCandidate = streamCandidateLabel,
-                    ndi06Source = ndi06Source
-                    )
-                }
-            }
+            // NDI-SF02: keep this zero-height scroll anchor for existing tool indices,
+            // but do NOT render the old second 16:9 RemoteWirelessHomeHero frame.
+            item { Spacer(Modifier.height(0.dp)) }
 
             val visibleRemoteMessage = when {
                 recordModeSettling ->
@@ -1710,49 +1871,8 @@ private fun RemoteScreen(vm: AtomosViewModel) {
             item { Spacer(Modifier.height(4.dp)) }
         }
 
-        // NDI-07 V9: one persistent video view, outside LazyColumn.
-        // Scroll only changes its bounds. It does NOT dispose/start/stop native NDI.
-        // Leaving the REMOTE tab disposes the view and releases the receiver.
-        if (ndi16SelectedSourceName != null && Ndi07Native.available) {
-            val previewBounds = if (ndiMiniPreview) {
-                Modifier.align(Alignment.TopEnd)
-                    .padding(top = 50.dp, end = 14.dp)
-                    .width(188.dp)
-                    .height(108.dp)
-            } else {
-                Modifier.align(Alignment.TopCenter)
-                    .padding(top = 20.dp, start = 26.dp, end = 26.dp)
-                    .fillMaxWidth()
-                    .aspectRatio(16f / 9f)
-            }
-            Box(
-                modifier = previewBounds
-                    .zIndex(5f)
-                    .background(Color.Black, RoundedCornerShape(12.dp))
-                    .border(1.dp, AtomosCyan.copy(alpha = 0.72f), RoundedCornerShape(12.dp))
-                    .clip(RoundedCornerShape(12.dp))
-            ) {
-                Ndi07InlinePreview(
-                    sourceName = ndi16SelectedSourceName,
-                    enabled = ndi14PreviewActive,
-                    modifier = Modifier.fillMaxSize()
-                )
-                if (ndiMiniPreview) {
-                    Text(
-                        "RECORDER NDI",
-                        color = Color.White,
-                        fontSize = 9.sp,
-                        fontWeight = FontWeight.Bold,
-                        modifier = Modifier.align(Alignment.BottomStart)
-                            .padding(6.dp)
-                            .background(Color(0xCC031513), RoundedCornerShape(5.dp))
-                            .padding(horizontal = 6.dp, vertical = 3.dp)
-                    )
-                }
-            }
-        }
-
-    }
+        } // tool list only when not fullscreen
+    } // pinned preview + independently scrollable tools
 
             // UI 07.3.4: transport stays visible, remains above the gesture bar,
             // and is rendered as a single horizontal icon dock.
@@ -1760,7 +1880,8 @@ private fun RemoteScreen(vm: AtomosViewModel) {
                 Modifier
                     .fillMaxWidth()
                     .background(Color(0xFF02090B))
-                    .padding(horizontal = 14.dp, vertical = 8.dp)
+                    .padding(horizontal = if (ndiFullscreen) 8.dp else 14.dp,
+                        vertical = if (ndiFullscreen) 2.dp else 8.dp)
             ) {
                 Card(
                     modifier = Modifier.fillMaxWidth(),
@@ -1787,6 +1908,39 @@ private fun RemoteScreen(vm: AtomosViewModel) {
                         }
                     }
 
+                    // MDP2: same four dock buttons; only the selected READY session(s) receive TX.
+                    val mdp2Transport: (String, String, String, () -> Boolean) -> Unit =
+                        { action, label, expected, primarySend ->
+                            val primaryId = mdp2Selection.primaryAddress
+                            val primaryOnly = primaryId != null && mdp2Selection.selected == setOf(primaryId)
+                            if (primaryOnly) {
+                                Log.i("AtomRemoteMDPF", "ROUTE_CLICK command=$action role=primaryOnly " +
+                                    "ready=$transportReady enabled=$transportButtonsEnabled")
+                                if (!transportButtonsEnabled) {
+                                    Log.w("AtomRemoteMDPF", "ROUTE_BLOCK command=$action reason=PRIMARY_UI_LOCK " +
+                                        "ready=$transportReady inFlight=$commandInFlight uiLocked=$transportUiLocked " +
+                                        "settling=$recordModeSettling noTx=true")
+                                } else {
+                                    // Original VM handler remains authoritative for one primary recorder.
+                                    startUiAction(action, label, expected) {
+                                        val accepted = primarySend()
+                                        Log.i("AtomRemoteMDPF", "ROUTE_TARGET command=$action role=primary " +
+                                            "queued=$accepted")
+                                        Log.i("AtomRemoteMDPF", "ROUTE_RESULT command=$action selected=1 " +
+                                            "queued=${if (accepted) 1 else 0} recorderConfirmed=false")
+                                        accepted
+                                    }
+                                }
+                            } else {
+                                if (action == "record-start" && primaryId in mdp2Selection.selected &&
+                                    transportUi.mode == RemoteTransportUiController.Mode.PLAYBACK) {
+                                    Log.w("AtomRemoteMDP2", "ROUTE_BLOCK command=record-start reason=PRIMARY_PLAYBACK_MODE noTx=true")
+                                } else {
+                                    mdp1.dispatchSelectedTransport(action, primarySend)
+                                }
+                            }
+                        }
+
                     val recordPending = transportUi.pendingAction in setOf(
                         "record-start",
                         "return-record-mode"
@@ -1800,27 +1954,29 @@ private fun RemoteScreen(vm: AtomosViewModel) {
                     Row(
                         modifier = Modifier
                             .fillMaxWidth()
-                            .padding(horizontal = 8.dp, vertical = 8.dp),
+                            .padding(horizontal = 8.dp, vertical = if (ndiFullscreen) 2.dp else 8.dp),
                         verticalAlignment = Alignment.CenterVertically
                     ) {
                         RemoteTransportDockButton(
+                            compact = ndiFullscreen,
                             label = recordLabel,
                             kind = "record",
-                            enabled = transportButtonsEnabled,
+                            enabled = mdp2DockEnabled,
                             accent = AtomosRed,
                             loading = recordPending,
                             modifier = Modifier.weight(1f)
                         ) {
-                            if (transportUi.mode == RemoteTransportUiController.Mode.PLAYBACK) {
-                                startUiAction(
-                                    "return-record-mode",
-                                    "Return to Record mode",
-                                    "Prepare Record Mode"
-                                ) {
-                                    vm.returnToRecordModeOnlyFromUi()
+                            if (transportUi.mode == RemoteTransportUiController.Mode.PLAYBACK &&
+                                (mdp2Selection.primaryAddress?.let { it in mdp2Selection.selected } == true)) {
+                                if (mdp2Selection.selected.size == 1) {
+                                    startUiAction("return-record-mode", "Return to Record mode", "Prepare Record Mode") {
+                                        vm.returnToRecordModeOnlyFromUi()
+                                    }
+                                } else {
+                                    Log.w("AtomRemoteMDP2", "ROUTE_BLOCK command=record-start reason=PRIMARY_PLAYBACK_MODE noTx=true")
                                 }
                             } else {
-                                startUiAction(
+                                mdp2Transport(
                                     "record-start",
                                     "Record Start",
                                     "Record Start"
@@ -1830,47 +1986,50 @@ private fun RemoteScreen(vm: AtomosViewModel) {
                             }
                         }
 
-                        RemoteTransportDivider()
+                        RemoteTransportDivider(compact = ndiFullscreen)
 
                         RemoteTransportDockButton(
+                            compact = ndiFullscreen,
                             label = if (transportUi.pendingAction == "record-stop") "STOPPING..." else "STOP",
                             kind = "stop",
-                            enabled = transportButtonsEnabled,
+                            enabled = mdp2DockEnabled,
                             accent = Color(0xFFE7EAEB),
                             loading = transportUi.pendingAction == "record-stop",
                             modifier = Modifier.weight(1f)
                         ) {
-                            startUiAction("record-stop", "Record Stop", "Record Stop") {
+                            mdp2Transport("record-stop", "Record Stop", "Record Stop") {
                                 vm.sendRemoteTransportFromUi("record-stop")
                             }
                         }
 
-                        RemoteTransportDivider()
+                        RemoteTransportDivider(compact = ndiFullscreen)
 
                         RemoteTransportDockButton(
+                            compact = ndiFullscreen,
                             label = if (transportUi.pendingAction == "play") "PLAYING..." else "PLAY",
                             kind = "play",
-                            enabled = transportButtonsEnabled,
+                            enabled = mdp2DockEnabled,
                             accent = Color.White,
                             loading = transportUi.pendingAction == "play",
                             modifier = Modifier.weight(1f)
                         ) {
-                            startUiAction("play", "Play", "Play") {
+                            mdp2Transport("play", "Play", "Play") {
                                 vm.sendRemoteTransportFromUi("play")
                             }
                         }
 
-                        RemoteTransportDivider()
+                        RemoteTransportDivider(compact = ndiFullscreen)
 
                         RemoteTransportDockButton(
+                            compact = ndiFullscreen,
                             label = if (transportUi.pendingAction == "pause") "PAUSING..." else "PAUSE",
                             kind = "pause",
-                            enabled = transportButtonsEnabled,
+                            enabled = mdp2DockEnabled,
                             accent = Color.White,
                             loading = transportUi.pendingAction == "pause",
                             modifier = Modifier.weight(1f)
                         ) {
-                            startUiAction("pause", "Pause", "Pause") {
+                            mdp2Transport("pause", "Pause", "Pause") {
                                 vm.sendRemoteTransportFromUi("pause")
                             }
                         }
@@ -2200,6 +2359,10 @@ private fun RemoteScreen(vm: AtomosViewModel) {
                     }
                 ) {
                     val tool = activeTool!!
+                    if (mdp2Selection.selected.any { it != mdp2Selection.primaryAddress }) {
+                        Text("Selected devices: tool SET is per recorder; displayed GET values may be from primary.",
+                            fontSize = 10.sp, color = Color(0xFFFFC476))
+                    }
                     val panel = activePanel!!
                     Column(
                         Modifier
@@ -2238,82 +2401,82 @@ private fun RemoteScreen(vm: AtomosViewModel) {
                                 mode = monitorDisplayMode,
                                 monitorCore = monitorCore,
                                 lutState = monitorLutState,
-                                onModeChange = vm::setMonitorDisplayMode,
+                                onModeChange = { v -> mdp1.dispatchSelectedTool("monitor-mode", { vm.setMonitorDisplayMode(v) }, { it.sendOfficialMonitorMode(v) }); Unit },
                                 onLutRefresh = vm::refreshLutState,
-                                onLutSlot = vm::setLutSlot,
-                                onLutPreview = vm::setLutPreview,
-                                onLutRecord = vm::setLutDuringRecord,
-                                onLutOutput = vm::setLutDuringOutput
+                                onLutSlot = { v -> mdp1.dispatchSelectedTool("lut-slot", { vm.setLutSlot(v) }, { it.sendOfficialLutSlot(v) }); Unit },
+                                onLutPreview = { v -> mdp1.dispatchSelectedTool("lut-preview", { vm.setLutPreview(v) }, { it.sendOfficialLutPreview(v) }); Unit },
+                                onLutRecord = { v -> mdp1.dispatchSelectedTool("lut-record", { vm.setLutDuringRecord(v) }, { it.sendOfficialLutDuringRecord(v) }); Unit },
+                                onLutOutput = { v -> mdp1.dispatchSelectedTool("lut-output", { vm.setLutDuringOutput(v) }, { it.sendOfficialLutDuringOutput(v) }); Unit }
                             )
 
                             RemoteHomeTool.WAVEFORM -> RemoteScopesCard(
                                 enabled = transportReady,
                                 scopeState = monitorScopeState,
                                 onRefresh = vm::refreshScopeCore,
-                                onEnabledChange = vm::setScopeEnabled,
-                                onModeChange = vm::setScopeMode,
-                                onSizeChange = vm::setScopeSize,
-                                onOpacityChange = vm::setScopeOpacity,
-                                onBrightnessChange = vm::setScopeBrightness
+                                onEnabledChange = { v -> mdp1.dispatchSelectedTool("scope-enabled", { vm.setScopeEnabled(v) }, { it.sendOfficialScopeEnabled(v) }); Unit },
+                                onModeChange = { v -> mdp1.dispatchSelectedTool("scope-mode", { vm.setScopeMode(v) }, { it.sendOfficialScopeMode(v) }); Unit },
+                                onSizeChange = { v -> mdp1.dispatchSelectedTool("scope-size", { vm.setScopeSize(v) }, { it.sendOfficialScopeSize(v) }); Unit },
+                                onOpacityChange = { v -> mdp1.dispatchSelectedTool("scope-opacity", { vm.setScopeOpacity(v) }, { it.sendOfficialScopeOpacity(v) }); Unit },
+                                onBrightnessChange = { v -> mdp1.dispatchSelectedTool("scope-brightness", { vm.setScopeBrightness(v) }, { it.sendOfficialScopeBrightness(v) }); Unit }
                             )
 
                             RemoteHomeTool.FOCUS -> RemoteFocusOnlyCard(
                                 enabled = transportReady,
                                 state = monitorFocusAssistState,
                                 onRefresh = vm::refreshFocusAssistState,
-                                onToggle = { checked -> vm.setMonitorAssistToggle("focus-assist", checked) },
-                                onType = vm::setFocusAssistType,
-                                onThreshold = vm::setFocusAssistThreshold,
-                                onColour = vm::setFocusAssistColour
+                                onToggle = { v -> mdp1.dispatchSelectedTool("focus-assist", { vm.setMonitorAssistToggle("focus-assist", v) }, { it.sendOfficialMonitorAssistToggle("focus-assist", v) }); Unit },
+                                onType = { v -> mdp1.dispatchSelectedTool("focus-type", { vm.setFocusAssistType(v) }, { it.sendOfficialFocusPeakType(v) }); Unit },
+                                onThreshold = { v -> mdp1.dispatchSelectedTool("focus-threshold", { vm.setFocusAssistThreshold(v) }, { it.sendOfficialFocusPeakThreshold(v) }); Unit },
+                                onColour = { v -> mdp1.dispatchSelectedTool("focus-colour", { vm.setFocusAssistColour(v) }, { it.sendOfficialFocusPeakColour(v) }); Unit }
                             )
 
                             RemoteHomeTool.ZEBRA -> RemoteZebraOnlyCard(
                                 enabled = transportReady,
                                 state = monitorZebraState,
                                 onRefresh = vm::refreshMonitorAssistEffects,
-                                onToggle = { checked -> vm.setMonitorAssistToggle("zebra", checked) },
-                                onThreshold = vm::setZebraThreshold
+                                onToggle = { v -> mdp1.dispatchSelectedTool("zebra", { vm.setMonitorAssistToggle("zebra", v) }, { it.sendOfficialZebraEnabled(v) }); Unit },
+                                onThreshold = { v -> mdp1.dispatchSelectedTool("zebra-threshold", { vm.setZebraThreshold(v) }, { it.sendOfficialZebraThreshold(v) }); Unit }
                             )
 
                             RemoteHomeTool.FALSE_COLOR -> RemoteFalseColorOnlyCard(
                                 enabled = transportReady,
                                 state = monitorAssistEffects,
                                 onRefresh = vm::refreshMonitorAssistEffects,
-                                onToggle = { checked -> vm.setMonitorAssistToggle("false-color", checked) }
+                                onToggle = { v -> mdp1.dispatchSelectedTool("false-color", { vm.setMonitorAssistToggle("false-color", v) }, { it.sendOfficialFalseColourEnabled(v) }); Unit }
                             )
 
                             RemoteHomeTool.BLUE_ONLY -> RemoteBlueOnlyCard(
                                 enabled = transportReady,
                                 state = monitorAssistEffects,
                                 onRefresh = vm::refreshMonitorAssistEffects,
-                                onToggle = { checked -> vm.setMonitorAssistToggle("blue-only", checked) }
+                                onToggle = { v -> mdp1.dispatchSelectedTool("blue-only", { vm.setMonitorAssistToggle("blue-only", v) }, { it.sendOfficialBlueOnlyEnabled(v) }); Unit }
                             )
 
                             RemoteHomeTool.LUT -> RemoteLutInnerCard(
                                 enabled = transportReady,
                                 mode = monitorDisplayMode,
                                 lutState = monitorLutState,
-                                onEnableLutMode = { vm.setMonitorDisplayMode(5) },
+                                onEnableLutMode = { mdp1.dispatchSelectedTool("lut-monitor-mode", { vm.setMonitorDisplayMode(5) }, { it.sendOfficialMonitorMode(5) }); Unit },
                                 onRefresh = vm::refreshLutState,
-                                onSlot = vm::setLutSlot,
-                                onPreview = vm::setLutPreview,
-                                onRecord = vm::setLutDuringRecord,
-                                onOutput = vm::setLutDuringOutput
+                                onSlot = { v -> mdp1.dispatchSelectedTool("lut-slot", { vm.setLutSlot(v) }, { it.sendOfficialLutSlot(v) }); Unit },
+                                onPreview = { v -> mdp1.dispatchSelectedTool("lut-preview", { vm.setLutPreview(v) }, { it.sendOfficialLutPreview(v) }); Unit },
+                                onRecord = { v -> mdp1.dispatchSelectedTool("lut-record", { vm.setLutDuringRecord(v) }, { it.sendOfficialLutDuringRecord(v) }); Unit },
+                                onOutput = { v -> mdp1.dispatchSelectedTool("lut-output", { vm.setLutDuringOutput(v) }, { it.sendOfficialLutDuringOutput(v) }); Unit }
                             )
 
                             RemoteHomeTool.FRAME_GUIDE -> RemoteFrameGuideOnlyCard(
                                 enabled = transportReady,
                                 guideState = monitorGuideState,
                                 onRefresh = vm::refreshGuidesState,
-                                onToggle = vm::setFrameGuideEnabled,
-                                onFormat = vm::setFrameGuideFormat
+                                onToggle = { v -> mdp1.dispatchSelectedTool("frame-guide", { vm.setFrameGuideEnabled(v) }, { it.sendOfficialFrameGuideEnabled(v) }); Unit },
+                                onFormat = { v -> mdp1.dispatchSelectedTool("frame-guide-format", { vm.setFrameGuideFormat(v) }, { it.sendOfficialFrameGuideFormat(v) }); Unit }
                             )
 
                             RemoteHomeTool.GRID -> RemoteGridOnlyCard(
                                 enabled = transportReady,
                                 guideState = monitorGuideState,
                                 onRefresh = vm::refreshGuidesState,
-                                onToggle = vm::setFrameGridEnabled
+                                onToggle = { v -> mdp1.dispatchSelectedTool("grid", { vm.setFrameGridEnabled(v) }, { it.sendOfficialFrameGridEnabled(v) }); Unit }
                             )
 
                             RemoteHomeTool.ZOOM -> RemoteZoomOnlyCard(
@@ -2325,22 +2488,29 @@ private fun RemoteScreen(vm: AtomosViewModel) {
                                 zoomCore = monitorZoomCore,
                                 zoomViewport = monitorZoomViewport,
                                 zoomBoxState = zoomBoxState,
-                                onZoomLevelChange = vm::setMonitorZoomLevel,
+                                onZoomLevelChange = { v -> mdp1.dispatchSelectedTool("zoom-level", { vm.setMonitorZoomLevel(v) }, { it.sendOfficialMonitorZoomLevel(v) }); Unit },
                                 onZoomRefresh = vm::refreshZoomState,
                                 onZoomViewportRefresh = vm::refreshZoomViewport,
-                                onZoomAnalogSessionChange = vm::setZoomAnalogSession,
-                                onPan = vm::panZoomNormalized
+                                onZoomAnalogSessionChange = { v ->
+                                    if (mdp2Selection.selected == setOf(mdp2Selection.primaryAddress)) vm.setZoomAnalogSession(v)
+                                    else Log.w("AtomRemoteMDPF", "TOOL_BLOCK name=zoom-pan-session reason=SECONDARY_UNROUTED noTx=true")
+                                },
+                                onPan = { x, y ->
+                                    if (mdp2Selection.selected == setOf(mdp2Selection.primaryAddress)) vm.panZoomNormalized(x, y)
+                                    else Log.w("AtomRemoteMDPF", "TOOL_BLOCK name=zoom-pan reason=SECONDARY_UNROUTED noTx=true")
+                                }
                             )
 
                             RemoteHomeTool.SAFE_AREA -> RemoteSafeAreaOnlyCard(
                                 enabled = transportReady,
                                 safeAreaMode = safeAreaMode,
                                 onRefresh = vm::refreshSafeAreaState,
-                                onMode = vm::setSafeAreaMode
+                                onMode = { v -> mdp1.dispatchSelectedTool("safe-area", { vm.setSafeAreaMode(v) }, { it.sendOfficialSafeAreaMode(v) }); Unit }
                             )
 
                             RemoteHomeTool.DISPLAY -> RemoteDisplayCard(
-                                enabled = transportReady,
+                                // Secondary display SET/readback not independently routed; block wrong-primary TX.
+                                enabled = transportReady && mdp2Selection.selected == setOf(mdp2Selection.primaryAddress),
                                 state = monitorDisplayState,
                                 onRefresh = vm::refreshDisplayState,
                                 onBacklight = vm::setDisplayBacklight,
@@ -2353,7 +2523,8 @@ private fun RemoteScreen(vm: AtomosViewModel) {
                             )
 
                             RemoteHomeTool.CODEC -> RemoteCodecCard(
-                                enabled = transportReady,
+                                // Codec per-recorder verification required; no silent primary fallback.
+                                enabled = transportReady && mdp2Selection.selected == setOf(mdp2Selection.primaryAddress),
                                 profile = codecProfile,
                                 bitDepth = codecBitDepth,
                                 confirmedProfile = codecHardwareProfile,
@@ -2368,7 +2539,7 @@ private fun RemoteScreen(vm: AtomosViewModel) {
                                 transportReady,
                                 monitorAnamorphicState,
                                 vm::refreshAnamorphicMode,
-                                vm::setAnamorphicMode
+                                { v -> mdp1.dispatchSelectedTool("anamorphic", { vm.setAnamorphicMode(v) }, { it.sendOfficialAnamorphicMode(v) }); Unit }
                             )
                         }
                     }
@@ -8227,8 +8398,76 @@ private fun MediaModuleScreen(vm: AtomosViewModel) {
         )
     }
 
+    val transportUi by vm.remoteTransportUiState.collectAsState()
+    val remote by vm.tcsRemoteState.collectAsState()
+    val gattState by vm.gattState.collectAsState()
+    val commandStatus by vm.commandStatus.collectAsState()
+
+    // This effect also covers the standalone MEDIA screen route. ConnectedTopTabs
+    // may already be observing the same VM controller; observe() is idempotent.
+    LaunchedEffect(remote.phase, remote.lastCommand, remote.lastError, gattState) {
+        vm.observeRemoteTransportUiState()
+    }
+    LaunchedEffect(transportUi.generation, transportUi.pendingAction) {
+        if (transportUi.pendingAction != null) {
+            val generation = transportUi.generation
+            kotlinx.coroutines.delay(6000)
+            vm.timeoutRemoteTransportUiAction(generation)
+        }
+    }
     ModuleShell(vm, AtomosViewModel.Screen.MEDIA, "Media", recorderName) {
-        com.atomosremote.nativeapp.media.MediaPhaseM02Screen()
+        val mediaFiles by vm.mediaSsdFileListState.collectAsState()
+        com.atomosremote.nativeapp.media.MediaModePlaybackScreen(
+            mediaFileList = mediaFiles,
+            ui = transportUi,
+            remoteAvailable = remote.available,
+            remotePhase = remote.phase,
+            commandStatus = commandStatus,
+            onPlaybackMode = {
+                val token = vm.beginRemoteTransportUiAction(
+                    "enter-playback-mode", "Playback Mode", "Prepare Playback Mode"
+                )
+                if (token != null && !vm.enterPlaybackModeOnlyFromMediaUi()) {
+                    vm.rejectRemoteTransportUiAction("Playback Mode request was not queued")
+                }
+            },
+            onRecordMode = {
+                val token = vm.beginRemoteTransportUiAction(
+                    "return-record-mode", "Return to Record mode", "Prepare Record Mode"
+                )
+                if (token != null && !vm.returnToRecordModeOnlyFromUi()) {
+                    vm.rejectRemoteTransportUiAction("Record Mode request was not queued")
+                }
+            },
+            onPlay = {
+                val token = vm.beginRemoteTransportUiAction("play", "Play", "Play")
+                if (token != null && !vm.sendMediaPlaybackOnlyFromUi("play")) {
+                    vm.rejectRemoteTransportUiAction("Play request was not queued")
+                }
+            },
+            onPause = {
+                val token = vm.beginRemoteTransportUiAction("pause", "Pause", "Pause")
+                if (token != null && !vm.sendMediaPlaybackOnlyFromUi("pause")) {
+                    vm.rejectRemoteTransportUiAction("Pause request was not queued")
+                }
+            },
+            onSsdListEvidence = { start -> vm.requestMediaK01FileListGetOnce(start) },
+            onDiagnosticTest = { testId ->
+                when (testId) {
+                    "filelist-nonlocal" -> vm.requestMediaU04FileListRouteOnce(0, false)
+                    "filelist-local" -> vm.requestMediaU04FileListRouteOnce(0, true)
+                    "mode-get" -> vm.requestMediaK014ModeGetOnce()
+                    "media-state" -> vm.requestMediaK011StateGetOnce()
+                    else -> false // U04 unverified / state-changing methods cannot transmit.
+                }
+            },
+            onSsdListTimeout = { generation -> vm.mediaU02ExpireFileList(generation) },
+            onSsdListReset = { vm.mediaU02ResetFileList() },
+            onModeGetEvidence = { vm.requestMediaK014ModeGetOnce() },
+            onModeStart = { vm.requestMediaK016ModeStartOnce() },
+            onMediaStateGetEvidence = { vm.requestMediaK011StateGetOnce() },
+            onRecover = { vm.recoverRemoteSessionFromUi() }
+        )
     }
 }
 
@@ -8602,6 +8841,9 @@ private fun SettingsModuleScreen(vm: AtomosViewModel) {
         ?: "ATOMOS Recorder"
     val modelCode = selected?.name?.let { recorderModelCode(it) } ?: "Not reported"
     val remoteReady = pairing.acceptWritten && remote.available
+    // SETTINGS S05: observe existing GATT audit events; no change to shared GATT/PacketLink.
+    val s05GattEvents by vm.gattEvents.collectAsState()
+    val s05GattSnapshot by vm.gattSnapshot.collectAsState()
 
     ModuleShell(vm, AtomosViewModel.Screen.SETTINGS, "Settings", recorderName) {
         com.atomosremote.nativeapp.ui.settings.SettingsS02Panel(
@@ -8610,7 +8852,21 @@ private fun SettingsModuleScreen(vm: AtomosViewModel) {
             bleAddress = selected?.address ?: "Not connected",
             bleState = gattState.replace('-', ' ').uppercase(),
             linked = remoteReady,
-            remotePhase = remote.phase
+            remotePhase = remote.phase,
+            s05GattEvents = s05GattEvents,
+            s05LiveGattAddress = s05GattSnapshot?.deviceAddress,
+
+            s11RequestDateGet = { vm.gatt.b11RequestDateGetOnce() },
+            s12RequestSettingsGet = { cmd -> vm.gatt.b12RequestMappedSettingsGetOnce(cmd) },
+            b4767SendAirGluOffsetPilot = { target, before, source, tcSource ->
+                vm.gatt.b4767SendAirGluOffsetPilot(target, before, source, tcSource)
+            },
+            s61PreviewDateSetNoTx = { timestamp -> vm.gatt.b4761BuildDateSetPreviewNoTx(timestamp) },
+            b4771SendDateSetPilot = { candidate, baseline ->
+                vm.gatt.b4771SendDateSetPilot(candidate, baseline)
+            },
+            s05RefreshExistingBootstrap = { vm.gatt.refreshOfficialRecorderState() },
+            s11ReadLiveGattEvents = { vm.gatt.events.value }
         )
     }
 }
@@ -8661,11 +8917,11 @@ private fun RemoteModuleCard(
 }
 
 @Composable
-private fun RemoteTransportDivider() {
+private fun RemoteTransportDivider(compact: Boolean = false) {
     Box(
         Modifier
             .width(1.dp)
-            .height(64.dp)
+            .height(if (compact) 32.dp else 64.dp)
             .background(Color(0xFF1E3538))
     )
 }
@@ -8678,11 +8934,12 @@ private fun RemoteTransportDockButton(
     accent: Color,
     modifier: Modifier = Modifier,
     loading: Boolean = false,
+    compact: Boolean = false,
     onClick: () -> Unit
 ) {
     Box(
         modifier = modifier
-            .height(92.dp)
+            .height(if (compact) 52.dp else 92.dp)
             .background(Color.Transparent, RoundedCornerShape(14.dp))
             .clickable(enabled = enabled, onClick = onClick),
         contentAlignment = Alignment.Center
@@ -8693,18 +8950,18 @@ private fun RemoteTransportDockButton(
         ) {
             if (loading) {
                 CircularProgressIndicator(
-                    modifier = Modifier.size(30.dp),
+                    modifier = Modifier.size(if (compact) 20.dp else 30.dp),
                     strokeWidth = 2.dp,
                     color = accent
                 )
             } else {
-                RemoteTransportGlyph(kind = kind, tint = accent, modifier = Modifier.size(54.dp))
+                RemoteTransportGlyph(kind = kind, tint = accent, modifier = Modifier.size(if (compact) 28.dp else 54.dp))
             }
-            Spacer(Modifier.height(8.dp))
+            Spacer(Modifier.height(if (compact) 2.dp else 8.dp))
             Text(
                 text = label,
                 color = if (enabled || loading) Color.White else Color(0xFF738185),
-                fontSize = 7.5.sp,
+                fontSize = if (compact) 8.sp else 7.5.sp,
                 fontWeight = FontWeight.ExtraBold,
                 letterSpacing = 0.45.sp,
                 maxLines = 1

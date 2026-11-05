@@ -21,8 +21,8 @@ import androidx.compose.ui.unit.sp
  * No playback mode switch, clip playback, file writes, format or recovery actions.
  */
 @Composable
-fun MediaPhaseM02Screen() {
-    var page by rememberSaveable { mutableStateOf("drives") }
+fun MediaPhaseM02Screen(initialPage: String = "drives") {
+    var page by rememberSaveable(initialPage) { mutableStateOf(initialPage) }
     // No hardware adapter has been activated: unknown is the only honest initial state.
     val readback = remember { MediaM05M07Snapshot() }
     val cyan = Color(0xFF42C7DD)

@@ -127,8 +127,32 @@ class GattClient(context: Context) {
     private val _tcsPairingState = MutableStateFlow(TcsPairingState())
     val tcsPairingState: StateFlow<TcsPairingState> = _tcsPairingState
 
+    /** K016 recorder-only list candidates, reset each manual GET; no fake media files. */
+    private val _mediaSsdFileListState = MutableStateFlow(com.atomosremote.nativeapp.media.SsdBrowserState())
+    val mediaSsdFileListState: StateFlow<com.atomosremote.nativeapp.media.SsdBrowserState> = _mediaSsdFileListState
+    private var mediaK016ListWindowOpenedAtMs: Long = 0L
+    private var mediaU04LocalRoute: Boolean = true // U04: operator-selected FileList test route
+    private var mediaK016ModeStartAttempted = false
+    private var mediaU02Generation = 0L
+    /** K011: manual read-only General.MediaStateGet evidence. */
+    private var mediaK011GetQueued = false
+    private var mediaK011RxWindowAtMs: Long = 0L
+
     private val _tcsRemoteState = MutableStateFlow(TcsRemoteState())
     val tcsRemoteState: StateFlow<TcsRemoteState> = _tcsRemoteState
+
+    // MDP READY-STABLE: phase=sending/queued is normal PacketLink activity, NOT a BLE disconnect.
+    // Read-only session gate: match the standalone MD15 stable transport criteria.
+    // Never change the transport engine, pairing state, or PacketLink scheduler here.
+    fun isOfficialRemoteSessionReadyForCommands(): Boolean {
+        val remote = _tcsRemoteState.value
+        val ble = _state.value
+        return _tcsPairingState.value.acceptWritten &&
+            packetLink18Primed && remoteBootstrapCompleted &&
+            remote.available && remote.phase != "error" &&
+            ble !in setOf("disconnected", "idle", "connecting", "retrying") &&
+            !ble.startsWith("error:") && !ble.startsWith("service-error:")
+    }
 
     // 19.11.6 universal identity: BLE advertisements such as "AG2" identify the
     // AirGlu endpoint, not the recorder model. cxtic2 is the recorder-authoritative
@@ -10246,6 +10270,359 @@ private fun b0123TryEmbedOneShot(desired: Int): Boolean {
         }
     }
 
+
+
+
+    /**
+     * K011 static macOS evidence: General.MediaStateGet writes request ID 0x04B5,
+     * candidate response-related field 0x04B3, local=false, empty request body.
+     * Three separate client callsites at 0x100008908, 0x10001E74E and
+     * 0x10006EAC6 use MediaStateGet metadata and build this request.
+     * AG2 hardware support remains unverified. One manual GET, never a SET,
+     * never automatic, no retries after a queued request.
+     */
+    @SuppressLint("MissingPermission")
+    fun mediaK011RequestMediaStateGetOnce(): Boolean {
+        if (mediaK011GetQueued) {
+            android.util.Log.w("AtomRemoteMediaK011", "MEDIA_STATE_ALREADY_QUEUED noRetry=true noTx=true")
+            return false
+        }
+        if (outputR21MtuBytes < 61) {
+            val requested = requestR21OutputPageMtu()
+            android.util.Log.i("AtomRemoteMediaK011", "MEDIA_STATE_MTU_WAIT mtu=$outputR21MtuBytes requestQueued=$requested noTx=true")
+            return false
+        }
+        val safe = _tcsPairingState.value.acceptWritten && _tcsRemoteState.value.available &&
+            packetLink18Primed && packetLink18.peerCredit() && !remoteBootstrapActive &&
+            pendingRemotePacket == null && outputR21MtuBytes >= 61
+        if (!safe) {
+            android.util.Log.i("AtomRemoteMediaK011", "MEDIA_STATE_BLOCKED pending=${pendingRemotePacket?.label} mtu=$outputR21MtuBytes noTx=true")
+            return false
+        }
+        val current = gatt ?: return false
+        val service = current.getService(UUID.fromString(AIRGLU_SHOGUN_SERVICE_UUID)) ?: return false
+        service.getCharacteristic(UUID.fromString(TCS_PACKET_WRITE_UUID)) ?: return false
+        val pkt = PendingRemotePacket(
+            body = buildOfficialAtomMessageBody(0, 0x04b5),
+            purpose = "media-k011-read-media-state-once",
+            label = "K011.General.MediaStateGet",
+            commandId = 0x04b5,
+            packetId = 0,
+            expectedResponseId = null // 0x04B3 is binary static candidate, NOT a verified AG2 RX.
+        )
+        val queued = queueRemotePacket18_8(pkt, local = false)
+        if (queued) {
+            mediaK011GetQueued = true
+            mediaK011RxWindowAtMs = android.os.SystemClock.elapsedRealtime()
+        }
+        android.util.Log.i("AtomRemoteMediaK011",
+            "MEDIA_STATE_GET_TX cmd=0x04B5 expectedCandidate=0x04B3 local=false packetId=0 " +
+                "emptyBody=true queued=$queued hardwareReplyUnverified=true noSet=true noRetry=true")
+        return queued
+    }
+
+    /**
+     * K016 explicitly operator-triggered FileBrowser.ModeStart (0x01FE).
+     * macOS code x86_64 0x100031371 / 0x100067BB1: command=0x01FE,
+     * local=1, responseId=0. EMPTY payload is a static candidate, not an
+     * AG2 verified recipe. STATE-CHANGING: never automatically execute.
+     */
+    @SuppressLint("MissingPermission")
+    fun mediaK016RequestModeStartOnce(): Boolean {
+        if (mediaK016ModeStartAttempted) {
+            android.util.Log.w("AtomRemoteMediaK016", "MODE_START_ALREADY_ATTEMPTED noRetry=true")
+            return false
+        }
+        if (outputR21MtuBytes < 61) {
+            val mtuRequested = requestR21OutputPageMtu()
+            android.util.Log.i("AtomRemoteMediaK016", "MODE_START_MTU_WAIT current=$outputR21MtuBytes requestQueued=$mtuRequested noTx=true")
+            return false
+        }
+        val safe = _tcsPairingState.value.acceptWritten && _tcsRemoteState.value.available &&
+            packetLink18Primed && packetLink18.peerCredit() && !remoteBootstrapActive &&
+            pendingRemotePacket == null && outputR21MtuBytes >= 61
+        if (!safe) {
+            android.util.Log.i("AtomRemoteMediaK016", "MODE_START_BLOCKED pending=${pendingRemotePacket?.label} noTx=true")
+            return false
+        }
+        val current = gatt ?: return false
+        val service = current.getService(UUID.fromString(AIRGLU_SHOGUN_SERVICE_UUID)) ?: return false
+        service.getCharacteristic(UUID.fromString(TCS_PACKET_WRITE_UUID)) ?: return false
+        val packet = PendingRemotePacket(
+            body = buildOfficialAtomMessageBody(0, 0x01fe),
+            purpose = "media-k016-filebrowser-mode-start-once",
+            label = "K016.FileBrowser.ModeStart",
+            commandId = 0x01fe,
+            packetId = 0,
+            expectedResponseId = null
+        )
+        val queued = queueRemotePacket18_8(packet, local = true)
+        if (queued) mediaK016ModeStartAttempted = true
+        android.util.Log.i("AtomRemoteMediaK016", "MODE_START_TX cmd=0x01FE local=true emptyProtoCandidate=true queued=$queued recorderConfirmed=false noRetry=true")
+        return queued
+    }
+
+    /**
+     * K01.4 FileBrowser.ModeGet: x86_64+arm64 static GET command 0x0200.
+     * Read-only manual diagnostic. No ModeStart, ModeExit, folder navigation,
+     * clip actions, auto-retries, implied reply IDs or optimistic mode status.
+     * AG2 hardware compatibility is UNVERIFIED.
+     */
+    @SuppressLint("MissingPermission")
+    fun mediaK014RequestFileBrowserModeGetOnce(): Boolean {
+        if (outputR21MtuBytes < 61) {
+            val requested = requestR21OutputPageMtu()
+            android.util.Log.i("AtomRemoteMediaK014",
+                "MODE_GET_MTU_WAIT current=$outputR21MtuBytes requestMtuQueued=$requested NO_TX")
+            return false
+        }
+        val safe = _tcsPairingState.value.acceptWritten &&
+            _tcsRemoteState.value.available && packetLink18Primed &&
+            packetLink18.peerCredit() && !remoteBootstrapActive &&
+            pendingRemotePacket == null && outputR21MtuBytes >= 61
+        if (!safe) {
+            android.util.Log.i("AtomRemoteMediaK014",
+                "MODE_GET_BLOCKED accept=${_tcsPairingState.value.acceptWritten} " +
+                "remote=${_tcsRemoteState.value.available} primed=$packetLink18Primed " +
+                "credit=${packetLink18.peerCredit()} bootstrap=$remoteBootstrapActive " +
+                "pending=${pendingRemotePacket?.label} mtu=$outputR21MtuBytes NO_TX")
+            return false
+        }
+        val current = gatt ?: return false
+        val service = current.getService(UUID.fromString(AIRGLU_SHOGUN_SERVICE_UUID)) ?: return false
+        service.getCharacteristic(UUID.fromString(TCS_PACKET_WRITE_UUID)) ?: return false
+        val packet = PendingRemotePacket(
+            body = buildOfficialAtomMessageBody(0, 0x0200),
+            purpose = "media-k014-filebrowser-mode-get",
+            label = "K014.FileBrowser.ModeGet",
+            commandId = 0x0200,
+            packetId = 0,
+            expectedResponseId = null // Unknown on AG2; do not assume an ACK shape.
+        )
+        val queued = queueRemotePacket18_8(packet, local = false)
+        android.util.Log.i("AtomRemoteMediaK014",
+            "MODE_GET_TX cmd=0x0200 packetId=0 local=false emptyProto=true queued=$queued " +
+            "applicationReplyUnverified=true noRetry=true noSet=true")
+        return queued
+    }
+
+    /**
+     * MEDIA-K01 opt-in FileBrowser.FileListGet diagnostic, GET ONLY.
+     * Source: uploaded macOS Contents (x86_64 + arm64) both encode request
+     * 0x01FC and expected reply 0x01FC, with local=false in the base constructor.
+     * Actual AG2 response and protobuf body are UNVERIFIED. No auto-loop,
+     * no retries, and no file action, SET, delete, or format is possible here.
+     *
+     * Empty proto is a deliberate initial test candidate only. If the AG2
+     * needs a nonempty FileBrowserFileListQuery, it will remain unverified.
+     */
+    @SuppressLint("MissingPermission")
+    fun mediaK01RequestFileListGetOnce(startIndex: Int = 0, localRoute: Boolean = true): Boolean {
+        if (startIndex !in 0..999984 || startIndex % 16 != 0) {
+            android.util.Log.w("AtomRemoteMediaU02", "INVALID_PAGE start=$startIndex noTx=true")
+            return false
+        }
+        if (_mediaSsdFileListState.value.pending) {
+            android.util.Log.w("AtomRemoteMediaU02", "LIST_ALREADY_PENDING noTx=true")
+            return false
+        }
+        if (outputR21MtuBytes < 61) {
+            val mtuRequested = requestR21OutputPageMtu()
+            android.util.Log.i("AtomRemoteMediaK01",
+                "FILE_LIST_MTU_WAIT current=$outputR21MtuBytes requestMtuQueued=$mtuRequested NO_GET_TX")
+            return false
+        }
+        val safe = _tcsPairingState.value.acceptWritten &&
+            _tcsRemoteState.value.available && packetLink18Primed &&
+            packetLink18.peerCredit() && !remoteBootstrapActive &&
+            pendingRemotePacket == null && outputR21MtuBytes >= 61
+        if (!safe) {
+            android.util.Log.i("AtomRemoteMediaK01",
+                "FILE_LIST_GET_BLOCKED accept=${_tcsPairingState.value.acceptWritten} " +
+                "remote=${_tcsRemoteState.value.available} primed=$packetLink18Primed " +
+                "credit=${packetLink18.peerCredit()} bootstrap=$remoteBootstrapActive " +
+                "pending=${pendingRemotePacket?.label} mtu=$outputR21MtuBytes NO_TX")
+            return false
+        }
+        val current = gatt ?: return false
+        val service = current.getService(UUID.fromString(AIRGLU_SHOGUN_SERVICE_UUID)) ?: return false
+        service.getCharacteristic(UUID.fromString(TCS_PACKET_WRITE_UUID)) ?: return false
+        val packetId = 0
+        // Binary-evidenced FileListQuery: field 1 start, field 2 count=16,
+        // field 3 forward=true. Nonzero start is manually requested only.
+        val pageProto = com.atomosremote.nativeapp.media.SsdFileListPageQuery.encode(startIndex)
+        mediaU04LocalRoute = localRoute
+        val packet = PendingRemotePacket(
+            body = buildOfficialAtomMessageBodyWithProtoPayload(
+                packetId, 0x01FC, pageProto
+            ),
+            purpose = "media-k01-filelist-get",
+            label = "K01.FileBrowser.FileListGet",
+            commandId = 0x01FC,
+            packetId = packetId,
+            expectedResponseId = 0x01FC
+        )
+        // Only a manual read resets this evidence window. Empty result is NOT interpreted as empty SSD.
+        mediaU02Generation++
+        val generation = mediaU02Generation
+        _mediaSsdFileListState.value = com.atomosremote.nativeapp.media.SsdBrowserState(
+            status = "Waiting for recorder FileList response (up to 40 seconds)",
+            requestedStartIndex = startIndex, pending = true, generation = generation
+        )
+        mediaK016ListWindowOpenedAtMs = android.os.SystemClock.elapsedRealtime()
+        val queued = queueRemotePacket18_8(packet, local = localRoute)
+        if (!queued) {
+            mediaK016ListWindowOpenedAtMs = 0L
+            _mediaSsdFileListState.value = com.atomosremote.nativeapp.media.SsdBrowserState(
+                status = "FileList request not queued; link/MTU/credit unavailable", requestedStartIndex = startIndex,
+                generation = generation
+            )
+        }
+        android.util.Log.i("AtomRemoteMediaK01",
+            "FILE_LIST_GET_TX cmd=0x01FC expectedCandidate=0x01FC packetId=$packetId " +
+            "local=$localRoute routeTrial=U04 protobuf=${pageProto.toHex()} start=$startIndex count=16 forward=true " +
+            "infoType=FileNameOnly-default candidate=true queued=$queued " +
+            "hardwareReplyUnverified=true noRetry=true noSet=true")
+        return queued
+    }
+
+    fun mediaU02ExpireFileList(generation: Long) {
+        val state = _mediaSsdFileListState.value
+        if (state.pending && state.generation == generation) {
+            mediaK016ListWindowOpenedAtMs = 0L
+            val diagnosis = when {
+                state.fileListOpcodeRx > 0 -> "FileList opcode observed but body/correlation not decoded"
+                mediaU04LocalRoute && state.localApplicationRx == 0 -> "No local application RX during FileList window"
+                mediaU04LocalRoute -> "Local application RX received; no matching FileList payload"
+                state.nonLocalApplicationRx == 0 -> "No non-local application RX during FileList window"
+                else -> "Non-local application RX present, but no FileList response"
+            }
+            _mediaSsdFileListState.value = state.copy(
+                pending = false,
+                status = "$diagnosis; SSD contents UNKNOWN (not empty)"
+            )
+            android.util.Log.w("AtomRemoteMediaU03", "LIST_TIMEOUT generation=$generation diagnosis=$diagnosis " +
+                "localApplicationRx=${state.localApplicationRx} nonLocalApplicationRx=${state.nonLocalApplicationRx} " +
+                "fileListOpcodeRx=${state.fileListOpcodeRx} noReply=true")
+        }
+    }
+
+    fun mediaU02ResetFileList() {
+        mediaK016ListWindowOpenedAtMs = 0L
+        _mediaSsdFileListState.value = com.atomosremote.nativeapp.media.SsdBrowserState()
+    }
+
+    /**
+     * B11 Settings / General.DateGet READ ONLY. Binary callsite 0x1000A9BB0:
+     * request 0x04B9, candidate expected type 0x04B5, m_isLocal=0.
+     * The expected RESPONSE SHAPE is not AG2-hardware verified.
+     * No SET path. Reuse existing GATT session and PacketLink scheduler.
+     */
+    @SuppressLint("MissingPermission")
+    fun b11RequestDateGetOnce(): Boolean {
+        val safe = _tcsPairingState.value.acceptWritten &&
+            _tcsRemoteState.value.available && packetLink18Primed &&
+            !remoteBootstrapActive && pendingRemotePacket == null &&
+            packetLink18.peerCredit()
+        if (!safe) {
+            android.util.Log.i("AtomRemoteB11", "DATE_GET_BLOCKED accept=${_tcsPairingState.value.acceptWritten} available=${_tcsRemoteState.value.available} primed=$packetLink18Primed bootstrap=$remoteBootstrapActive pending=${pendingRemotePacket?.label} peerCredit=${packetLink18.peerCredit()}")
+            return false
+        }
+        val current = gatt ?: return false
+        val service = current.getService(UUID.fromString(AIRGLU_SHOGUN_SERVICE_UUID)) ?: return false
+        service.getCharacteristic(UUID.fromString(TCS_PACKET_WRITE_UUID)) ?: return false
+        tcsCommandSequence = if (tcsCommandSequence >= 255) 1 else tcsCommandSequence + 1
+        val packetId = tcsCommandSequence
+        val body = buildOfficialAtomMessageBody(packetId, 0x04B9)
+        val packet = PendingRemotePacket(
+            body = body,
+            purpose = "settings-b11-date-read-only",
+            label = "B11.DateGet",
+            commandId = 0x04B9,
+            packetId = packetId,
+            expectedResponseId = 0x04B5
+        )
+        pendingRemotePacket = packet
+        pendingRemoteFrameWritten = false
+        android.util.Log.i("AtomRemoteB11", "DATE_GET_DISPATCH packetId=$packetId cmd=0x04B9 expectedCandidate=0x04B5 m_isLocal=0 protoBytes=0")
+        appendEvent("B11 DATE_GET_DISPATCH packetId=$packetId cmd=0x04B9 expectedCandidate=0x04B5 m_isLocal=0")
+        val queued = queueRemotePacket18_8(packet, local = false)
+        android.util.Log.i("AtomRemoteB11", "DATE_GET_QUEUE_RESULT packetId=$packetId accepted=$queued replyUnverified=true")
+        appendEvent("B11 DATE_GET_QUEUE_RESULT packetId=$packetId accepted=$queued replyUnverified=true")
+        return queued
+    }
+
+    /**
+     * B12 Settings consolidated READ ONLY pilots. No SET opcode is accepted.
+     * Request IDs verified by official macOS binary constructor/callsite mapping;
+     * recorder support and response schemas are not verified.
+     */
+    @SuppressLint("MissingPermission")
+    fun b12RequestMappedSettingsGetOnce(commandId: Int): Boolean {
+        val (label, candidateResponse) = when (commandId) {
+            0x04B9 -> Pair("DateGet", 0x04B5)
+            0x04BB -> Pair("DateFormatGet", 0x04B7)
+            0x04B0 -> Pair("DeviceInfoGet", 0x04B0)
+            0x044C -> Pair("TimecodeSourceGet", 0x044C) // B42.1: macOS GET candidate, AG2 RX unverified
+            0x044D -> Pair("TimecodeSelectedSourceGetCandidate", 0x044D) // B44.1 read-only; macOS-derived, recorder enum unverified
+            // B47.11 strict GET-only pilot, static official macOS TimecodeGet and OffsetGet links.
+            // Hardware RX unverified; expected response IDs are MAC constructor fields, not proven AG2 message types.
+            // Both requests are manually triggered ONLY from Settings, no automatic refresh or retries.
+            0x044F -> Pair("B4711TimecodeGetCandidate", 0x044E)
+            0x0451 -> Pair("B4711OffsetGetCandidate", 0x044F)
+            else -> {
+                android.util.Log.w("AtomRemoteB12", "BATCH_GET_REJECTED unmappedOpcode=$commandId; NO_TX")
+                return false
+            }
+        }
+        val safe = _tcsPairingState.value.acceptWritten &&
+            _tcsRemoteState.value.available && packetLink18Primed &&
+            !remoteBootstrapActive && pendingRemotePacket == null &&
+            packetLink18.peerCredit()
+        if (!safe) {
+            android.util.Log.i("AtomRemoteB12", "BATCH_GET_BUSY label=$label accept=${_tcsPairingState.value.acceptWritten} available=${_tcsRemoteState.value.available} primed=$packetLink18Primed bootstrap=$remoteBootstrapActive pending=${pendingRemotePacket?.label} peerCredit=${packetLink18.peerCredit()}")
+            return false
+        }
+        // B14 Settings only: both Date and DeviceInfo returned complete headers but their
+        // AG2 responses were cut to 22 total bytes at default ATT MTU=23 (B13 trace).
+        // Existing OutputR21 MTU helper already uses the serialized ATT queue and
+        // does not send any recorder command; reuse it without modifying transport.
+        // Fail closed: NO Settings GET packet is sent until callback proves MTU >=61.
+        if (outputR21MtuBytes < 61) {
+            val mtuQueued = requestR21OutputPageMtu()
+            android.util.Log.i("AtomRemoteB14", "SETTINGS_MTU_WAIT cmd=0x${commandId.toString(16).uppercase()} " +
+                "current=$outputR21MtuBytes queued=$mtuQueued state=$outputR21MtuResult NO_GET_TX")
+            return false
+        }
+        android.util.Log.i("AtomRemoteB14", "SETTINGS_MTU_READY current=$outputR21MtuBytes " +
+            "cmd=0x${commandId.toString(16).uppercase()}")
+        val current = gatt ?: return false
+        val service = current.getService(UUID.fromString(AIRGLU_SHOGUN_SERVICE_UUID)) ?: return false
+        service.getCharacteristic(UUID.fromString(TCS_PACKET_WRITE_UUID)) ?: return false
+        // B13 route-only A/B: match the AG2-proven Input GET local=true / packetId=0 wire pattern.
+        // Commands remain whitelisted read-only GETs; any SET is still unavailable.
+        val packetId = 0
+        val packet = PendingRemotePacket(
+            body = buildOfficialAtomMessageBody(packetId, commandId),
+            purpose = "settings-b12-read-only",
+            label = "B12.$label",
+            commandId = commandId,
+            packetId = packetId,
+            expectedResponseId = candidateResponse
+        )
+        pendingRemotePacket = packet
+        pendingRemoteFrameWritten = false
+        val cmdHex = "0x" + commandId.toString(16).uppercase().padStart(4, '0')
+        val expectedHex = "0x" + candidateResponse.toString(16).uppercase().padStart(4, '0')
+        android.util.Log.i("AtomRemoteB12", "BATCH_GET_DISPATCH label=$label packetId=$packetId cmd=$cmdHex expectedCandidate=$expectedHex local=true protoBytes=0 route=B14_LOCAL_ZERO_MTU")
+        appendEvent("B12 BATCH_GET_DISPATCH label=$label packetId=$packetId cmd=$cmdHex expectedCandidate=$expectedHex")
+        android.util.Log.i("AtomRemoteB14", "B14_LOCAL_GET_ATTEMPT label=$label packetId=$packetId cmd=$cmdHex local=true SET_DISABLED")
+        val queued = queueRemotePacket18_8(packet, local = true)
+        android.util.Log.i("AtomRemoteB12", "BATCH_GET_QUEUE_RESULT label=$label packetId=$packetId accepted=$queued typedRxUnverified=true")
+        appendEvent("B12 BATCH_GET_QUEUE_RESULT label=$label packetId=$packetId accepted=$queued")
+        return queued
+    }
+
     /**
      * 19.12.9.2 explicit recorder-state refresh. This is intentionally safe to
      * call after the trusted Remote session is already linked. If ATT / PacketLink
@@ -10497,6 +10874,139 @@ private fun b0123TryEmbedOneShot(desired: Int): Boolean {
         if (frameGuideMode != 0) { out.write(0x18); out.write(frameGuideMode and 0x7F) } // field 3
         if (customFrameGuideRatio != 0) { out.write(0x20); out.write(customFrameGuideRatio and 0x7F) } // field 4
         return out.toByteArray()
+    }
+
+    /**
+     * B47.61 Settings-only DateSet WIRE PREVIEW. Never queues or transmits.
+     * The selected recorder timezone and the SET acknowledgement remain unknown.
+     * This method validates a recorder-formatted sample and reuses the existing
+     * AtomMessage body builder solely to produce candidate HEX for inspection.
+     */
+    /** B47.69 Settings ONLY: experimental AirGlu numeric offset 0..20.
+     * Reuses unchanged PacketLink enqueue transport. The numeric field-1 protobuf
+     * is a candidate outside previously observed 1/2. Queue is never device ACK.
+     * Zero uses explicit f1=0 varint; hardware behavior NOT independently proven.
+     * No negative numbers, no auto retry, and source 5 + fresh GET required in UI.
+     */
+    // B47.68: no per-process one-use lockout. The UI still requires a NEW complete
+    // source 5 / TC source 5 / Offset GET and explicit confirmation before EVERY write.
+    fun b4767SendAirGluOffsetPilot(
+        target: Int, observedBefore: Int, sourceGet: Int, timecodeSource: Int
+    ): Boolean {
+        val validTransition = target in 0..20 && observedBefore in 0..20 &&
+            target != observedBefore
+        val ready = validTransition && sourceGet == 5 && timecodeSource == 5 &&
+            _tcsPairingState.value.acceptWritten && _tcsRemoteState.value.available &&
+            packetLink18Primed && !remoteBootstrapActive && pendingRemotePacket == null &&
+            // B47.82: ATT can be busy while the independent PacketLink TX buffer is READY.
+            // Never bypass PacketLink arbitration; its serialized 10ms process tick waits for ATT idle.
+            packetLink18.state().toString() == "READY" && packetLink18.bufferedPacketSize() == 0 &&
+            packetLink18.peerCredit() && outputR21MtuBytes >= 61
+        if (!ready) {
+            android.util.Log.w("AtomRemoteB4767", "SET_PILOT_BLOCKED target=$target before=$observedBefore source=$sourceGet tcSource=$timecodeSource " +
+                "validTransition=$validTransition accept=${_tcsPairingState.value.acceptWritten} remote=${_tcsRemoteState.value.available} " +
+                "primed=$packetLink18Primed bootstrap=$remoteBootstrapActive pendingPacket=${pendingRemotePacket != null} " +
+                "opInFlight=$operationInFlight pendingOps=${pendingOps.size} plinkState=${packetLink18.state()} plinkBuffered=${packetLink18.bufferedPacketSize()} credit=${packetLink18.peerCredit()} mtu=$outputR21MtuBytes noTX=true")
+            return false
+        }
+        // Experimental f1 varint in numeric 0..20 only. Explicit zero field for 0.
+        // Neither zero nor values 3..20 are hardware-proven; no frame unit claim.
+        val protoCandidate = byteArrayOf(0x08, target.toByte())
+        android.util.Log.i("AtomRemoteB4767", "SET_PILOT_INTENT cmd=0x0452 candidate=${protoCandidate.toHex()} target=$target baseline=$observedBefore experimental=true noAutoRetry=true range=0..20")
+        val queued = enqueueOfficialRemoteCommandProtoPayload(
+            commandId = 0x0452,
+            proto = protoCandidate,
+            purpose = "settings-b4767-airglu-offset-one-shot",
+            label = "B4767.OffsetSetPilot",
+            local = true
+        )
+        // Failed PacketLink buffer admission must not leave an orphaned pending pilot.
+        if (!queued && pendingRemotePacket?.label == "B4767.OffsetSetPilot") {
+            pendingRemotePacket = null
+            pendingRemoteFrameWritten = false
+        }
+        android.util.Log.i("AtomRemoteB4782", "OFFSET_BUFFER_RESULT accepted=$queued attInFlight=$operationInFlight packetLink=${packetLink18.state()} buffered=${packetLink18.bufferedPacketSize()} ack=UNVERIFIED postGet=REQUIRED")
+        // A queue result is NOT an ACK or a confirmed setting change.
+        android.util.Log.i("AtomRemoteB4768", "AIRGLU_SET_QUEUE target=$target prior=$observedBefore queued=$queued response=UNKNOWN postGet=REQUIRED retry=false")
+        android.util.Log.i("AtomRemoteB4767", "SET_PILOT_QUEUE_RESULT target=$target queued=$queued ack=UNVERIFIED hardware=UNVERIFIED noAutoRetry=true")
+        return queued
+    }
+
+    /** B47.71 DateSet hardware PILOT, one-shot only. Static Mac cmd 0x04B8 and
+     * field-1 DateTimeMsg text serializer are known; recorder ACK / zone effect
+     * are UNPROVEN. UI must obtain fresh DateGet, physical +10 confirmation and
+     * explicit human confirmation. Never retry or declare queue admission success.
+     * Uses only existing official PacketLink function; transport is unchanged.
+     */
+    fun b4771SendDateSetPilot(utcLikeTarget: String, freshRawBaseline: String): Boolean {
+        val datePattern = java.time.format.DateTimeFormatter.ofPattern(
+            "uuuu-MM-dd HH:mm:ss", java.util.Locale.US
+        ).withResolverStyle(java.time.format.ResolverStyle.STRICT)
+        val requested = try { java.time.LocalDateTime.parse(utcLikeTarget, datePattern) }
+            catch (_: Exception) { null }
+        val original = try { java.time.LocalDateTime.parse(freshRawBaseline, datePattern) }
+            catch (_: Exception) { null }
+        val delta = if (requested != null && original != null)
+            kotlin.math.abs(java.time.Duration.between(original, requested).seconds)
+        else Long.MAX_VALUE
+        // B47.74 Date-only pilot: one calendar day, unchanged running clock
+        // within the fresh-read age bound. Never allow a time-only SET here.
+        val calendarDays = if (requested != null && original != null)
+            java.time.temporal.ChronoUnit.DAYS.between(original.toLocalDate(), requested.toLocalDate())
+        else 0L
+        val clockDrift = if (requested != null && original != null)
+            kotlin.math.abs(java.time.Duration.between(original, requested).seconds - calendarDays * 86400L)
+        else Long.MAX_VALUE
+        val dateOnlyBounded = kotlin.math.abs(calendarDays) == 1L && clockDrift <= 90L
+        val valid = requested != null && original != null && dateOnlyBounded && delta <= 86490L &&
+            _tcsPairingState.value.acceptWritten && _tcsRemoteState.value.available &&
+            packetLink18Primed && !remoteBootstrapActive && pendingRemotePacket == null &&
+            // B47.82: buffer only in official PacketLink READY, even when unrelated ATT is busy.
+            // The preexisting process tick retains exclusive write/read serialization.
+            packetLink18.state().toString() == "READY" && packetLink18.bufferedPacketSize() == 0 &&
+            packetLink18.peerCredit() && outputR21MtuBytes >= 61
+        if (!valid) {
+            android.util.Log.w("AtomRemoteB4771", "DATESET_BLOCKED dateOnlyBounded=$dateOnlyBounded dayShift=$calendarDays driftSeconds=$clockDrift deltaSeconds=$delta accept=${_tcsPairingState.value.acceptWritten} remote=${_tcsRemoteState.value.available} primed=$packetLink18Primed bootstrap=$remoteBootstrapActive packetPending=${pendingRemotePacket != null} opInFlight=$operationInFlight pendingOps=${pendingOps.size} plinkState=${packetLink18.state()} plinkBuffered=${packetLink18.bufferedPacketSize()} credit=${packetLink18.peerCredit()} mtu=$outputR21MtuBytes noTX=true")
+            return false
+        }
+        val proto = byteArrayOf(0x0A, 0x13) + utcLikeTarget.toByteArray(Charsets.US_ASCII)
+        android.util.Log.i("AtomRemoteB4771", "DATE_ONLY_TX_INTENT cmd=0x04B8 candidate=${proto.toHex()} dayShift=$calendarDays driftSeconds=$clockDrift noAutoRetry=true")
+        val queued = enqueueOfficialRemoteCommandProtoPayload(
+            commandId = 0x04B8,
+            proto = proto,
+            purpose = "settings-b4771-datetime-one-shot",
+            label = "B4771.DateSetPilot",
+            local = true
+        )
+        if (!queued && pendingRemotePacket?.label == "B4771.DateSetPilot") {
+            pendingRemotePacket = null
+            pendingRemoteFrameWritten = false
+        }
+        android.util.Log.i("AtomRemoteB4782", "DATE_BUFFER_RESULT accepted=$queued attInFlight=$operationInFlight packetLink=${packetLink18.state()} buffered=${packetLink18.bufferedPacketSize()} ack=UNVERIFIED postGet=REQUIRED")
+        android.util.Log.i("AtomRemoteB4771", "DATESET_QUEUE_RESULT queued=$queued ack=UNVERIFIED physical=UNVERIFIED postGet=REQUIRED retry=false")
+        return queued
+    }
+
+    fun b4761BuildDateSetPreviewNoTx(recorderTimestamp: String): String {
+        if (!Regex("""^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$""").matches(recorderTimestamp)) {
+            return "BLOCKED: fresh recorder GET timestamp must be yyyy-MM-dd HH:mm:ss; no TX"
+        }
+        try {
+            java.time.LocalDateTime.parse(
+                recorderTimestamp,
+                java.time.format.DateTimeFormatter.ofPattern("uuuu-MM-dd HH:mm:ss", java.util.Locale.US)
+                    .withResolverStyle(java.time.format.ResolverStyle.STRICT)
+            )
+        } catch (_: java.time.format.DateTimeParseException) {
+            return "BLOCKED: invalid calendar value; no TX"
+        }
+        val timestampBytes = recorderTimestamp.toByteArray(Charsets.US_ASCII)
+        if (timestampBytes.size != 19) return "BLOCKED: unexpected timestamp size; no TX"
+        val protobufCandidate = byteArrayOf(0x0A, 0x13) + timestampBytes
+        val bodyCandidate = buildOfficialAtomMessageBodyWithProtoPayload(0, 0x04B8, protobufCandidate)
+        return "CANDIDATE ONLY | cmd=0x04B8 | proto=" + protobufCandidate.toHex() +
+            " | body=" + bodyCandidate.toHex() +
+            " | source=recorder GET sample | timezone=UNKNOWN | ACK=UNKNOWN | TX=DISABLED"
     }
 
     private fun buildOfficialAtomMessageBodyWithProtoPayload(
@@ -11254,6 +11764,61 @@ private fun b0123TryEmbedOneShot(desired: Int): Boolean {
         )
         appendEvent("TCS18.8 REMOTE PAYLOAD local=$local packetId=$packetId payloadLen=$payloadLen messageType=$messageType data=${body.toHex()}")
 
+        // K011 passive raw RX window, no change to PacketLink handling or parser routing.
+        val mediaK011AgeMs = android.os.SystemClock.elapsedRealtime() - mediaK011RxWindowAtMs
+        if (mediaK011RxWindowAtMs != 0L && mediaK011AgeMs in 0L..35000L) {
+            android.util.Log.i("AtomRemoteMediaK011",
+                "MEDIA_STATE_WINDOW_RX packetId=$packetId local=$local opcode=0x${messageType.toString(16).uppercase()} " +
+                    "candidateByType=${(messageType and 0x7FFF) == 0x04b3 || (messageType and 0x7FFF) == 0x04b5} " +
+                    "payloadLen=${body.size} payload=${body.toHex()} requestMatchUnknown=true")
+        }
+
+        // K016 passive FileBrowser response receiver. Do not intercept or mutate other RX.
+        // A successful GATT write or E0 flow-control is never a decoded filename.
+        val listAgeMs = android.os.SystemClock.elapsedRealtime() - mediaK016ListWindowOpenedAtMs
+        if (mediaK016ListWindowOpenedAtMs != 0L && listAgeMs in 0L..40000L) {
+            // U03 passive health classification. Parsed application frames only;
+            // PacketLink E0 flow-credit has no application header and never reaches here.
+            val beforeEvidence = _mediaSsdFileListState.value
+            if (beforeEvidence.pending) {
+                val listOpcode = (messageType and 0x7fff) == 0x01fc
+                val afterEvidence = beforeEvidence.copy(
+                    localApplicationRx = beforeEvidence.localApplicationRx + if (local) 1 else 0,
+                    nonLocalApplicationRx = beforeEvidence.nonLocalApplicationRx + if (local) 0 else 1,
+                    fileListOpcodeRx = beforeEvidence.fileListOpcodeRx + if (listOpcode) 1 else 0,
+                    lastApplicationOpcode = messageType
+                )
+                _mediaSsdFileListState.value = afterEvidence
+                if (afterEvidence.localApplicationRx + afterEvidence.nonLocalApplicationRx <= 32) {
+                    android.util.Log.i("AtomRemoteMediaU03", "APP_RX_WINDOW opcode=0x${messageType.toString(16)} " +
+                        "local=$local packetId=$packetId payloadBytes=${body.size} " +
+                        "fileListCandidate=$listOpcode generation=${afterEvidence.generation}")
+                }
+            }
+            if ((messageType and 0x7fff) == 0x01fc) {
+                val currentList = _mediaSsdFileListState.value
+                val parsed = if (currentList.pending && local == mediaU04LocalRoute)
+                    com.atomosremote.nativeapp.media.SsdFileListDecoder.decode(
+                        messageType, body, currentList.requestedStartIndex
+                    ) else null
+                if (parsed != null) {
+                    _mediaSsdFileListState.value = parsed.copy(
+                        generation = currentList.generation,
+                        localApplicationRx = currentList.localApplicationRx,
+                        nonLocalApplicationRx = currentList.nonLocalApplicationRx,
+                        fileListOpcodeRx = currentList.fileListOpcodeRx,
+                        lastApplicationOpcode = currentList.lastApplicationOpcode
+                    )
+                    mediaK016ListWindowOpenedAtMs = 0L
+                    android.util.Log.i("AtomRemoteMediaK016", "LIST_CANDIDATE_RX opcode=0x${messageType.toString(16)} local=$local packetId=$packetId entries=${parsed.entries.size} total=${parsed.totalFiles} recorderValidated=false")
+                } else {
+                    android.util.Log.w("AtomRemoteMediaK016", "LIST_UNPARSED_RX opcode=0x${messageType.toString(16)} local=$local packetId=$packetId body=${body.toHex()} candidateOnly=true")
+                }
+            } else {
+                android.util.Log.d("AtomRemoteMediaK016", "LIST_WINDOW_OTHER_RX type=0x${messageType.toString(16)} local=$local bytes=${body.size}")
+            }
+        }
+
         if (WlConnectPrototype.isPotentialConnectResponse(messageType)) {
             appendEvent(
                 "WLP3 RAW CONNECT RX packetId=$packetId " +
@@ -11443,7 +12008,22 @@ private fun b0123TryEmbedOneShot(desired: Int): Boolean {
             )
         }
 
-        handleExtendedInputPayload(messageType, body, local)
+        // U04.22: exact Media/Record.RebootToPlayback typed response 0x8132.
+        // Do not allow an unrelated, currently active Extended Input probe to
+        // label this reply as Camera Options. This ONLY changes classification;
+        // it neither sends a packet nor consumes the response in the remaining
+        // existing handlers below. Protobuf field 1 is NOT a proven mode ACK.
+        if (messageType == 0x8132) {
+            android.util.Log.i(
+                "AtomRemoteMediaU0422",
+                "PREPARE_PLAYBACK_TYPED_RX_CANDIDATE response=0x8132 local=$local " +
+                    "packetId=$packetId field1=${protoVarintField(body, 1) ?: -1} " +
+                    "payload=${body.toHex()} recorderModeConfirmed=false " +
+                    "inputProbeConsumed=false noNewTx=true"
+            )
+        } else {
+            handleExtendedInputPayload(messageType, body, local)
+        }
 
         // 19.12.10 semantic correlation survives the E0 transport turn. The
         // PacketLink transport may clear pendingRemotePacket before the recorder's
@@ -14575,6 +15155,19 @@ private fun b0123TryEmbedOneShot(desired: Int): Boolean {
             val declaredEnd = (5 + payloadLen).coerceAtMost(completePayload.size)
             val messagePayload = if (declaredEnd > 5) completePayload.copyOfRange(5, declaredEnd) else byteArrayOf()
             val decoded = "AtomMessage packetId=$packetId payloadLen=$payloadLen messageType=$messageType data=${messagePayload.toHex()}"
+            // MEDIA-K01: raw RX candidate only; do not mark an SSD file list
+            // validated from an E0 ACK, arbitrary async frame, or generic success.
+            if (packet?.purpose == "media-k01-filelist-get") {
+                val correlated = packetId == packet.packetId
+                val candidateType = messageType == 0x01FC || messageType == 0x81FC
+                android.util.Log.i("AtomRemoteMediaK01",
+                    "FILE_LIST_RX packetId=$packetId requestPacketId=${packet.packetId} " +
+                    "responseType=0x${messageType.toString(16).uppercase()} " +
+                    "declaredPayloadBytes=$payloadLen actualPayloadBytes=${messagePayload.size} " +
+                    "packetCorrelated=$correlated opcodeCandidate=$candidateType " +
+                    "rawProto=${messagePayload.toHex().take(12000)} " +
+                    "typedFilesVerified=false")
+            }
             if (outputR7IsTrackedPurpose(packet?.purpose) ||
                 messageType in arrayOf(0x00DC, 0x0648, 0xFFFF, 0xFFFE, 0x00E2, 0x00E3, 0x00E6, 0x00E7)) {
                 outputR7Trace("RX_ATOM purpose=${packet?.purpose ?: "async"} requestPacketId=${packet?.packetId ?: -1} responsePacketId=$packetId type=0x${messageType.toString(16)} payloadLen=$payloadLen availableBytes=${completePayload.size} local=${tcsPacketLocalFlag} raw=${messagePayload.toHex().take(120)}")

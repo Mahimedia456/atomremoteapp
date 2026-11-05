@@ -128,11 +128,14 @@ class RemoteTransportUiController {
         if (isIdlePhase(remotePhase) && (current.sawBusy || commandConfirmed)) {
             val nextMode = when (current.pendingAction) {
                 "record-start", "record-stop" -> Mode.RECORD
+                "enter-playback-mode" -> Mode.PLAYBACK
                 "play", "pause" -> Mode.PLAYBACK
                 "return-record-mode" -> Mode.RECORD
                 else -> current.mode
             }
             val doneMessage = when (current.pendingAction) {
+                "enter-playback-mode" ->
+                    "Playback mode request completed at transport level. Verify recorder screen."
                 "return-record-mode" ->
                     "Recorder is back in Record mode. Press RECORD again to start recording."
                 else -> "${current.pendingLabel ?: "Remote command"} completed."

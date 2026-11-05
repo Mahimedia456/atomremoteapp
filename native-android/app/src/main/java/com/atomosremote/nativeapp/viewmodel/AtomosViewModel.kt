@@ -2112,6 +2112,159 @@ class AtomosViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     /**
+     * MEDIA-U01: Evidence-scoped Media tab mode switch. This uses the EXISTING
+     * 0x0132 Record.RebootToPlayback transport, not a guessed Media command.
+     * Command acceptance is NOT physical recorder mode confirmation.
+     */
+    fun enterPlaybackModeOnlyFromMediaUi(): Boolean {
+        val remote = gatt.tcsRemoteState.value
+        if (!_pairingCodeAccepted.value || !gatt.tcsPairingState.value.acceptWritten) {
+            _commandStatus.value = "Official TCS pairing must be accepted before switching modes."
+            return false
+        }
+        if (!remote.available || remoteTransportUiController.state.value.recoveryRequired) {
+            _commandStatus.value = "Remote transport is not ready for Playback mode."
+            return false
+        }
+        val queued = gatt.sendOfficialRemoteCommand("prepare-playback-mode")
+        _commandStatus.value = if (queued) "Playback mode requested (0x0132); verify recorder screen." else
+            "Playback mode could not be queued."
+        Log.i("AtomRemoteMediaU01", "MODE_REQUEST target=playback queued=$queued recorderConfirmed=false")
+        return queued
+    }
+
+    /**
+     * MEDIA-U01: Play/Pause refer ONLY to the current recorder-selected clip.
+     * File selection over BLE is NOT implemented; no FilePlay/DirGo is transmitted.
+     * Direct official transport avoids macParity's hidden second reboot on Play.
+     */
+    fun sendMediaPlaybackOnlyFromUi(command: String): Boolean {
+        if (command != "play" && command != "pause") return false
+        val remote = gatt.tcsRemoteState.value
+        val uiState = remoteTransportUiController.state.value
+        if (!_pairingCodeAccepted.value || !gatt.tcsPairingState.value.acceptWritten ||
+            !remote.available || uiState.mode != RemoteTransportUiController.Mode.PLAYBACK ||
+            uiState.recoveryRequired
+        ) {
+            _commandStatus.value = "Playback control blocked: linked Playback mode has not been tracked."
+            return false
+        }
+        val queued = gatt.sendOfficialRemoteCommand(command)
+        _commandStatus.value = if (queued) "${command.replaceFirstChar { it.uppercase() }} queued for recorder-selected clip." else
+            "${command.replaceFirstChar { it.uppercase() }} not queued."
+        Log.i("AtomRemoteMediaU01", "CONTROL_REQUEST control=$command queued=$queued recorderConfirmed=false")
+        return queued
+    }
+
+
+    /** K01.4 manual read-only FileBrowser mode evidence, never a SET. */
+    fun requestMediaK014ModeGetOnce(): Boolean {
+        val remote = gatt.tcsRemoteState.value
+        val uiState = remoteTransportUiController.state.value
+        if (!_pairingCodeAccepted.value || !gatt.tcsPairingState.value.acceptWritten ||
+            !remote.available || uiState.mode != RemoteTransportUiController.Mode.PLAYBACK ||
+            uiState.recoveryRequired || uiState.pendingAction != null
+        ) {
+            _commandStatus.value = "FileBrowser ModeGet blocked: enter Playback and finish current action."
+            Log.i("AtomRemoteMediaK014", "MODE_GET_UI_BLOCKED NO_TX")
+            return false
+        }
+        val queued = gatt.mediaK014RequestFileBrowserModeGetOnce()
+        _commandStatus.value = if (queued) "FileBrowser ModeGet 0x0200 requested. Recorder reply unverified." else
+            "FileBrowser ModeGet not queued. Check MTU / link readiness before one manual retry."
+        Log.i("AtomRemoteMediaK014", "MODE_GET_UI_REQUEST queued=$queued recorderConfirmed=false")
+        return queued
+    }
+
+    /** K011: manual one-shot MediaStateGet, no optimistic 'SSD ready' status. */
+    fun requestMediaK011StateGetOnce(): Boolean {
+        val uiState = remoteTransportUiController.state.value
+        val remote = gatt.tcsRemoteState.value
+        if (!_pairingCodeAccepted.value || !gatt.tcsPairingState.value.acceptWritten ||
+            !remote.available || uiState.mode != RemoteTransportUiController.Mode.PLAYBACK ||
+            uiState.recoveryRequired || uiState.pendingAction != null
+        ) {
+            _commandStatus.value = "MediaState GET blocked: connect, enter Playback, finish current action."
+            Log.i("AtomRemoteMediaK011", "MEDIA_STATE_UI_BLOCKED noTx=true")
+            return false
+        }
+        val queued = gatt.mediaK011RequestMediaStateGetOnce()
+        _commandStatus.value = if (queued)
+            "MediaStateGet (0x04B5) queued; raw RX evidence only, no SSD status confirmed."
+        else "MediaState GET not queued; check MTU/credit, or already queued."
+        Log.i("AtomRemoteMediaK011", "MEDIA_STATE_UI_REQUEST queued=$queued recorderConfirmed=false")
+        return queued
+    }
+
+    /** Manual, one-shot FileBrowser ModeStart is state-changing; no auto-TX. */
+    fun requestMediaK016ModeStartOnce(): Boolean {
+        val uiState = remoteTransportUiController.state.value
+        val remote = gatt.tcsRemoteState.value
+        if (!_pairingCodeAccepted.value || !gatt.tcsPairingState.value.acceptWritten ||
+            !remote.available || uiState.mode != RemoteTransportUiController.Mode.PLAYBACK ||
+            uiState.recoveryRequired || uiState.pendingAction != null
+        ) {
+            _commandStatus.value = "FileBrowser start blocked: connect and enter Playback first."
+            return false
+        }
+        val queued = gatt.mediaK016RequestModeStartOnce()
+        _commandStatus.value = if (queued) "FileBrowser ModeStart (0x01FE) queued; check recorder screen, then read SSD." else
+            "FileBrowser ModeStart not queued or already attempted. Do not force a retry."
+        return queued
+    }
+
+    /** K016: only entries obtained from raw, structurally decoded FileBrowser RX are shown. */
+    val mediaSsdFileListState: StateFlow<com.atomosremote.nativeapp.media.SsdBrowserState> = gatt.mediaSsdFileListState
+
+    /**
+     * U04 dedicated FileBrowser test button route, using the same validated
+     * one-shot queued GET scheduler and pairing/Playback guards as K01.
+     * The macOS command-object route is non-local (false). U031 local trial
+     * stays available for comparison; it is NOT macOS-equivalent.
+     */
+    fun requestMediaU04FileListRouteOnce(startIndex: Int, local: Boolean): Boolean {
+        val remote = gatt.tcsRemoteState.value
+        val uiState = remoteTransportUiController.state.value
+        if (!_pairingCodeAccepted.value || !gatt.tcsPairingState.value.acceptWritten ||
+            !remote.available || uiState.mode != RemoteTransportUiController.Mode.PLAYBACK ||
+            uiState.recoveryRequired || uiState.pendingAction != null
+        ) {
+            _commandStatus.value = "SSD diagnostic blocked: enter Playback and finish current action."
+            Log.i("AtomRemoteMediaU04", "TEST_ROUTE_BLOCKED local=$local noTx=true")
+            return false
+        }
+        val queued = gatt.mediaK01RequestFileListGetOnce(startIndex, localRoute = local)
+        _commandStatus.value = if (queued)
+            "FileListGet route=${if (local) "LOCAL E8 (trial)" else "NONLOCAL E0 (macOS)"} queued; awaiting recorder evidence"
+        else "FileListGet not queued: MTU, pending request, or link not ready"
+        Log.i("AtomRemoteMediaU04", "TEST_ROUTE_REQUEST cmd=0x01FC local=$local start=$startIndex queued=$queued noSet=true recorderConfirmed=false")
+        return queued
+    }
+
+    /** MEDIA-K01: manual one-shot SSD listing evidence. No user-selected FilePlay. */
+    fun requestMediaK01FileListGetOnce(startIndex: Int = 0): Boolean {
+        val remote = gatt.tcsRemoteState.value
+        val uiState = remoteTransportUiController.state.value
+        if (!_pairingCodeAccepted.value || !gatt.tcsPairingState.value.acceptWritten ||
+            !remote.available || uiState.mode != RemoteTransportUiController.Mode.PLAYBACK ||
+            uiState.recoveryRequired || uiState.pendingAction != null
+        ) {
+            _commandStatus.value = "SSD GET blocked: enter Playback and finish current Remote action first."
+            Log.i("AtomRemoteMediaK01", "FILE_LIST_UI_BLOCKED noTx=true")
+            return false
+        }
+        val queued = gatt.mediaK01RequestFileListGetOnce(startIndex)
+        _commandStatus.value = if (queued)
+            "SSD FileListGet evidence requested (0x01FC). Files not verified yet."
+        else "SSD FileListGet not queued. Check PacketLink credit / negotiated MTU and retry manually."
+        Log.i("AtomRemoteMediaK01", "FILE_LIST_UI_REQUEST queued=$queued startIndex=$startIndex recorderConfirmed=false")
+        return queued
+    }
+
+    fun mediaU02ExpireFileList(generation: Long) = gatt.mediaU02ExpireFileList(generation)
+    fun mediaU02ResetFileList() = gatt.mediaU02ResetFileList()
+
+    /**
      * UI recovery path for a stuck/failed Remote transaction.
      *
      * Uses only the existing public disconnect/connectTrusted API from the frozen

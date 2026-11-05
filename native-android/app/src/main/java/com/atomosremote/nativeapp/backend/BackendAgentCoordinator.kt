@@ -58,6 +58,7 @@ class BackendAgentCoordinator(
 
     private suspend fun executeCommand(command: BackendAgentCommand) {
             when (command.action) {
+                "media.filebrowser.evidence.snapshot" -> runFileBrowserEvidenceSnapshot(command)
                 "input.page.get","input.hdr.get","input.summary.get" -> runInputCollector(command)
                 "input.source.get" -> runInputField(command, "source", "0x0064")
                 "input.hdrState.get" -> runInputField(command, "hdrState", "0x006D")
@@ -77,6 +78,42 @@ class BackendAgentCoordinator(
                 "monitor.mode.set" -> runInt(command,"mode") { gattClient.sendOfficialMonitorMode(it) }
                 else -> sendFail(command,"Action not wired in Phase 07-09")
             }
+    }
+
+    // U04.54 read-only bridge. A snapshot is evidence of app state, NOT a fresh recorder reply.
+    // This action does not call refresh, queueRemotePacket, BLE, FilePlay or ModeStart.
+    private fun runFileBrowserEvidenceSnapshot(command: BackendAgentCommand) {
+        val s = gattClient.mediaSsdFileListState.value
+        val entries = org.json.JSONArray()
+        for (row in s.entries.take(256)) {
+            entries.put(JSONObject().put("index", row.index).put("filename", row.filename))
+        }
+        val data = JSONObject()
+            .put("origin", "ANDROID_GATT_FILEBROWSER_STATEFLOW_CACHE")
+            .put("evidenceTimestampEpochMs", System.currentTimeMillis())
+            .put("recorderTxOnThisRequest", false)
+            .put("hardwareVerifiedForThisApiCall", false)
+            .put("apiResultMeaning", "STATE_SNAPSHOT_RECEIVED_NOT_FRESH_RECORDER_PROOF")
+            .put("status", s.status)
+            .put("generation", s.generation)
+            .put("pending", s.pending)
+            .put("requestedStartIndex", s.requestedStartIndex)
+            .put("startIndex", s.startIndex)
+            .put("totalFiles", s.totalFiles ?: JSONObject.NULL)
+            .put("responseOpcode", s.responseOpcode?.let { "0x" + it.toString(16).uppercase().padStart(4, '0') } ?: JSONObject.NULL)
+            .put("lastApplicationOpcode", s.lastApplicationOpcode?.let { "0x" + it.toString(16).uppercase().padStart(4, '0') } ?: JSONObject.NULL)
+            .put("localApplicationRx", s.localApplicationRx)
+            .put("nonLocalApplicationRx", s.nonLocalApplicationRx)
+            .put("fileListOpcodeRx", s.fileListOpcodeRx)
+            .put("recorderValidatedByExistingState", s.recorderValidated)
+            .put("entryCount", s.entries.size)
+            .put("entries", entries)
+        transport.sendResult(
+            BackendAgentResult(
+                command.requestId, deviceId, command.action, true,
+                data = data, remoteResponse = "cached-filebrowser-state-no-recorder-tx"
+            )
+        )
     }
 
     private suspend fun runInputCollector(command:BackendAgentCommand) {
@@ -207,19 +244,75 @@ class BackendAgentCoordinator(
 
 
     private suspend fun runStateRefresh(command:BackendAgentCommand) {
-        val before=gattClient.remoteStateSnapshot.value.generation
-        if(!gattClient.refreshOfficialRecorderState()){sendFail(command,"State refresh blocked: recorder not PacketLink-ready");return}
-        val s=withTimeoutOrNull(12_000){
-            gattClient.remoteStateSnapshot.first{
-                it.generation>before && (it.cycleComplete || it.pages.isNotEmpty())
+        // U04.52: A state snapshot is not proof of recorder readback.
+        // GATT/PacketLink TX and all other agent actions remain unchanged.
+        val before = gattClient.remoteStateSnapshot.value.generation
+        if (!gattClient.refreshOfficialRecorderState()) {
+            sendFail(command, "State refresh blocked: recorder not PacketLink-ready")
+            return
+        }
+        val s = withTimeoutOrNull(12_000) {
+            gattClient.remoteStateSnapshot.first {
+                it.generation > before && (it.cycleComplete || it.pages.isNotEmpty())
             }
         } ?: gattClient.remoteStateSnapshot.value
-        val data=runCatching{JSONObject(s.json)}.getOrElse{JSONObject().put("generation",s.generation).put("receivedPages",s.receivedPages).put("cycleComplete",s.cycleComplete)}
-        if (s.cycleComplete && s.pages.isEmpty()) {
-            data.put("appPollingPayloadStatus", "NO_TYPED_PAGE_PAYLOAD")
-            data.put("transportStatus", "PACKETLINK_DELIVERED_ONLY")
+
+        // The MAC13 collector can send a general refresh for ANY state action.
+        // A fresh snapshot or some other page is NOT proof of this requested page.
+        val fresh = s.generation > before
+        val requestedPage = if (fresh) s.pages[command.commandId] else null
+        val typedPageObserved = requestedPage != null &&
+            requestedPage.rawHex.isNotBlank() &&
+            requestedPage.responseType != 0xFFFE &&
+            requestedPage.responseType != 0xFFFF
+
+        val snapshot = runCatching { JSONObject(s.json) }.getOrElse {
+            JSONObject().put("generation", s.generation)
+                .put("receivedPages", s.receivedPages)
+                .put("cycleComplete", s.cycleComplete)
         }
-        transport.sendResult(BackendAgentResult(command.requestId,deviceId,command.action,true,data=data,responseId=command.commandHex,remoteResponse="state-snapshot"))
+        val data = JSONObject()
+            .put("requestedCommandId", command.commandHex)
+            .put("beforeGeneration", before)
+            .put("generation", s.generation)
+            .put("freshGeneration", fresh)
+            .put("cycleComplete", s.cycleComplete)
+            .put("receivedPages", s.receivedPages)
+            .put("expectedPages", s.expectedPages)
+            .put("requestedTypedPageObserved", typedPageObserved)
+            // The snapshot has no API-request-to-packet-id correlation.
+            .put("packetMatchedToApiRequest", false)
+            .put("hardwareVerified", false)
+            .put("snapshot", snapshot)
+
+        if (!typedPageObserved) {
+            data.put("appPollingPayloadStatus", "NO_FRESH_TYPED_REQUESTED_PAGE")
+            data.put("transportStatus", "SNAPSHOT_ONLY_NOT_RECORDER_READBACK")
+            transport.sendResult(
+                BackendAgentResult(
+                    command.requestId, deviceId, command.action, false,
+                    data = data,
+                    remoteResponse = "state-snapshot-unverified",
+                    error = "NO_FRESH_TYPED_RECORDER_PAGE for ${command.commandHex}; " +
+                        "pages=${s.receivedPages}/${s.expectedPages}; packet response unverified"
+                )
+            )
+            return
+        }
+
+        // Useful recorder-origin typed page was observed but full packet-ID
+        // correlation to the specific API call is still not proven.
+        data.put("appPollingPayloadStatus", "TYPED_REQUESTED_PAGE_OBSERVED")
+        data.put("transportStatus", "TYPED_PAGE_OBSERVED_NOT_API_PACKET_CORRELATED")
+        transport.sendResult(
+            BackendAgentResult(
+                command.requestId, deviceId, command.action, true,
+                data = data,
+                rawPayloadHex = requestedPage!!.rawHex,
+                responseId = "0x${requestedPage.responseType.toString(16).uppercase().padStart(4, '0')}",
+                remoteResponse = "typed-page-observed-not-request-correlated"
+            )
+        )
     }
 
     private fun runBoolean(c:BackendAgentCommand, fn:(Boolean)->Boolean){ val v=c.payload?.optBoolean("enabled",false)?:false; sendQueued(c,fn(v),JSONObject().put("enabled",v)) }
