@@ -2170,7 +2170,7 @@ class AtomosViewModel(app: Application) : AndroidViewModel(app) {
             return false
         }
         val queued = gatt.mediaK014RequestFileBrowserModeGetOnce()
-        _commandStatus.value = if (queued) "FileBrowser ModeGet 0x0200 requested. Recorder reply unverified." else
+        _commandStatus.value = if (queued) "FileBrowser ModeGet 0x01FF queued; waiting for recorder reply." else
             "FileBrowser ModeGet not queued. Check MTU / link readiness before one manual retry."
         Log.i("AtomRemoteMediaK014", "MODE_GET_UI_REQUEST queued=$queued recorderConfirmed=false")
         return queued
@@ -2208,13 +2208,55 @@ class AtomosViewModel(app: Application) : AndroidViewModel(app) {
             return false
         }
         val queued = gatt.mediaK016RequestModeStartOnce()
-        _commandStatus.value = if (queued) "FileBrowser ModeStart (0x01FE) queued; check recorder screen, then read SSD." else
+        _commandStatus.value = if (queued) "FileBrowser ModeStart (0x01FD MoviePicker) queued; confirm recorder state." else
             "FileBrowser ModeStart not queued or already attempted. Do not force a retry."
+        return queued
+    }
+
+    /** 0x0202 sets filename length. Only explicit UI confirmation may call this. */
+    fun requestMediaU0459FilenameSizeOnce(): Boolean {
+        val uiState = remoteTransportUiController.state.value
+        if (!_pairingCodeAccepted.value || !gatt.tcsPairingState.value.acceptWritten ||
+            !gatt.tcsRemoteState.value.available ||
+            uiState.mode != RemoteTransportUiController.Mode.PLAYBACK ||
+            uiState.recoveryRequired || uiState.pendingAction != null) return false
+        val queued = gatt.mediaU0459RequestFilenameSizeOnce()
+        _commandStatus.value = if (queued) "Filename size setting queued, recorder acknowledgement unknown." else
+            "Filename size setting blocked: PacketLink busy or already attempted."
+        return queued
+    }
+
+    /** FilePlay uses index from a genuine, correlated FileList RX only. */
+    fun requestMediaU0459PlayFile(index: Int): Boolean {
+        val uiState = remoteTransportUiController.state.value
+        if (!_pairingCodeAccepted.value || !gatt.tcsPairingState.value.acceptWritten ||
+            !gatt.tcsRemoteState.value.available ||
+            uiState.mode != RemoteTransportUiController.Mode.PLAYBACK ||
+            uiState.recoveryRequired || uiState.pendingAction != null) return false
+        val queued = gatt.mediaU0459RequestPlayFile(index)
+        _commandStatus.value = if (queued) "FilePlay index=$index queued, awaiting recorder reply." else
+            "FilePlay blocked: no recorder list, pending command or link not ready."
         return queued
     }
 
     /** K016: only entries obtained from raw, structurally decoded FileBrowser RX are shown. */
     val mediaSsdFileListState: StateFlow<com.atomosremote.nativeapp.media.SsdBrowserState> = gatt.mediaSsdFileListState
+    val mediaU0465ProbeState: StateFlow<com.atomosremote.nativeapp.media.U0465ProbeState> = gatt.mediaU0465ProbeState
+
+    /** U04.65: only allowlisted read-only GETs; Playback + pairing checked in UI and GATT. */
+    fun requestMediaU0465ProbeOnce(name: String): Boolean {
+        val uiState = remoteTransportUiController.state.value
+        val remote = gatt.tcsRemoteState.value
+        if (!_pairingCodeAccepted.value || !gatt.tcsPairingState.value.acceptWritten ||
+            !remote.available || uiState.mode != RemoteTransportUiController.Mode.PLAYBACK ||
+            uiState.recoveryRequired || uiState.pendingAction != null) {
+            Log.i("AtomRemoteMediaU0465", "UI_GET_BLOCKED name=$name noTx=true")
+            return false
+        }
+        return gatt.mediaU0465ManualGetOnce(name)
+    }
+
+    fun expireMediaU0465Probe(generation: Long) = gatt.mediaU0465Expire(generation)
 
     /**
      * U04 dedicated FileBrowser test button route, using the same validated
@@ -2237,7 +2279,7 @@ class AtomosViewModel(app: Application) : AndroidViewModel(app) {
         _commandStatus.value = if (queued)
             "FileListGet route=${if (local) "LOCAL E8 (trial)" else "NONLOCAL E0 (macOS)"} queued; awaiting recorder evidence"
         else "FileListGet not queued: MTU, pending request, or link not ready"
-        Log.i("AtomRemoteMediaU04", "TEST_ROUTE_REQUEST cmd=0x01FC local=$local start=$startIndex queued=$queued noSet=true recorderConfirmed=false")
+        Log.i("AtomRemoteMediaU04", "TEST_ROUTE_REQUEST cmd=0x01FB local=$local start=$startIndex queued=$queued recorderConfirmed=false")
         return queued
     }
 
@@ -2253,9 +2295,9 @@ class AtomosViewModel(app: Application) : AndroidViewModel(app) {
             Log.i("AtomRemoteMediaK01", "FILE_LIST_UI_BLOCKED noTx=true")
             return false
         }
-        val queued = gatt.mediaK01RequestFileListGetOnce(startIndex)
+        val queued = gatt.mediaK01RequestFileListGetOnce(startIndex, localRoute = false)
         _commandStatus.value = if (queued)
-            "SSD FileListGet evidence requested (0x01FC). Files not verified yet."
+            "SSD FileListGet (0x01FB) queued; awaiting live FileList response."
         else "SSD FileListGet not queued. Check PacketLink credit / negotiated MTU and retry manually."
         Log.i("AtomRemoteMediaK01", "FILE_LIST_UI_REQUEST queued=$queued startIndex=$startIndex recorderConfirmed=false")
         return queued

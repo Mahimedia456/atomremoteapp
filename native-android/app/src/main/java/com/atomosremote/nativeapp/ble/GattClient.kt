@@ -130,8 +130,22 @@ class GattClient(context: Context) {
     /** K016 recorder-only list candidates, reset each manual GET; no fake media files. */
     private val _mediaSsdFileListState = MutableStateFlow(com.atomosremote.nativeapp.media.SsdBrowserState())
     val mediaSsdFileListState: StateFlow<com.atomosremote.nativeapp.media.SsdBrowserState> = _mediaSsdFileListState
+    // U04.65: isolated FileBrowser GET probe display; existing BLE / PacketLink mechanics frozen.
+    private val _mediaU0465ProbeState = MutableStateFlow(com.atomosremote.nativeapp.media.U0465ProbeState())
+    val mediaU0465ProbeState: StateFlow<com.atomosremote.nativeapp.media.U0465ProbeState> = _mediaU0465ProbeState
+    private val mediaU0465Consumed = mutableSetOf<String>()
+    private var mediaU0465OpenedAtMs: Long = 0L
     private var mediaK016ListWindowOpenedAtMs: Long = 0L
+    private var mediaU0456AttemptConsumed = false // retired legacy flag; no U0459 runtime calls
+    private var mediaU0459ListPacketId = -1
+    private var mediaU0459PlayPacketId = -1
+    private var mediaU0459RequestedPlayIndex = -1
+    private var mediaU0459ModeGetPacketId = -1
+    private var mediaU0459FilenameSizeAttempted = false
+    private var mediaU0459PageRequests = 0
     private var mediaU04LocalRoute: Boolean = true // U04: operator-selected FileList test route
+    // U04.66: at most one explicitly tapped local E8 FileList GET each connected Media session.
+    private var mediaU0466LocalFileListUsed = false
     private var mediaK016ModeStartAttempted = false
     private var mediaU02Generation = 0L
     /** K011: manual read-only General.MediaStateGet evidence. */
@@ -10321,194 +10335,313 @@ private fun b0123TryEmbedOneShot(desired: Int): Boolean {
         return queued
     }
 
-    /**
-     * K016 explicitly operator-triggered FileBrowser.ModeStart (0x01FE).
-     * macOS code x86_64 0x100031371 / 0x100067BB1: command=0x01FE,
-     * local=1, responseId=0. EMPTY payload is a static candidate, not an
-     * AG2 verified recipe. STATE-CHANGING: never automatically execute.
-     */
+    /** U04.59: macOS FileBrowser.ModeStart = 0x01FD with ModeMsg(mode=MoviePicker=1). */
     @SuppressLint("MissingPermission")
     fun mediaK016RequestModeStartOnce(): Boolean {
-        if (mediaK016ModeStartAttempted) {
-            android.util.Log.w("AtomRemoteMediaK016", "MODE_START_ALREADY_ATTEMPTED noRetry=true")
-            return false
-        }
-        if (outputR21MtuBytes < 61) {
-            val mtuRequested = requestR21OutputPageMtu()
-            android.util.Log.i("AtomRemoteMediaK016", "MODE_START_MTU_WAIT current=$outputR21MtuBytes requestQueued=$mtuRequested noTx=true")
-            return false
-        }
-        val safe = _tcsPairingState.value.acceptWritten && _tcsRemoteState.value.available &&
-            packetLink18Primed && packetLink18.peerCredit() && !remoteBootstrapActive &&
-            pendingRemotePacket == null && outputR21MtuBytes >= 61
-        if (!safe) {
-            android.util.Log.i("AtomRemoteMediaK016", "MODE_START_BLOCKED pending=${pendingRemotePacket?.label} noTx=true")
-            return false
-        }
-        val current = gatt ?: return false
-        val service = current.getService(UUID.fromString(AIRGLU_SHOGUN_SERVICE_UUID)) ?: return false
-        service.getCharacteristic(UUID.fromString(TCS_PACKET_WRITE_UUID)) ?: return false
+        if (mediaK016ModeStartAttempted) return false
+        val proto = com.atomosremote.nativeapp.media.U0459FileBrowserWire.startMoviePicker()
+        if (!mediaU0459Gate(proto.size)) return false
         val packet = PendingRemotePacket(
-            body = buildOfficialAtomMessageBody(0, 0x01fe),
-            purpose = "media-k016-filebrowser-mode-start-once",
-            label = "K016.FileBrowser.ModeStart",
-            commandId = 0x01fe,
-            packetId = 0,
-            expectedResponseId = null
-        )
-        val queued = queueRemotePacket18_8(packet, local = true)
-        if (queued) mediaK016ModeStartAttempted = true
-        android.util.Log.i("AtomRemoteMediaK016", "MODE_START_TX cmd=0x01FE local=true emptyProtoCandidate=true queued=$queued recorderConfirmed=false noRetry=true")
-        return queued
-    }
-
-    /**
-     * K01.4 FileBrowser.ModeGet: x86_64+arm64 static GET command 0x0200.
-     * Read-only manual diagnostic. No ModeStart, ModeExit, folder navigation,
-     * clip actions, auto-retries, implied reply IDs or optimistic mode status.
-     * AG2 hardware compatibility is UNVERIFIED.
-     */
-    @SuppressLint("MissingPermission")
-    fun mediaK014RequestFileBrowserModeGetOnce(): Boolean {
-        if (outputR21MtuBytes < 61) {
-            val requested = requestR21OutputPageMtu()
-            android.util.Log.i("AtomRemoteMediaK014",
-                "MODE_GET_MTU_WAIT current=$outputR21MtuBytes requestMtuQueued=$requested NO_TX")
-            return false
-        }
-        val safe = _tcsPairingState.value.acceptWritten &&
-            _tcsRemoteState.value.available && packetLink18Primed &&
-            packetLink18.peerCredit() && !remoteBootstrapActive &&
-            pendingRemotePacket == null && outputR21MtuBytes >= 61
-        if (!safe) {
-            android.util.Log.i("AtomRemoteMediaK014",
-                "MODE_GET_BLOCKED accept=${_tcsPairingState.value.acceptWritten} " +
-                "remote=${_tcsRemoteState.value.available} primed=$packetLink18Primed " +
-                "credit=${packetLink18.peerCredit()} bootstrap=$remoteBootstrapActive " +
-                "pending=${pendingRemotePacket?.label} mtu=$outputR21MtuBytes NO_TX")
-            return false
-        }
-        val current = gatt ?: return false
-        val service = current.getService(UUID.fromString(AIRGLU_SHOGUN_SERVICE_UUID)) ?: return false
-        service.getCharacteristic(UUID.fromString(TCS_PACKET_WRITE_UUID)) ?: return false
-        val packet = PendingRemotePacket(
-            body = buildOfficialAtomMessageBody(0, 0x0200),
-            purpose = "media-k014-filebrowser-mode-get",
-            label = "K014.FileBrowser.ModeGet",
-            commandId = 0x0200,
-            packetId = 0,
-            expectedResponseId = null // Unknown on AG2; do not assume an ACK shape.
+            body = buildOfficialAtomMessageBodyWithProtoPayload(0, 0x01FD, proto),
+            purpose = "media-u0459-filebrowser-mode-start",
+            label = "U0459.FileBrowser.ModeStart.MoviePicker",
+            commandId = 0x01FD, packetId = 0, expectedResponseId = null
         )
         val queued = queueRemotePacket18_8(packet, local = false)
-        android.util.Log.i("AtomRemoteMediaK014",
-            "MODE_GET_TX cmd=0x0200 packetId=0 local=false emptyProto=true queued=$queued " +
-            "applicationReplyUnverified=true noRetry=true noSet=true")
+        if (queued) mediaK016ModeStartAttempted = true
+        android.util.Log.i("AtomRemoteMediaU0459", "MODE_START queued=$queued opcode=0x01FD proto=${proto.toHex()} route=E0 responseUnverified=true")
         return queued
     }
 
+    /** Corrected ModeGet=0x01FF. Never transmit the previous 0x0200 LutSelect. */
+    @SuppressLint("MissingPermission")
+    fun mediaK014RequestFileBrowserModeGetOnce(): Boolean {
+        if (!mediaU0459Gate(0)) return false
+        // U04.62 read-only compatibility probe: other macOS one-shot commands use zero.
+        // AG2 FileBrowser acceptance remains unverified until real application RX.
+        val packetId = 0
+        val packet = PendingRemotePacket(
+            body = buildOfficialAtomMessageBody(packetId, 0x01FF),
+            purpose = "media-u0459-mode-get", label = "U0459.FileBrowser.ModeGet",
+            commandId = 0x01FF, packetId = packetId, expectedResponseId = null
+        )
+        val queued = queueRemotePacket18_8(packet, local = false)
+        if (queued) mediaU0459ModeGetPacketId = packetId
+        android.util.Log.i("AtomRemoteMediaU0459", "MODE_GET queued=$queued opcode=0x01FF packetId=$packetId route=E0")
+        return queued
+    }
+
+    /** Manual FilelistFilenameSizeSet (0x0202), only after explicit operator approval. */
+    @SuppressLint("MissingPermission")
+    fun mediaU0459RequestFilenameSizeOnce(): Boolean {
+        if (mediaU0459FilenameSizeAttempted) return false
+        val proto = com.atomosremote.nativeapp.media.U0459FileBrowserWire.filenameSize(128)
+        if (!mediaU0459Gate(proto.size)) return false
+        val packet = PendingRemotePacket(
+            body = buildOfficialAtomMessageBodyWithProtoPayload(0, 0x0202, proto),
+            purpose = "media-u0459-filename-size", label = "U0459.FileBrowser.FilenameSizeSet",
+            commandId = 0x0202, packetId = 0, expectedResponseId = null
+        )
+        val queued = queueRemotePacket18_8(packet, local = false)
+        if (queued) mediaU0459FilenameSizeAttempted = true
+        android.util.Log.i("AtomRemoteMediaU0459", "FILENAME_SIZE_SET queued=$queued opcode=0x0202 bytes=128 proto=${proto.toHex()} local=E0 experimental=true")
+        return queued
+    }
+
+    /** One explicit, page-scoped FileListGet. No automatic retry and no FilePlay. */
+    @SuppressLint("MissingPermission")
+    fun mediaK01RequestFileListGetOnce(startIndex: Int = 0, localRoute: Boolean = false): Boolean {
+        val state = _mediaSsdFileListState.value
+        // U04.66: allow exactly one manually triggered read-only local E8 route A/B probe.
+        // Previous E0 path remains unchanged; no automatic retry and no FilePlay.
+        if (startIndex !in 0..1_000_000 || state.pending || mediaU0459PageRequests >= 128 ||
+            (localRoute && (startIndex != 0 || mediaU0466LocalFileListUsed))) return false
+        // A QueryCountLimitMsg has not yet been observed; default to conservative count=1.
+        val count = (state.pageCountLimit ?: com.atomosremote.nativeapp.media.U0459FileBrowserWire.DEFAULT_UNVERIFIED_COUNT)
+            .coerceIn(1, com.atomosremote.nativeapp.media.U0459FileBrowserWire.MAX_PAGE_LIMIT)
+        val proto = com.atomosremote.nativeapp.media.U0459FileBrowserWire.fileListQuery(startIndex, count)
+        if (!mediaU0459Gate(proto.size)) return false
+        // U04.62 GET-only compatibility probe; keep 0x01FB protobuf and E0 route intact.
+        val packetId = 0
+        val packet = PendingRemotePacket(
+            body = buildOfficialAtomMessageBodyWithProtoPayload(packetId, 0x01FB, proto),
+            purpose = if (localRoute) "media-u0466-filelist-local-e8" else "media-u0459-filelist-page",
+            label = if (localRoute) "U0466.FileBrowser.FileListGet.LOCAL_E8" else "U0459.FileBrowser.FileListGet",
+            commandId = 0x01FB, packetId = packetId, expectedResponseId = null
+        )
+        val queued = queueRemotePacket18_8(packet, local = localRoute)
+        android.util.Log.i("AtomRemoteMediaU0459", "LIST_QUEUE queued=$queued opcode=0x01FB packetId=$packetId start=$startIndex count=$count route=${if (localRoute) "E8" else "E0"} proto=${proto.toHex()}")
+        if (!queued) return false
+        if (localRoute) {
+            mediaU0466LocalFileListUsed = true
+            android.util.Log.i("AtomRemoteMediaU0466", "LOCAL_E8_PILOT_QUEUED opcode=0x01FB packetId=$packetId count=$count manual=true oneShot=true")
+        }
+        mediaU0459PageRequests++
+        mediaU0459ListPacketId = packetId
+        mediaU04LocalRoute = localRoute
+        mediaK016ListWindowOpenedAtMs = android.os.SystemClock.elapsedRealtime()
+        mediaU02Generation++
+        _mediaSsdFileListState.value = state.copy(
+            status = "Loading recorder page from SSD (15s evidence window)",
+            requestedStartIndex = startIndex,
+            pending = true, generation = mediaU02Generation,
+            localApplicationRx = 0, nonLocalApplicationRx = 0, fileListOpcodeRx = 0,
+            lastApplicationOpcode = null
+        )
+        return true
+    }
+
+    /** Explicit clip play; index is allowed ONLY when it originated in a correlated live FileList reply. */
+    @SuppressLint("MissingPermission")
+    fun mediaU0459RequestPlayFile(index: Int): Boolean {
+        val state = _mediaSsdFileListState.value
+        if (!state.recorderValidated || state.pending || !state.entries.any { it.index == index } ||
+            index !in 0..1_000_000) return false
+        val proto = com.atomosremote.nativeapp.media.U0459FileBrowserWire.playFileIndex(index)
+        if (!mediaU0459Gate(proto.size)) return false
+        val packetId = mediaU0459NextId()
+        val packet = PendingRemotePacket(
+            body = buildOfficialAtomMessageBodyWithProtoPayload(packetId, 0x01FC, proto),
+            purpose = "media-u0459-file-play-index:$index", label = "U0459.FileBrowser.FilePlay",
+            commandId = 0x01FC, packetId = packetId, expectedResponseId = null
+        )
+        val queued = queueRemotePacket18_8(packet, local = false)
+        if (queued) {
+            mediaU0459PlayPacketId = packetId
+            mediaU0459RequestedPlayIndex = index
+            _mediaSsdFileListState.value = state.copy(status = "FilePlay for index $index queued; recorder confirmation pending")
+        }
+        android.util.Log.i("AtomRemoteMediaU0459", "FILE_PLAY queued=$queued opcode=0x01FC packetId=$packetId index=$index proto=${proto.toHex()} route=E0 responseUnverified=true")
+        return queued
+    }
+
+    private fun mediaU0459NextId(): Int {
+        tcsCommandSequence = if (tcsCommandSequence >= 255) 1 else tcsCommandSequence + 1
+        return tcsCommandSequence
+    }
+
+    @SuppressLint("MissingPermission")
+    private fun mediaU0459Gate(protoBytes: Int): Boolean {
+        val frameBytes = 1 + 5 + protoBytes
+        val good = _tcsPairingState.value.acceptWritten && _tcsRemoteState.value.available &&
+            packetLink18Primed && packetLink18.peerCredit() && !remoteBootstrapActive &&
+            pendingRemotePacket == null && frameBytes <= outputR21MtuBytes - 3 &&
+            gatt?.getService(UUID.fromString(AIRGLU_SHOGUN_SERVICE_UUID))
+                ?.getCharacteristic(UUID.fromString(TCS_PACKET_WRITE_UUID)) != null
+        if (!good) android.util.Log.i("AtomRemoteMediaU0459", "TX_BLOCKED accept=${_tcsPairingState.value.acceptWritten} remote=${_tcsRemoteState.value.available} credit=${packetLink18.peerCredit()} bootstrap=$remoteBootstrapActive pending=${pendingRemotePacket?.label} frame=$frameBytes mtu=$outputR21MtuBytes")
+        return good
+    }
+
+
     /**
-     * MEDIA-K01 opt-in FileBrowser.FileListGet diagnostic, GET ONLY.
-     * Source: uploaded macOS Contents (x86_64 + arm64) both encode request
-     * 0x01FC and expected reply 0x01FC, with local=false in the base constructor.
-     * Actual AG2 response and protobuf body are UNVERIFIED. No auto-loop,
-     * no retries, and no file action, SET, delete, or format is possible here.
-     *
-     * Empty proto is a deliberate initial test candidate only. If the AG2
-     * needs a nonempty FileBrowserFileListQuery, it will remain unverified.
+     * U04.65 manual bounded GET matrix. Read-only opcodes derived from user Mac JSON.
+     * Uses existing PacketLink scheduler and byte serialization; no transport changes,
+     * no SET / navigation / clip playback, no auto-send and no auto-retry.
+     * 0x01F8: direct Mac code evidence (DirInfoGet)
+     * 0x04C3: call-site candidate (General.MediaChangeIdGet)
+     * 0x01F4: inferred only (CurrentIndexGet), advanced opt-in UI.
      */
     @SuppressLint("MissingPermission")
-    fun mediaK01RequestFileListGetOnce(startIndex: Int = 0, localRoute: Boolean = true): Boolean {
-        if (startIndex !in 0..999984 || startIndex % 16 != 0) {
-            android.util.Log.w("AtomRemoteMediaU02", "INVALID_PAGE start=$startIndex noTx=true")
+    fun mediaU0465ManualGetOnce(name: String): Boolean {
+        val opcode = when (name) {
+            "dir-info" -> 0x01F8
+            "media-change" -> 0x04C3
+            "current-index-inferred" -> 0x01F4
+            else -> return false
+        }
+        val previous = _mediaU0465ProbeState.value
+        if (previous.phase == "waiting" && mediaU0465OpenedAtMs != 0L &&
+            android.os.SystemClock.elapsedRealtime() - mediaU0465OpenedAtMs > 15_000L) {
+            mediaU0465Expire(previous.generation)
+        }
+        if (mediaU0465Consumed.contains(name) || _mediaU0465ProbeState.value.phase == "waiting" ||
+            _mediaSsdFileListState.value.pending || !mediaU0459Gate(0)) {
+            android.util.Log.w("AtomRemoteMediaU0465", "GET_BLOCKED name=$name opcode=0x${opcode.toString(16)} consumed=${mediaU0465Consumed.contains(name)} busy=${_mediaU0465ProbeState.value.phase} fileListPending=${_mediaSsdFileListState.value.pending} noTx=true")
             return false
         }
-        if (_mediaSsdFileListState.value.pending) {
-            android.util.Log.w("AtomRemoteMediaU02", "LIST_ALREADY_PENDING noTx=true")
-            return false
-        }
-        if (outputR21MtuBytes < 61) {
-            val mtuRequested = requestR21OutputPageMtu()
-            android.util.Log.i("AtomRemoteMediaK01",
-                "FILE_LIST_MTU_WAIT current=$outputR21MtuBytes requestMtuQueued=$mtuRequested NO_GET_TX")
-            return false
-        }
-        val safe = _tcsPairingState.value.acceptWritten &&
-            _tcsRemoteState.value.available && packetLink18Primed &&
-            packetLink18.peerCredit() && !remoteBootstrapActive &&
-            pendingRemotePacket == null && outputR21MtuBytes >= 61
-        if (!safe) {
-            android.util.Log.i("AtomRemoteMediaK01",
-                "FILE_LIST_GET_BLOCKED accept=${_tcsPairingState.value.acceptWritten} " +
-                "remote=${_tcsRemoteState.value.available} primed=$packetLink18Primed " +
-                "credit=${packetLink18.peerCredit()} bootstrap=$remoteBootstrapActive " +
-                "pending=${pendingRemotePacket?.label} mtu=$outputR21MtuBytes NO_TX")
-            return false
-        }
-        val current = gatt ?: return false
-        val service = current.getService(UUID.fromString(AIRGLU_SHOGUN_SERVICE_UUID)) ?: return false
-        service.getCharacteristic(UUID.fromString(TCS_PACKET_WRITE_UUID)) ?: return false
-        val packetId = 0
-        // Binary-evidenced FileListQuery: field 1 start, field 2 count=16,
-        // field 3 forward=true. Nonzero start is manually requested only.
-        val pageProto = com.atomosremote.nativeapp.media.SsdFileListPageQuery.encode(startIndex)
-        mediaU04LocalRoute = localRoute
         val packet = PendingRemotePacket(
-            body = buildOfficialAtomMessageBodyWithProtoPayload(
-                packetId, 0x01FC, pageProto
-            ),
-            purpose = "media-k01-filelist-get",
-            label = "K01.FileBrowser.FileListGet",
-            commandId = 0x01FC,
-            packetId = packetId,
-            expectedResponseId = 0x01FC
+            body = buildOfficialAtomMessageBody(0, opcode),
+            purpose = "media-u0465-manual-get:$name",
+            label = "U0465.FileBrowser.Get.$name",
+            commandId = opcode, packetId = 0, expectedResponseId = null
         )
-        // Only a manual read resets this evidence window. Empty result is NOT interpreted as empty SSD.
-        mediaU02Generation++
-        val generation = mediaU02Generation
-        _mediaSsdFileListState.value = com.atomosremote.nativeapp.media.SsdBrowserState(
-            status = "Waiting for recorder FileList response (up to 40 seconds)",
-            requestedStartIndex = startIndex, pending = true, generation = generation
-        )
-        mediaK016ListWindowOpenedAtMs = android.os.SystemClock.elapsedRealtime()
-        val queued = queueRemotePacket18_8(packet, local = localRoute)
-        if (!queued) {
-            mediaK016ListWindowOpenedAtMs = 0L
-            _mediaSsdFileListState.value = com.atomosremote.nativeapp.media.SsdBrowserState(
-                status = "FileList request not queued; link/MTU/credit unavailable", requestedStartIndex = startIndex,
-                generation = generation
+        val queued = queueRemotePacket18_8(packet, local = false)
+        android.util.Log.i("AtomRemoteMediaU0465",
+            "GET_QUEUE name=$name opcode=0x${opcode.toString(16)} packetId=0 route=E0 queued=$queued expectedRxUnverified=true source=${if (name == "current-index-inferred") "inferred" else "mac-static"}")
+        if (queued) {
+            mediaU0465Consumed.add(name)
+            mediaU0465OpenedAtMs = android.os.SystemClock.elapsedRealtime()
+            _mediaU0465ProbeState.value = previous.copy(
+                name = name, opcode = opcode, generation = previous.generation + 1,
+                phase = "waiting", responseOpcode = null, responsePacketId = null,
+                responseLocal = null, responseHex = "", lastRawAtomMessages = emptyList(),
+                consumedNames = mediaU0465Consumed.toList(),
+                status = "GET queued to PacketLink, waiting 15s for application RX; not recorder ACK"
             )
         }
-        android.util.Log.i("AtomRemoteMediaK01",
-            "FILE_LIST_GET_TX cmd=0x01FC expectedCandidate=0x01FC packetId=$packetId " +
-            "local=$localRoute routeTrial=U04 protobuf=${pageProto.toHex()} start=$startIndex count=16 forward=true " +
-            "infoType=FileNameOnly-default candidate=true queued=$queued " +
-            "hardwareReplyUnverified=true noRetry=true noSet=true")
         return queued
+    }
+
+    /** Typed and unrelated complete AtomMessage RX are observed, never consumed. */
+    private fun mediaU0465OnApplicationRx(packetId: Int, opcode: Int, local: Boolean, data: ByteArray) {
+        val state = _mediaU0465ProbeState.value
+        if (state.phase != "waiting" || mediaU0465OpenedAtMs == 0L) return
+        val age = android.os.SystemClock.elapsedRealtime() - mediaU0465OpenedAtMs
+        if (age !in 0L..15_000L) return
+        val isMatch = packetId == 0 && !local && ((opcode and 0x7FFF) == state.opcode)
+        val sample = "pkt=$packetId opcode=0x${opcode.toString(16)} route=${if (local) "E8" else "E0"} bytes=${data.size} hex=${data.toHex().take(128)}"
+        android.util.Log.i("AtomRemoteMediaU0465", "GET_WINDOW_RX name=${state.name} ageMs=$age match=$isMatch $sample")
+        _mediaU0465ProbeState.value = state.copy(
+            lastRawAtomMessages = (state.lastRawAtomMessages + sample).takeLast(6),
+            phase = if (isMatch) "rx" else "waiting",
+            responseOpcode = if (isMatch) opcode else state.responseOpcode,
+            responsePacketId = if (isMatch) packetId else state.responsePacketId,
+            responseLocal = if (isMatch) local else state.responseLocal,
+            responseHex = if (isMatch) data.toHex().take(256) else state.responseHex,
+            status = if (isMatch) "Matching complete application RX captured (raw only; decoder still unverified)"
+                else "Unrelated application RX observed; target reply still pending"
+        )
+        if (isMatch) mediaU0465OpenedAtMs = 0L
+    }
+
+    /** Called only by Compose timeout; never transmits or changes BLE state. */
+    fun mediaU0465Expire(generation: Long) {
+        val state = _mediaU0465ProbeState.value
+        if (state.phase == "waiting" && state.generation == generation) {
+            mediaU0465OpenedAtMs = 0L
+            _mediaU0465ProbeState.value = state.copy(
+                phase = "timeout",
+                status = "15s timeout: no correlated application reply. Not proof of empty SSD."
+            )
+            android.util.Log.w("AtomRemoteMediaU0465", "GET_TIMEOUT name=${state.name} opcode=${state.opcode} rawAtoms=${state.lastRawAtomMessages.size}")
+        }
+    }
+
+    /** The only U04.59 receive hook, called from the existing AtomMessage demultiplexer. */
+    private fun mediaU0459OnApplicationRx(packetId: Int, opcode: Int, local: Boolean, body: ByteArray) {
+        val state = _mediaSsdFileListState.value
+        val normalized = opcode and 0x7FFF
+        if (state.pending && mediaK016ListWindowOpenedAtMs != 0L &&
+            android.os.SystemClock.elapsedRealtime() - mediaK016ListWindowOpenedAtMs in 0L..15_000L) {
+            _mediaSsdFileListState.value = state.copy(
+                localApplicationRx = state.localApplicationRx + if (local) 1 else 0,
+                nonLocalApplicationRx = state.nonLocalApplicationRx + if (local) 0 else 1,
+                fileListOpcodeRx = state.fileListOpcodeRx + if (normalized == 0x01FB) 1 else 0,
+                lastApplicationOpcode = opcode
+            )
+            if (normalized == 0x01FB) {
+                android.util.Log.i("AtomRemoteMediaU0459", "LIST_RX opcode=0x${opcode.toString(16)} pkt=$packetId expected=$mediaU0459ListPacketId route=${if (local) "E8" else "E0"} bytes=${body.size}")
+                // U04.66: correlate to the route actually selected for this ONE request.
+                // Never accept a cross-route or unrelated AtomMessage as FileList evidence.
+                if (packetId == mediaU0459ListPacketId && local == mediaU04LocalRoute) {
+                    val parsed = com.atomosremote.nativeapp.media.U0459FileBrowserWire.parseFileList(
+                        body, state.requestedStartIndex)
+                    if (parsed != null) {
+                        val before = _mediaSsdFileListState.value
+                        val combined = (before.entries + parsed.entries).distinctBy { it.index }
+                            .sortedBy { it.index }.take(1024)
+                        _mediaSsdFileListState.value = before.copy(
+                            entries = combined, totalFiles = parsed.total ?: before.totalFiles,
+                            startIndex = parsed.start, pending = false, recorderValidated = true,
+                            responseOpcode = opcode,
+                            status = "Live FileList reply decoded: ${combined.size} recorder filenames"
+                        )
+                        mediaK016ListWindowOpenedAtMs = 0L
+                        android.util.Log.i("AtomRemoteMediaU0459", "LIST_DECODE_OK entries=${parsed.entries.size} accumulated=${combined.size} total=${parsed.total} correlated=true")
+                    } else android.util.Log.w("AtomRemoteMediaU0459", "LIST_DECODE_REJECT opcode=0x${opcode.toString(16)} bytes=${body.size} - no synthetic rows")
+                }
+            }
+        }
+        if (normalized == 0x01FC && packetId == mediaU0459PlayPacketId && mediaU0459PlayPacketId != -1) {
+            val result = com.atomosremote.nativeapp.media.U0459FileBrowserWire.parseFileResult(body)
+            if (result == 0) {
+                _mediaSsdFileListState.value = _mediaSsdFileListState.value.copy(
+                    activeIndex = mediaU0459RequestedPlayIndex,
+                    status = "FilePlay recorder OK for index=$mediaU0459RequestedPlayIndex"
+                )
+            } else if (result == 1) {
+                _mediaSsdFileListState.value = _mediaSsdFileListState.value.copy(
+                    status = "FilePlay is loading index=$mediaU0459RequestedPlayIndex; active clip not verified"
+                )
+            } else {
+                _mediaSsdFileListState.value = _mediaSsdFileListState.value.copy(
+                    status = "FilePlay reply status=${result ?: "unparsed"}; active clip unchanged"
+                )
+            }
+            android.util.Log.i("AtomRemoteMediaU0459", "FILE_PLAY_RX opcode=0x${opcode.toString(16)} pkt=$packetId status=$result local=$local")
+            mediaU0459PlayPacketId = -1
+        }
+        if (normalized == 0x01FF && packetId == mediaU0459ModeGetPacketId && mediaU0459ModeGetPacketId != -1) {
+            val mode = com.atomosremote.nativeapp.media.U0459FileBrowserWire.parseMode(body)
+            if (mode != null) _mediaSsdFileListState.value = _mediaSsdFileListState.value.copy(modeReadback = mode)
+            android.util.Log.i("AtomRemoteMediaU0459", "MODE_GET_RX mode=$mode opcode=0x${opcode.toString(16)}")
+            mediaU0459ModeGetPacketId = -1
+        }
     }
 
     fun mediaU02ExpireFileList(generation: Long) {
         val state = _mediaSsdFileListState.value
         if (state.pending && state.generation == generation) {
             mediaK016ListWindowOpenedAtMs = 0L
-            val diagnosis = when {
-                state.fileListOpcodeRx > 0 -> "FileList opcode observed but body/correlation not decoded"
-                mediaU04LocalRoute && state.localApplicationRx == 0 -> "No local application RX during FileList window"
-                mediaU04LocalRoute -> "Local application RX received; no matching FileList payload"
-                state.nonLocalApplicationRx == 0 -> "No non-local application RX during FileList window"
-                else -> "Non-local application RX present, but no FileList response"
-            }
             _mediaSsdFileListState.value = state.copy(
                 pending = false,
-                status = "$diagnosis; SSD contents UNKNOWN (not empty)"
+                status = "No matching FileList application reply in 15 seconds; SSD still contains files, list unavailable"
             )
-            android.util.Log.w("AtomRemoteMediaU03", "LIST_TIMEOUT generation=$generation diagnosis=$diagnosis " +
-                "localApplicationRx=${state.localApplicationRx} nonLocalApplicationRx=${state.nonLocalApplicationRx} " +
-                "fileListOpcodeRx=${state.fileListOpcodeRx} noReply=true")
+            android.util.Log.w("AtomRemoteMediaU0459", "LIST_TIMEOUT packetId=$mediaU0459ListPacketId generation=$generation localRX=${state.localApplicationRx} nonlocalRX=${state.nonLocalApplicationRx} opcodeRX=${state.fileListOpcodeRx}")
         }
     }
 
     fun mediaU02ResetFileList() {
         mediaK016ListWindowOpenedAtMs = 0L
+        mediaU0459ListPacketId = -1
+        mediaU0459PlayPacketId = -1
+        mediaU0459PageRequests = 0
+        mediaU0466LocalFileListUsed = false
+        mediaU0459FilenameSizeAttempted = false
+        mediaK016ModeStartAttempted = false
+        mediaU0465OpenedAtMs = 0L
+        mediaU0465Consumed.clear()
+        _mediaU0465ProbeState.value = com.atomosremote.nativeapp.media.U0465ProbeState()
         _mediaSsdFileListState.value = com.atomosremote.nativeapp.media.SsdBrowserState()
     }
 
@@ -11368,6 +11501,20 @@ private fun b0123TryEmbedOneShot(desired: Int): Boolean {
         }
 
         val result = packetLink18.onReadSubpacket(value)
+        // U04.68: Passive FileList-only INFO witness. No PacketLink/queue/control mutation.
+        // OEM log filtering hides most AtomRemoteGatt DEBUG RX lines during live capture.
+        if (_mediaSsdFileListState.value.pending) {
+            val packetInfo = result.packet
+            val rxPacketIdInfo = if (packetInfo != null && packetInfo.isNotEmpty())
+                packetInfo[0].toInt() and 0xFF else -1
+            val rxOpcodeInfo = if (packetInfo != null && packetInfo.size >= 5)
+                (packetInfo[3].toInt() and 0xFF) or ((packetInfo[4].toInt() and 0xFF) shl 8) else -1
+            android.util.Log.i("AtomRemoteMediaU0468",
+                "LIST_GATT_RX_INFO status=$status rawLen=${value.size} rawHex=${value.toHex().take(256)} " +
+                    "assembledLen=${packetInfo?.size ?: 0} packetId=$rxPacketIdInfo " +
+                    "opcode=$rxOpcodeInfo local=${result.packetLocal} " +
+                    "needAnotherRead=${result.needAnotherRead} peerCredit=${result.peerCredit}")
+        }
         tcsPacketRemoteCredit = result.peerCredit
         if (outputR7IsTrackedPurpose(pendingRemotePacket?.purpose)) {
             val completedPayload = result.packet
@@ -11773,51 +11920,11 @@ private fun b0123TryEmbedOneShot(desired: Int): Boolean {
                     "payloadLen=${body.size} payload=${body.toHex()} requestMatchUnknown=true")
         }
 
-        // K016 passive FileBrowser response receiver. Do not intercept or mutate other RX.
-        // A successful GATT write or E0 flow-control is never a decoded filename.
-        val listAgeMs = android.os.SystemClock.elapsedRealtime() - mediaK016ListWindowOpenedAtMs
-        if (mediaK016ListWindowOpenedAtMs != 0L && listAgeMs in 0L..40000L) {
-            // U03 passive health classification. Parsed application frames only;
-            // PacketLink E0 flow-credit has no application header and never reaches here.
-            val beforeEvidence = _mediaSsdFileListState.value
-            if (beforeEvidence.pending) {
-                val listOpcode = (messageType and 0x7fff) == 0x01fc
-                val afterEvidence = beforeEvidence.copy(
-                    localApplicationRx = beforeEvidence.localApplicationRx + if (local) 1 else 0,
-                    nonLocalApplicationRx = beforeEvidence.nonLocalApplicationRx + if (local) 0 else 1,
-                    fileListOpcodeRx = beforeEvidence.fileListOpcodeRx + if (listOpcode) 1 else 0,
-                    lastApplicationOpcode = messageType
-                )
-                _mediaSsdFileListState.value = afterEvidence
-                if (afterEvidence.localApplicationRx + afterEvidence.nonLocalApplicationRx <= 32) {
-                    android.util.Log.i("AtomRemoteMediaU03", "APP_RX_WINDOW opcode=0x${messageType.toString(16)} " +
-                        "local=$local packetId=$packetId payloadBytes=${body.size} " +
-                        "fileListCandidate=$listOpcode generation=${afterEvidence.generation}")
-                }
-            }
-            if ((messageType and 0x7fff) == 0x01fc) {
-                val currentList = _mediaSsdFileListState.value
-                val parsed = if (currentList.pending && local == mediaU04LocalRoute)
-                    com.atomosremote.nativeapp.media.SsdFileListDecoder.decode(
-                        messageType, body, currentList.requestedStartIndex
-                    ) else null
-                if (parsed != null) {
-                    _mediaSsdFileListState.value = parsed.copy(
-                        generation = currentList.generation,
-                        localApplicationRx = currentList.localApplicationRx,
-                        nonLocalApplicationRx = currentList.nonLocalApplicationRx,
-                        fileListOpcodeRx = currentList.fileListOpcodeRx,
-                        lastApplicationOpcode = currentList.lastApplicationOpcode
-                    )
-                    mediaK016ListWindowOpenedAtMs = 0L
-                    android.util.Log.i("AtomRemoteMediaK016", "LIST_CANDIDATE_RX opcode=0x${messageType.toString(16)} local=$local packetId=$packetId entries=${parsed.entries.size} total=${parsed.totalFiles} recorderValidated=false")
-                } else {
-                    android.util.Log.w("AtomRemoteMediaK016", "LIST_UNPARSED_RX opcode=0x${messageType.toString(16)} local=$local packetId=$packetId body=${body.toHex()} candidateOnly=true")
-                }
-            } else {
-                android.util.Log.d("AtomRemoteMediaK016", "LIST_WINDOW_OTHER_RX type=0x${messageType.toString(16)} local=$local bytes=${body.size}")
-            }
-        }
+        // U04.59: isolate FileBrowser RX parsing from large PacketLink dispatcher.
+        // Existing pairing, transport demux and other RX callbacks are unchanged.
+        mediaU0459OnApplicationRx(packetId, messageType, local, body)
+        // U04.65 passive parallel observer; original RX handlers and PacketLink state unchanged.
+        mediaU0465OnApplicationRx(packetId, messageType, local, body)
 
         if (WlConnectPrototype.isPotentialConnectResponse(messageType)) {
             appendEvent(

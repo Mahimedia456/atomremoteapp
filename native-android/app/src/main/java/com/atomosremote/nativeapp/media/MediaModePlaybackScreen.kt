@@ -2,32 +2,32 @@ package com.atomosremote.nativeapp.media
 
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
-import androidx.compose.runtime.saveable.rememberSaveable
-import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.atomosremote.nativeapp.viewmodel.RemoteTransportUiController
 
 /**
- * U04.20 guarded UI evidence and lifecycle cleanup on the U04.16 source baseline.
- * FileListGet 0x01FC and FileBrowserIndexMsg(field 1=index) are macOS static facts.
- * 08 00 is an explicitly encoded index-zero *candidate*, NOT AG2-proven.
- * An operator tap uses the EXISTING ViewModel callback/PacketLink GET path.
- * All state-changing, autoplay, browser navigation and FilePlay TX remain locked.
- * Recorder playback and SSD mount MUST be manually observed. Transport-tracked
- * playback state is not a recorder readback. ATT writes are log-only evidence.
+ * U04.86 evidence-correct Media UI. FileList errors are NOT inferred from uncorrelated RX.
+ * All mode/Play/Pause callbacks are the existing recorder implementations.
+ * FileList requests are manually initiated, read-only, and never retried automatically.
+ * No unverified FilePlay, ModeStart, FilenameSize or overlay commands are exposed.
  */
 @Composable
 @Suppress("UNUSED_PARAMETER")
 fun MediaModePlaybackScreen(
     ui: RemoteTransportUiController.State,
     mediaFileList: SsdBrowserState,
+    fileListEventLines: List<String> = emptyList(),
+    browserProbe: U0465ProbeState,
     remoteAvailable: Boolean,
     remotePhase: String,
     commandStatus: String?,
@@ -39,286 +39,286 @@ fun MediaModePlaybackScreen(
     onDiagnosticTest: (String) -> Boolean,
     onSsdListTimeout: (Long) -> Unit,
     onSsdListReset: () -> Unit,
-    onModeGetEvidence: () -> Unit,
-    onModeStart: () -> Unit,
-    onMediaStateGetEvidence: () -> Unit,
+    onModeGetEvidence: () -> Boolean,
+    onModeStart: () -> Boolean,
+    onFilenameSize: () -> Boolean,
+    onFilePlay: (Int) -> Boolean,
+    onPageRequest: (Int) -> Boolean,
+    onMediaStateGetEvidence: () -> Boolean,
+    onBrowserProbeGet: (String) -> Boolean,
+    onBrowserProbeTimeout: (Long) -> Unit,
     onRecover: () -> Unit
 ) {
     val accent = Color(0xFF19E7D3)
-    val warning = Color(0xFFFFCC91)
-    val muted = Color(0xFF95A8AA)
-    val inFlight = remotePhase in setOf(
-        "queued", "sending", "requesting-credit", "awaiting-credit", "awaiting-response", "bootstrapping"
+    val surface = Color(0xFF0C181B)
+    val subdued = Color(0xFF9BB0B4)
+    val warning = Color(0xFFFFCB91)
+    val transportBusy = remotePhase in setOf(
+        "queued", "sending", "requesting-credit", "awaiting-credit",
+        "awaiting-response", "bootstrapping"
     )
-    val ready = remoteAvailable && !ui.locked && !inFlight
     val playback = ui.mode == RemoteTransportUiController.Mode.PLAYBACK
-    val canPlay = ready && playback
-    var showTechnical by rememberSaveable { mutableStateOf(false) }
-    var showLegacyDiagnostics by rememberSaveable { mutableStateOf(false) }
-    var operatorPlaybackConfirmed by remember { mutableStateOf(false) }
-    var operatorSsdConfirmed by remember { mutableStateOf(false) }
-    var singleTestQueued by remember { mutableStateOf(false) }
-    var testFeedback by rememberSaveable { mutableStateOf("NOT TESTED") }
-    var testGeneration by remember { mutableStateOf(-1L) }
-    // U04.20 UI-only evidence. The backend callback returns Unit: a tap is NOT a queued GET.
-    var mediaStateGetTapped by rememberSaveable { mutableStateOf(false) }
-    var modeGetTapCount by rememberSaveable { mutableStateOf(0) }
+    val ready = remoteAvailable && !ui.locked && !transportBusy &&
+        !ui.recoveryRequired && ui.pendingAction == null
 
-    // If Media screen leaves composition during a FileList request, cancel stale UI
-    // evidence state without sending anything. No hidden TX, retries or SETs.
-    val latestPending = rememberUpdatedState(mediaFileList.pending)
-    val latestGeneration = rememberUpdatedState(mediaFileList.generation)
-    val latestResetCallback = rememberUpdatedState(onSsdListReset)
-    DisposableEffect(Unit) {
-        onDispose {
-            if (latestPending.value) {
-                android.util.Log.w("AtomRemoteMediaU0420",
-                    "U0420_SCREEN_LEFT_PENDING generation=${latestGeneration.value} " +
-                        "resetEvidenceOnly=true NO_TX=true timeoutNotProven=true")
-                latestResetCallback.value.invoke()
+    // Never show filenames from a sample Mac capture or a previous recorder session.
+    val liveFiles = remember { mutableStateListOf<SsdBrowserEntry>() }
+    var fileCount by remember { mutableStateOf<Int?>(null) }
+    var processed by remember { mutableStateOf<Pair<Long, Int>?>(null) }
+    var requestFeedback by remember { mutableStateOf("") }
+    var selectedClipIndex by remember { mutableStateOf<Int?>(null) }
+
+    LaunchedEffect(remoteAvailable, playback, mediaFileList.generation) {
+        if (!remoteAvailable || !playback ||
+            (mediaFileList.pending && mediaFileList.requestedStartIndex == 0)) {
+            liveFiles.clear()
+            selectedClipIndex = null
+            fileCount = null
+            processed = null
+            requestFeedback = ""
+        }
+    }
+    LaunchedEffect(fileListEventLines, mediaFileList.fileListOpcodeRx,
+        mediaFileList.generation, mediaFileList.pending, remoteAvailable, playback) {
+        if (remoteAvailable && playback && mediaFileList.pending) {
+            val hit = U0479LiveFileListBridge.fromEvents(fileListEventLines, mediaFileList)
+            if (hit != null && processed != (hit.generation to hit.responsePacketId)) {
+                if (hit.page.start == 0) liveFiles.clear()
+                val knownIndices = liveFiles.map { it.index }.toSet()
+                liveFiles.addAll(hit.page.entries.filter { it.index !in knownIndices })
+                fileCount = hit.page.total ?: fileCount
+                processed = hit.generation to hit.responsePacketId
+                requestFeedback = ""
             }
         }
     }
-
-    // Existing GATT read-only RX collector closes at 40s. UI cleanup at 41s
-    // allows for scheduling tolerance; it does NOT prove ATT or recorder timeout.
     LaunchedEffect(mediaFileList.pending, mediaFileList.generation) {
         if (mediaFileList.pending) {
-            kotlinx.coroutines.delay(41000L)
+            kotlinx.coroutines.delay(15_000L)
             onSsdListTimeout(mediaFileList.generation)
         }
     }
-    LaunchedEffect(playback, remoteAvailable) {
-        if (!playback || !remoteAvailable) {
-            onSsdListReset()
-            operatorPlaybackConfirmed = false
-            operatorSsdConfirmed = false
-            singleTestQueued = false
-            testFeedback = "NOT TESTED"
-            testGeneration = -1L
-        }
+    LaunchedEffect(remoteAvailable, playback) {
+        if (!remoteAvailable || !playback) onSsdListReset()
     }
 
     Card(
-        modifier = Modifier.fillMaxWidth(),
-        shape = RoundedCornerShape(16.dp),
-        border = BorderStroke(1.dp, Color(0xFF1F4645)),
-        colors = CardDefaults.cardColors(containerColor = Color(0xFF081517))
+        modifier = Modifier.fillMaxWidth(), shape = RoundedCornerShape(16.dp),
+        border = BorderStroke(1.dp, Color(0xFF284B4B)),
+        colors = CardDefaults.cardColors(containerColor = surface)
     ) {
-        Column(Modifier.padding(14.dp), verticalArrangement = Arrangement.spacedBy(11.dp)) {
-            Text("RECORDER MODE", color = Color.White, fontSize = 14.sp, fontWeight = FontWeight.Bold)
-            Text("Trusted Remote transport. Selecting Record Mode does not start recording.",
-                color = muted, fontSize = 11.sp)
-            Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+        Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+            Text("MEDIA", color = Color.White, fontWeight = FontWeight.Bold, fontSize = 18.sp)
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 OutlinedButton(
                     onClick = onRecordMode,
                     enabled = ready && ui.mode != RemoteTransportUiController.Mode.RECORD,
                     modifier = Modifier.weight(1f),
-                    border = BorderStroke(1.dp,
-                        if (ui.mode == RemoteTransportUiController.Mode.RECORD) accent else Color(0xFF53686C)),
-                    contentPadding = PaddingValues(horizontal = 6.dp, vertical = 10.dp)
-                ) { Text("RECORD MODE", fontSize = 11.sp) }
+                    border = BorderStroke(1.dp, if (!playback) accent else subdued),
+                    contentPadding = PaddingValues(horizontal = 4.dp, vertical = 8.dp)
+                ) { Text("RECORD", fontSize = 12.sp) }
                 OutlinedButton(
                     onClick = onPlaybackMode,
                     enabled = ready && !playback,
                     modifier = Modifier.weight(1f),
-                    border = BorderStroke(1.dp, if (playback) accent else Color(0xFF53686C)),
-                    contentPadding = PaddingValues(horizontal = 6.dp, vertical = 10.dp)
-                ) { Text("PLAYBACK MODE", fontSize = 11.sp) }
+                    border = BorderStroke(1.dp, if (playback) accent else subdued),
+                    contentPadding = PaddingValues(horizontal = 4.dp, vertical = 8.dp)
+                ) { Text("PLAYBACK", fontSize = 12.sp) }
             }
-            val mode = when (ui.mode) {
-                RemoteTransportUiController.Mode.RECORD -> "Record (transport-tracked)"
-                RemoteTransportUiController.Mode.PLAYBACK -> "Playback (transport-tracked)"
-                RemoteTransportUiController.Mode.RETURNING_TO_RECORD -> "Returning to Record"
-                else -> "Unknown, no dedicated readback"
-            }
-            Text("Mode: $mode  |  Link: ${if (remoteAvailable) "available" else "unavailable"}",
-                color = accent, fontSize = 11.sp)
-            Text("Transport mode is NOT independent recorder mode confirmation.",
-                color = warning, fontSize = 10.sp)
+            Text(
+                when {
+                    !remoteAvailable -> "Not connected"
+                    ui.recoveryRequired -> "Connection recovery required"
+                    playback -> "Playback selected"
+                    ui.mode == RemoteTransportUiController.Mode.RECORD -> "Record selected"
+                    else -> "Recorder mode not confirmed"
+                },
+                color = if (remoteAvailable && !ui.recoveryRequired) accent else warning,
+                fontSize = 12.sp
+            )
             if (ui.pendingAction != null) {
                 LinearProgressIndicator(modifier = Modifier.fillMaxWidth(), color = accent)
-                Text("Waiting: ${ui.pendingLabel ?: ui.pendingAction}", color = Color.White, fontSize = 11.sp)
+                Text(ui.pendingLabel ?: "Command in progress", color = subdued, fontSize = 11.sp)
             }
             if (ui.recoveryRequired) {
-                Text(ui.error ?: "Remote session recovery required", color = warning, fontSize = 11.sp)
+                Text(ui.error ?: "Reconnect to continue", color = warning, fontSize = 11.sp)
                 OutlinedButton(onClick = onRecover, modifier = Modifier.fillMaxWidth()) {
-                    Text("RECOVER TRUSTED REMOTE", fontSize = 11.sp)
+                    Text("RECOVER CONNECTION", fontSize = 12.sp)
                 }
             }
-            if (!commandStatus.isNullOrBlank())
-                Text(commandStatus, color = muted, fontSize = 10.sp)
+            if (!commandStatus.isNullOrBlank()) {
+                Text(commandStatus, color = subdued, fontSize = 11.sp)
+            }
         }
     }
 
-    // These are the existing transport actions, and are not linked to a guessed SSD file index.
+    // Passive observation only. These events can be historical and must never
+    // authorize new recorder SET commands or substitute for a fresh FileList RX.
+    val macInitRx = U0482MacSequenceGate.observe(fileListEventLines)
+
     if (playback) {
-        U0455MacStylePlaybackDeck(
-            mediaFileList = mediaFileList,
-            controlsEnabled = canPlay,
-            onPlay = onPlay,
-            onPause = onPause
-        )
-        TextButton(
-            onClick = { showLegacyDiagnostics = !showLegacyDiagnostics },
-            modifier = Modifier.fillMaxWidth()
-        ) {
-            Text(if (showLegacyDiagnostics) "HIDE LEGACY DIAGNOSTICS" else "SHOW LEGACY DIAGNOSTICS",
-                fontSize = 11.sp)
-        }
-        if (showLegacyDiagnostics) {
         Card(
             modifier = Modifier.fillMaxWidth(), shape = RoundedCornerShape(16.dp),
-            border = BorderStroke(1.dp, Color(0xFF1F4645)),
-            colors = CardDefaults.cardColors(containerColor = Color(0xFF081517))
+            colors = CardDefaults.cardColors(containerColor = surface)
         ) {
-            Column(Modifier.padding(14.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
-                Text("SSD FILE BROWSER | U04.20", color = Color.White,
-                    fontSize = 14.sp, fontWeight = FontWeight.Bold)
-                Text("Original Mac directory query: 0x01FB. Legacy 0x01FC index action is unverified.",
-                    color = Color.White, fontSize = 11.sp)
-                Text("Index 0 candidate: 08 00 | non-local E0 | AG2 acceptance UNVERIFIED",
-                    color = warning, fontSize = 11.sp)
-                Text("One manual read-only GET. No automatic TX, pagination, FilePlay, ModeStart or SET.",
-                    color = muted, fontSize = 11.sp)
-                Text("BEFORE TEST: confirm BOTH items on the physical Shogun Ultra AG2.",
-                    color = Color.White, fontSize = 11.sp, fontWeight = FontWeight.Bold)
-                Row(verticalAlignment = Alignment.CenterVertically) {
-                    Checkbox(checked = operatorPlaybackConfirmed,
-                        onCheckedChange = { operatorPlaybackConfirmed = it },
-                        enabled = canPlay && !singleTestQueued)
-                    Text("Recorder screen visibly in Playback Mode",
-                        modifier = Modifier.weight(1f), color = Color.White, fontSize = 11.sp)
-                }
-                Row(verticalAlignment = Alignment.CenterVertically) {
-                    Checkbox(checked = operatorSsdConfirmed,
-                        onCheckedChange = { operatorSsdConfirmed = it },
-                        enabled = canPlay && !singleTestQueued)
-                    Text("SSD mounted; recorder shows accessible media",
-                        modifier = Modifier.weight(1f), color = Color.White, fontSize = 11.sp)
-                }
-                Text("Manual checks are operator observations, NOT BLE readbacks.",
-                    color = muted, fontSize = 10.sp)
-
-                OutlinedButton(
-                    onClick = {
-                        if (!singleTestQueued && operatorPlaybackConfirmed && operatorSsdConfirmed) {
-                            val before = mediaFileList.generation
-                            // Existing AtomOS App mapping: filelist-nonlocal -> ViewModel
-                            // requestMediaU04FileListRouteOnce(0,false) -> existing GATT GET.
-                            android.util.Log.i("AtomRemoteMediaU0416",
-                                "U0416_OPERATOR_GATE modeObserved=$operatorPlaybackConfirmed " +
-                                    "ssdObserved=$operatorSsdConfirmed transportPlayback=$playback " +
-                                    "noAutomaticTx=true")
-                            val accepted = onDiagnosticTest("filelist-nonlocal")
-                            if (accepted) {
-                                singleTestQueued = true
-                                testGeneration = before
-                                testFeedback = "QUEUED; ATT TX / recorder RX NOT confirmed by UI"
-                            } else {
-                                testFeedback = "NOT QUEUED; check Playback, PacketLink credit, MTU and busy state"
-                            }
-                            android.util.Log.i("AtomRemoteMediaU0416",
-                                "U0416_TEST_TAP index=0 protoCandidate=0800 route=E0 queued=$accepted " +
-                                    "attWrite=LOG_ONLY attAck=LOG_ONLY rx=UNVERIFIED " +
-                                    "noAutoRetry=true noSet=true recorderConfirmed=false")
-                        }
-                    },
-                    enabled = false, // U04.48: ambiguous 0x01FC - no live TX
-                    modifier = Modifier.fillMaxWidth()
-                ) { Text("LEGACY 0x01FC INDEX TEST LOCKED", fontSize = 11.sp) }
-
-                Text("Test: $testFeedback", color = warning, fontSize = 11.sp)
-                Text("Evidence 1/4: request QUEUED = ${if (singleTestQueued) "YES" else "NO"}",
-                    color = Color.White, fontSize = 11.sp)
-                Text("RX collector: 40s; UI pending cleanup: 41s after queue. ADB capture: >=60s.",
-                    color = muted, fontSize = 10.sp)
-                Text("Evidence 2/4: ATT write/ACK = verify in ADB logs (not in UI state)",
-                    color = muted, fontSize = 11.sp)
-                Text("Evidence 3/4: application RX is counted separately from E0 credits",
-                    color = muted, fontSize = 11.sp)
-                Text("Evidence 4/4: matching FileList result/filenames = UNVERIFIED",
-                    color = warning, fontSize = 11.sp)
-                Text("Index-zero serialization: explicit 08 00 sent in U04.15. " +
-                        "Default-zero omission (empty body) remains an OFFLINE candidate, NOT a test button.",
-                    color = muted, fontSize = 10.sp)
-                if (mediaFileList.pending) LinearProgressIndicator(modifier = Modifier.fillMaxWidth(), color = accent)
-                if (singleTestQueued && mediaFileList.generation > testGeneration) {
-                    Text("Application RX: E0=${mediaFileList.nonLocalApplicationRx}, " +
-                            "E8=${mediaFileList.localApplicationRx}, " +
-                            "FileList opcode candidates=${mediaFileList.fileListOpcodeRx}",
-                        color = Color.White, fontSize = 11.sp)
-                    if (mediaFileList.fileListOpcodeRx > 0) {
-                        Text("Candidate 0x01FC RX seen. Confirm packet ID, body and real filenames in ADB log.",
-                            color = warning, fontSize = 11.sp)
-                    }
-                    Text("Window: ${mediaFileList.status}", color = muted, fontSize = 11.sp)
-                }
-                Text("NO VERIFIED FILENAMES. Silent RX never means the SSD is empty.",
-                    color = warning, fontSize = 11.sp, fontWeight = FontWeight.Bold)
-                Text("FilePlay 0x01FD and selected-clip playback: TX LOCKED.",
-                    color = muted, fontSize = 11.sp)
-                if (singleTestQueued && !mediaFileList.pending &&
-                    mediaFileList.generation > testGeneration) {
-                    OutlinedButton(onClick = {
-                        singleTestQueued = false
-                        operatorPlaybackConfirmed = false
-                        operatorSsdConfirmed = false
-                        testFeedback = "RE-ARMED; recorder checks required again"
-                        android.util.Log.i("AtomRemoteMediaU0416",
-                            "U0416_MANUAL_REARM noTx=true checksReset=true")
-                    }, modifier = Modifier.fillMaxWidth()) {
-                        Text("RE-ARM MANUALLY AFTER REVIEWING LOGS", fontSize = 10.sp)
-                    }
-                }
-
-                TextButton(onClick = { showTechnical = !showTechnical }, modifier = Modifier.fillMaxWidth()) {
-                    Text(if (showTechnical) "HIDE READ-ONLY DIAGNOSTICS" else "SHOW READ-ONLY DIAGNOSTICS",
-                        fontSize = 11.sp)
-                }
-                if (showTechnical) {
-                    Text("Existing GET paths only; application ACKs have not been AG2-proven.",
-                        color = muted, fontSize = 11.sp)
+            Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                Text("PLAYBACK CONTROLS", color = Color.White,
+                    fontWeight = FontWeight.Bold, fontSize = 15.sp)
+                // Five-position transport dock. Four experimental operations are
+                // intentionally DISABLED until genuine recorder opcode/payload/ACK
+                // evidence exists. Do not infer an FF opcode from a nearby constant.
+                Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
                     OutlinedButton(
-                        onClick = {
-                            mediaStateGetTapped = true
-                            android.util.Log.i("AtomRemoteMediaU0420",
-                                "U0420_MEDIASTATE_UI_TAP cmd=0x04B5 callbackReturnsUnit=true " +
-                                    "queued=UNKNOWN attAck=UNKNOWN appRx=UNKNOWN noAutoRetry=true")
-                            onMediaStateGetEvidence()
-                        },
-                        enabled = canPlay && !mediaFileList.pending && !mediaStateGetTapped,
-                        modifier = Modifier.fillMaxWidth()
-                    ) {
-                        Text("MEDIA STATE GET | 0x04B5 | ONE UI TAP", fontSize = 11.sp)
-                    }
-                    if (mediaStateGetTapped) {
-                        Text("MediaState: UI tap attempted. Existing GattClient one-shot guard " +
-                                "can block subsequent requests; actual queue/TX/RX requires logcat. " +
-                                "Navigating away does NOT reset that GATT guard.",
-                            color = warning, fontSize = 10.sp)
+                        onClick = {}, enabled = false,
+                        modifier = Modifier.weight(1f),
+                        contentPadding = PaddingValues(horizontal = 1.dp, vertical = 8.dp)
+                    ) { Text("PREV", fontSize = 10.sp) }
+                    OutlinedButton(
+                        onClick = {}, enabled = false,
+                        modifier = Modifier.weight(1f),
+                        contentPadding = PaddingValues(horizontal = 1.dp, vertical = 8.dp)
+                    ) { Text("REV", fontSize = 10.sp) }
+                    Column(modifier = Modifier.weight(1.45f),
+                        verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                        Button(
+                            onClick = onPlay, enabled = ready && !mediaFileList.pending,
+                            modifier = Modifier.fillMaxWidth(),
+                            contentPadding = PaddingValues(horizontal = 2.dp, vertical = 6.dp)
+                        ) { Text("PLAY", fontSize = 11.sp) }
+                        OutlinedButton(
+                            onClick = onPause, enabled = ready && !mediaFileList.pending,
+                            modifier = Modifier.fillMaxWidth(),
+                            contentPadding = PaddingValues(horizontal = 2.dp, vertical = 6.dp)
+                        ) { Text("PAUSE", fontSize = 11.sp) }
                     }
                     OutlinedButton(
-                        onClick = {
-                            modeGetTapCount += 1
-                            android.util.Log.i("AtomRemoteMediaU0420",
-                                "U0420_MODEGET_UI_TAP cmd=0x0200 tapCount=$modeGetTapCount " +
-                                    "queued=UNKNOWN attAck=UNKNOWN appRx=UNKNOWN")
-                            onModeGetEvidence()
-                        },
-                        enabled = canPlay && !mediaFileList.pending,
-                        modifier = Modifier.fillMaxWidth()
-                    ) {
-                        Text("BROWSER MODE GET | 0x0200", fontSize = 11.sp)
-                    }
-                    Text("Mode GET taps on this screen: $modeGetTapCount (manual taps are not a duplicate bug).",
-                        color = muted, fontSize = 10.sp)
-                    Text("These GETs have existing session guards. UI tap is not evidence of queue, " +
-                            "ATT ACK, recorder acceptance or RX. No E8 trial or new SET.",
-                        color = muted, fontSize = 10.sp)
+                        onClick = {}, enabled = false,
+                        modifier = Modifier.weight(1f),
+                        contentPadding = PaddingValues(horizontal = 1.dp, vertical = 8.dp)
+                    ) { Text("FWD", fontSize = 10.sp) }
+                    OutlinedButton(
+                        onClick = {}, enabled = false,
+                        modifier = Modifier.weight(1f),
+                        contentPadding = PaddingValues(horizontal = 1.dp, vertical = 8.dp)
+                    ) { Text("NEXT", fontSize = 10.sp) }
                 }
+                Text(
+                    "PREV / REV / FWD / NEXT locked: recorder command not verified. " +
+                        "PLAY / PAUSE control the current recorder clip.",
+                    color = subdued, fontSize = 11.sp
+                )
             }
         }
-        } // end collapsed legacy diagnostics
+        Card(
+            modifier = Modifier.fillMaxWidth(), shape = RoundedCornerShape(16.dp),
+            colors = CardDefaults.cardColors(containerColor = surface)
+        ) {
+            Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                Text("SSD FILES", color = Color.White,
+                    fontWeight = FontWeight.Bold, fontSize = 15.sp)
+                Text(
+                    if (macInitRx.modeStartResponseObserved)
+                        "SSD browsing is awaiting live recorder verification"
+                    else "SSD browsing is awaiting live recorder verification",
+                    color = subdued, fontSize = 11.sp
+                )
+                // A generic 0xFFFF was seen after Android 0x01FB in the
+                // user capture, but its packetId differs from the outbound
+                // packetId. It is NOT a correlated FileList rejection and
+                // must not suppress the manual retry or imply an empty SSD.
+                val genericUnmatched = mediaFileList.localApplicationRx > 0 &&
+                    mediaFileList.lastApplicationOpcode == 0xFFFF &&
+                    mediaFileList.fileListOpcodeRx == 0
+                val fileListOpcodeSeen = mediaFileList.fileListOpcodeRx > 0
+                val sorted = liveFiles.distinctBy { it.index }.sortedBy { it.index }
+                if (sorted.isEmpty()) {
+                    Text(
+                        when {
+                            mediaFileList.pending && fileListOpcodeSeen ->
+                                "FileList opcode observed. Validating live names..."
+                            mediaFileList.pending && genericUnmatched ->
+                                "Generic 0xFFFF observed, not matched to FileList request; waiting for 0x81FB."
+                            mediaFileList.pending -> "Reading SSD files..."
+                            fileListOpcodeSeen ->
+                                "0x81FB observed but no valid filename page decoded. Capture RX for parser review."
+                            genericUnmatched ->
+                                "Generic 0xFFFF observed (unmatched request ID). No confirmed FileList reply."
+                            mediaFileList.generation > 0L ->
+                                "No verified FileList reply in this request window. SSD is NOT confirmed empty."
+                            else -> "No verified SSD file list received."
+                        }, color = if (genericUnmatched || fileListOpcodeSeen) warning else subdued,
+                        fontSize = 12.sp
+                    )
+                } else {
+                    Text("${sorted.size} files" + (fileCount?.let { " / $it" } ?: ""),
+                        color = accent, fontSize = 12.sp)
+                    LazyColumn(
+                        modifier = Modifier.fillMaxWidth().heightIn(max = 280.dp),
+                        verticalArrangement = Arrangement.spacedBy(6.dp)
+                    ) {
+                        items(sorted, key = { it.index }) { file ->
+                            OutlinedButton(
+                                onClick = { selectedClipIndex = file.index },
+                                enabled = ready && !mediaFileList.pending,
+                                modifier = Modifier.fillMaxWidth(),
+                                border = BorderStroke(1.dp,
+                                    if (selectedClipIndex == file.index) accent else Color(0xFF284B4B)),
+                                contentPadding = PaddingValues(horizontal = 12.dp, vertical = 8.dp)
+                            ) {
+                                Text(file.filename, color = Color.White, fontSize = 12.sp,
+                                    maxLines = 2, overflow = TextOverflow.Ellipsis)
+                            }
+                        }
+                    }
+                    val selectedFile = sorted.firstOrNull { it.index == selectedClipIndex }
+                    if (selectedFile != null) {
+                        Text("SELECTED: ${selectedFile.filename}",
+                            color = accent, fontSize = 12.sp)
+                        // Only the confirmed existing PLAY callback may transmit.
+                        // FilePlay (0x01FC) is NOT recorder-verified, so selection
+                        // alone must never call onFilePlay or start playback.
+                        Text("Selected-clip playback awaits recorder verification. " +
+                            "PLAY controls the current recorder clip.",
+                            color = warning, fontSize = 11.sp)
+                    }
+                    val nextStart = sorted.last().index + 1
+                    val hasMore = fileCount == null || nextStart < fileCount!!
+                    if (hasMore && !mediaFileList.pending) {
+                        OutlinedButton(
+                            onClick = {
+                                val queued = onPageRequest(nextStart)
+                                requestFeedback = if (queued) "Loading more..." else "Request not queued"
+                            }, enabled = ready, modifier = Modifier.fillMaxWidth()
+                        ) { Text("LOAD MORE", fontSize = 12.sp) }
+                    }
+                }
+                // No auto retry. Unlike U04.85, an UNCORRELATED 0xFFFF does not
+                // permanently hide the button. Every retry is user initiated.
+                if (sorted.isEmpty() && !mediaFileList.pending) {
+                    OutlinedButton(
+                        onClick = {
+                            val queued = onDiagnosticTest("filelist-local")
+                            requestFeedback = if (queued) "Reading SSD files..." else "Request not queued"
+                        }, enabled = ready, modifier = Modifier.fillMaxWidth()
+                    ) {
+                        Text(if (mediaFileList.generation > 0L) "RETRY SSD FILES" else "LOAD SSD FILES",
+                            fontSize = 12.sp)
+                    }
+                }
+                if (requestFeedback.isNotBlank()) {
+                    Text(requestFeedback, color = subdued, fontSize = 11.sp)
+                }
+                if (mediaFileList.generation > 0L) {
+                    Text(
+                        "FileList GET: " + mediaFileList.status +
+                            " | 0x81FB RX=" + mediaFileList.fileListOpcodeRx +
+                            " | local RX=" + mediaFileList.localApplicationRx,
+                        color = subdued, fontSize = 10.sp
+                    )
+                }
+                // Clip selection is read-only. No FilePlay, Fast Forward, Rewind,
+                // Next, Previous or other unverified SET may transmit from here.
+            }
+        }
     }
 }

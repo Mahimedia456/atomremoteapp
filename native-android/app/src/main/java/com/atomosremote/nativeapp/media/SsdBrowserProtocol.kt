@@ -14,6 +14,9 @@ data class SsdBrowserState(
     val startIndex: Int = 0,
     val responseOpcode: Int? = null,
     val recorderValidated: Boolean = false,
+    val activeIndex: Int? = null, // only from packet-correlated FilePlay reply
+    val modeReadback: Int? = null, // only from packet-correlated ModeGet reply
+    val pageCountLimit: Int? = null, // no trusted limit until live QueryCountLimitMsg
     val requestedStartIndex: Int = 0,
     val pending: Boolean = false,
     val generation: Long = 0L,
@@ -68,7 +71,7 @@ object SsdFileListDecoder {
     }
     /** Returns candidate entries only for a structurally valid, relevant protobuf. */
     fun decode(responseOpcode: Int, body: ByteArray, requestedStartIndex: Int = 0): SsdBrowserState? {
-        if ((responseOpcode and 0x7fff) != 0x01fc || body.isEmpty()) return null
+        if ((responseOpcode and 0x7fff) != 0x01fb || body.isEmpty()) return null
         return try {
             val all = fields(body)
             val list = all.filter { it.number == 2 && it.kind == 2 }

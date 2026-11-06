@@ -8417,8 +8417,11 @@ private fun MediaModuleScreen(vm: AtomosViewModel) {
     }
     ModuleShell(vm, AtomosViewModel.Screen.MEDIA, "Media", recorderName) {
         val mediaFiles by vm.mediaSsdFileListState.collectAsState()
+        val browserProbe by vm.mediaU0465ProbeState.collectAsState()
         com.atomosremote.nativeapp.media.MediaModePlaybackScreen(
+            browserProbe = browserProbe,
             mediaFileList = mediaFiles,
+            fileListEventLines = vm.gattEvents.collectAsState().value,
             ui = transportUi,
             remoteAvailable = remote.available,
             remotePhase = remote.phase,
@@ -8455,7 +8458,7 @@ private fun MediaModuleScreen(vm: AtomosViewModel) {
             onDiagnosticTest = { testId ->
                 when (testId) {
                     "filelist-nonlocal" -> vm.requestMediaU04FileListRouteOnce(0, false)
-                    "filelist-local" -> vm.requestMediaU04FileListRouteOnce(0, true)
+                    "filelist-local" -> vm.requestMediaU04FileListRouteOnce(0, false)
                     "mode-get" -> vm.requestMediaK014ModeGetOnce()
                     "media-state" -> vm.requestMediaK011StateGetOnce()
                     else -> false // U04 unverified / state-changing methods cannot transmit.
@@ -8465,7 +8468,12 @@ private fun MediaModuleScreen(vm: AtomosViewModel) {
             onSsdListReset = { vm.mediaU02ResetFileList() },
             onModeGetEvidence = { vm.requestMediaK014ModeGetOnce() },
             onModeStart = { vm.requestMediaK016ModeStartOnce() },
+            onFilenameSize = { vm.requestMediaU0459FilenameSizeOnce() },
+            onFilePlay = { index -> vm.requestMediaU0459PlayFile(index) },
+            onPageRequest = { start -> vm.requestMediaU04FileListRouteOnce(start, false) },
             onMediaStateGetEvidence = { vm.requestMediaK011StateGetOnce() },
+            onBrowserProbeGet = { key -> vm.requestMediaU0465ProbeOnce(key) },
+            onBrowserProbeTimeout = { generation -> vm.expireMediaU0465Probe(generation) },
             onRecover = { vm.recoverRemoteSessionFromUi() }
         )
     }
