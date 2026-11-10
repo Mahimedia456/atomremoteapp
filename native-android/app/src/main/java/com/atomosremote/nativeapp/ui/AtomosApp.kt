@@ -8390,21 +8390,23 @@ private fun AudioR26MetersPlaceholder(havePayload: Boolean, rawHex: String, insp
 private fun MediaModuleScreen(vm: AtomosViewModel) {
     val selected by vm.selected.collectAsState()
     val recorderName = selected?.let { vm.displayNameFor(it) } ?: "ATOMOS Recorder"
-
-    LaunchedEffect(recorderName) {
-        Log.d(
-            "AtomRemoteUI",
-            "MEDIA-M02-M04 recorder=$recorderName ui=ISOLATED playback=BROWSER_VIEW_ONLY verifiedGet=NONE writes=LOCKED"
-        )
-    }
-
     val transportUi by vm.remoteTransportUiState.collectAsState()
     val remote by vm.tcsRemoteState.collectAsState()
     val gattState by vm.gattState.collectAsState()
     val commandStatus by vm.commandStatus.collectAsState()
+    val mediaFiles by vm.mediaSsdFileListState.collectAsState()
+    val browserProbe by vm.mediaU0465ProbeState.collectAsState()
+    val batchBusy by vm.mediaU0515BatchBusy.collectAsState()
+    val clipSwitchBusy by vm.mediaU0532ClipSwitchBusy.collectAsState()
+    val embedded = LocalConnectedModuleEmbedded.current
+    val ssdBootstrapGeneration by vm.mediaU0522BootstrapGeneration.collectAsState()
+    val autoRepairing by vm.mediaU0551Repairing.collectAsState()
+    val lastKnownFilename by vm.mediaU0551LastKnownClipName.collectAsState()
+    LaunchedEffect(selected?.address) { vm.mediaU0551CheckMediaDevice(selected?.address) }
 
-    // This effect also covers the standalone MEDIA screen route. ConnectedTopTabs
-    // may already be observing the same VM controller; observe() is idempotent.
+    // U05.22: never tie recovery bootstrap to a transient local Boolean.
+    // This generation is armed only by a successful operator Playback request,
+    // successful trusted Recover of that request, or manual physical-Playback confirmation.
     LaunchedEffect(remote.phase, remote.lastCommand, remote.lastError, gattState) {
         vm.observeRemoteTransportUiState()
     }
@@ -8415,67 +8417,106 @@ private fun MediaModuleScreen(vm: AtomosViewModel) {
             vm.timeoutRemoteTransportUiAction(generation)
         }
     }
-    ModuleShell(vm, AtomosViewModel.Screen.MEDIA, "Media", recorderName) {
-        val mediaFiles by vm.mediaSsdFileListState.collectAsState()
-        val browserProbe by vm.mediaU0465ProbeState.collectAsState()
-        com.atomosremote.nativeapp.media.MediaModePlaybackScreen(
-            browserProbe = browserProbe,
-            mediaFileList = mediaFiles,
-            fileListEventLines = vm.gattEvents.collectAsState().value,
-            ui = transportUi,
-            remoteAvailable = remote.available,
-            remotePhase = remote.phase,
-            commandStatus = commandStatus,
-            onPlaybackMode = {
-                val token = vm.beginRemoteTransportUiAction(
-                    "enter-playback-mode", "Playback Mode", "Prepare Playback Mode"
-                )
-                if (token != null && !vm.enterPlaybackModeOnlyFromMediaUi()) {
-                    vm.rejectRemoteTransportUiAction("Playback Mode request was not queued")
+    val firstSsdAlreadyVerified = mediaFiles.recorderValidated &&
+        mediaFiles.modeReadback == 1 && mediaFiles.entries.isNotEmpty()
+    LaunchedEffect(ssdBootstrapGeneration, transportUi.mode, transportUi.pendingAction,
+        remote.available, transportUi.recoveryRequired, firstSsdAlreadyVerified) {
+        if (ssdBootstrapGeneration > 0 &&
+            transportUi.mode == com.atomosremote.nativeapp.viewmodel.RemoteTransportUiController.Mode.PLAYBACK &&
+            transportUi.pendingAction == null && !transportUi.recoveryRequired && remote.available) {
+            // U05.26: a verified first-file + MoviePicker mode readback in
+            // this live state already proves the list is initialized. Do not
+            // send another unnecessary MoviePicker request or reset the count.
+            if (firstSsdAlreadyVerified) {
+                Log.i("AtomRemoteMediaU0526", "SSD_ALREADY_READY files=${mediaFiles.entries.size} total=${mediaFiles.totalFiles} noTx=true")
+                return@LaunchedEffect
+            }
+            // U05.37: no unconditional 4.5s / 350ms delay. If transport and
+            // MoviePicker safety gate are ready, dispatch on the same UI frame.
+            // Polling performs NO TX, cannot preempt other PLINK owners, and
+            // still respects U05.29 recorder reboot and connection safety holds.
+            // Existing automatic MoviePicker/SSD flow and UI remain unchanged.
+            val startedAt = android.os.SystemClock.elapsedRealtime()
+            Log.i("AtomRemoteMediaU0537", "SSD_IMMEDIATE_ADMISSION generation=$ssdBootstrapGeneration " +
+                "fixedDelayMs=0 safetyGatePreserved=true noPreemption=true")
+            var readyForRequest = false
+            for (attempt in 0 until 200) {
+                if (vm.mediaU0522ReadyToBootstrap()) {
+                    readyForRequest = true
+                    break
                 }
-            },
-            onRecordMode = {
-                val token = vm.beginRemoteTransportUiAction(
-                    "return-record-mode", "Return to Record mode", "Prepare Record Mode"
-                )
-                if (token != null && !vm.returnToRecordModeOnlyFromUi()) {
-                    vm.rejectRemoteTransportUiAction("Record Mode request was not queued")
-                }
-            },
-            onPlay = {
-                val token = vm.beginRemoteTransportUiAction("play", "Play", "Play")
-                if (token != null && !vm.sendMediaPlaybackOnlyFromUi("play")) {
-                    vm.rejectRemoteTransportUiAction("Play request was not queued")
-                }
-            },
-            onPause = {
-                val token = vm.beginRemoteTransportUiAction("pause", "Pause", "Pause")
-                if (token != null && !vm.sendMediaPlaybackOnlyFromUi("pause")) {
-                    vm.rejectRemoteTransportUiAction("Pause request was not queued")
-                }
-            },
-            onSsdListEvidence = { start -> vm.requestMediaK01FileListGetOnce(start) },
-            onDiagnosticTest = { testId ->
-                when (testId) {
-                    "filelist-nonlocal" -> vm.requestMediaU04FileListRouteOnce(0, false)
-                    "filelist-local" -> vm.requestMediaU04FileListRouteOnce(0, false)
-                    "mode-get" -> vm.requestMediaK014ModeGetOnce()
-                    "media-state" -> vm.requestMediaK011StateGetOnce()
-                    else -> false // U04 unverified / state-changing methods cannot transmit.
-                }
-            },
-            onSsdListTimeout = { generation -> vm.mediaU02ExpireFileList(generation) },
-            onSsdListReset = { vm.mediaU02ResetFileList() },
-            onModeGetEvidence = { vm.requestMediaK014ModeGetOnce() },
-            onModeStart = { vm.requestMediaK016ModeStartOnce() },
-            onFilenameSize = { vm.requestMediaU0459FilenameSizeOnce() },
-            onFilePlay = { index -> vm.requestMediaU0459PlayFile(index) },
-            onPageRequest = { start -> vm.requestMediaU04FileListRouteOnce(start, false) },
-            onMediaStateGetEvidence = { vm.requestMediaK011StateGetOnce() },
-            onBrowserProbeGet = { key -> vm.requestMediaU0465ProbeOnce(key) },
-            onBrowserProbeTimeout = { generation -> vm.expireMediaU0465Probe(generation) },
-            onRecover = { vm.recoverRemoteSessionFromUi() }
-        )
+                kotlinx.coroutines.delay(100L)
+            }
+            val admitted = if (readyForRequest) vm.mediaU0522AdmitBootstrap(ssdBootstrapGeneration) else false
+            val elapsed = android.os.SystemClock.elapsedRealtime() - startedAt
+            Log.i("AtomRemoteMediaU0537", "SSD_ADMISSION_RESULT generation=$ssdBootstrapGeneration " +
+                "ready=$readyForRequest admitted=$admitted waitedMs=$elapsed " +
+                "fixedDelayMs=0 noAutoTxRetry=true")
+        }
+    }
+
+    if (!embedded) BackHandler { vm.go(AtomosViewModel.Screen.REMOTE) }
+    Column(
+        Modifier.fillMaxSize().background(Color(0xFF02090C)).navigationBarsPadding()
+    ) {
+        if (!embedded) {
+            AppHeader(title = "Media", subtitle = recorderName,
+                onBack = { vm.go(AtomosViewModel.Screen.REMOTE) })
+        }
+        Box(Modifier.weight(1f).fillMaxWidth()) {
+            com.atomosremote.nativeapp.media.MediaModePlaybackScreen(
+                modifier = Modifier.fillMaxSize(),
+                recorderName = recorderName,
+                browserProbe = browserProbe,
+                mediaFileList = mediaFiles,
+                batchBusy = batchBusy,
+                clipSwitchBusy = clipSwitchBusy,
+                fileListEventLines = vm.gattEvents.collectAsState().value,
+                ui = transportUi,
+                remoteAvailable = remote.available,
+                remotePhase = remote.phase,
+                commandStatus = commandStatus,
+                onPlaybackMode = {
+                    val token = vm.beginRemoteTransportUiAction(
+                        "enter-playback-mode", "Playback Mode", "Prepare Playback Mode"
+                    )
+                    if (token != null) {
+                        if (!vm.enterPlaybackModeOnlyFromMediaUi())
+                            vm.rejectRemoteTransportUiAction("Playback Mode request was not queued")
+                    }
+                },
+                onRecordMode = {
+                    val token = vm.beginRemoteTransportUiAction(
+                        "return-record-mode", "Return to Record mode", "Prepare Record Mode"
+                    )
+                    if (token != null) {
+                        if (!vm.returnToRecordModeOnlyFromUi()) {
+                            vm.rejectRemoteTransportUiAction("Record Mode request was not queued")
+                        }
+                    }
+                },
+                // Play/Pause use the original recorder commands directly.
+                // They do NOT set a six-second UI pending lock that can wrongly
+                // require RECOVER if an optional application ACK is absent.
+                onPlay = { vm.sendMediaPlaybackOnlyFromUi("play") },
+                onPause = { vm.sendMediaPlaybackOnlyFromUi("pause") },
+                onSsdListTimeout = { generation -> vm.mediaU02ExpireFileList(generation) },
+                onSsdListReset = { vm.mediaU02ResetFileList() },
+                onFilePlay = { index -> vm.mediaU0522SelectAndPlay(index) },
+                onForceFilePlayPilot = { index -> vm.mediaU0527ConfirmForceFilePlayPilot(index) },
+                onPageRequest = { start, count -> vm.requestMediaU0513LoadNextEight(start, count) },
+                onShuttlePilot = { direction -> vm.mediaU0545FastForwardRewindPilot(direction) },
+                onConfirmPlaybackAndResume = {
+                    vm.confirmMediaPlaybackVisibleForResume()
+                },
+                onBrowserProbeGet = { key -> vm.requestMediaU0465ProbeOnce(key) },
+                onRecover = { vm.recoverRemoteSessionFromUi() },
+                autoRepairing = autoRepairing,
+                lastKnownFilename = lastKnownFilename,
+                onRememberFilename = vm::mediaU0551RememberClipName
+            )
+        }
+        if (!embedded) RemoteModuleNavBar(vm = vm, current = AtomosViewModel.Screen.MEDIA)
     }
 }
 

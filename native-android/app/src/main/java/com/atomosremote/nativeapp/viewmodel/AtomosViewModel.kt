@@ -2091,6 +2091,68 @@ class AtomosViewModel(app: Application) : AndroidViewModel(app) {
      * This calls the already-existing frozen GattClient command. No GattClient code
      * or packet construction is changed.
      */
+    // U05.22: Playback intent belongs to the ViewModel, not a transient Media composable.
+    // Recovery never sends a recorder command here. The existing MoviePicker ACK gate
+    // remains the only authority to begin SSD reads.
+    private var mediaU0522PlaybackIntent = false
+    private val _mediaU0522BootstrapGeneration = MutableStateFlow(0)
+    val mediaU0522BootstrapGeneration: StateFlow<Int> = _mediaU0522BootstrapGeneration
+    private var mediaU0522UsedGeneration = 0
+
+    // U05.29: The AG2 can reboot its BLE transport when switching Record -> Playback.
+    // A reconnect reporting packet-ready does NOT guarantee MoviePicker is ready.
+    // Delay ONLY the initial MoviePicker admission, not the Recover Remote button,
+    // existing Play/Pause commands, or the proven FileList decoder.
+    private var mediaU0529MoviePickerNotBeforeMs = 0L
+    // U05.47: reuse the 14s reboot hold for an immediately related trusted recovery.
+    // Independent recovery continues to require the original 12s stabilization.
+    private var mediaU0547RecordToPlaybackAtMs = 0L
+    private fun mediaU0529HoldMoviePicker(milliseconds: Long, reason: String) {
+        val now = android.os.SystemClock.elapsedRealtime()
+        mediaU0529MoviePickerNotBeforeMs = maxOf(
+            mediaU0529MoviePickerNotBeforeMs, now + milliseconds)
+        Log.i("AtomRemoteMediaU0529",
+            "MOVIEPICKER_STABILITY_HOLD reason=$reason holdMs=$milliseconds " +
+                "noTx=true manualRecoveryPreserved=true")
+    }
+
+    private fun mediaU0522Arm(reason: String) {
+        val next = _mediaU0522BootstrapGeneration.value + 1
+        _mediaU0522BootstrapGeneration.value = next
+        Log.i("AtomRemoteMediaU0522", "SSD_ARM generation=$next reason=$reason noTx=true")
+    }
+
+    // U05.32: initial Playback-only SSD request gets first eligible idle slot.
+    // Existing 14s Record->Playback reboot guard still takes precedence.
+    // Does NOT preempt PacketLink owners or cancel other-tab GETs.
+    fun mediaU0532PlaybackBootstrapDelayMs(): Long =
+        if (android.os.SystemClock.elapsedRealtime() < mediaU0529MoviePickerNotBeforeMs)
+            4_500L else 350L
+
+    fun mediaU0522ReadyToBootstrap(): Boolean {
+        // A real BLE connection can briefly be packet-ready while the recorder
+        // is still rebooting its MoviePicker. No recorder TX during this hold.
+        if (android.os.SystemClock.elapsedRealtime() < mediaU0529MoviePickerNotBeforeMs) return false
+        val st = remoteTransportUiController.state.value
+        val remote = gatt.tcsRemoteState.value
+        return remote.available && remote.phase in setOf("linked", "packet-ready", "transport-ready") &&
+            st.mode == RemoteTransportUiController.Mode.PLAYBACK &&
+            !st.recoveryRequired && st.pendingAction == null &&
+            gatt.tcsPairingState.value.acceptWritten
+    }
+
+    fun mediaU0522AdmitBootstrap(generation: Int): Boolean {
+        if (generation <= 0 || generation <= mediaU0522UsedGeneration) return false
+        val st = remoteTransportUiController.state.value
+        if (!mediaU0522ReadyToBootstrap()) return false
+        // Consume one user-authorized generation BEFORE an attempted TX.
+        // Never auto-retry a rejected or timed-out MoviePicker command.
+        mediaU0522UsedGeneration = generation
+        val queued = requestMediaU0507MoviePickerAndFilesOnce()
+        Log.i("AtomRemoteMediaU0522", "SSD_BOOTSTRAP generation=$generation queued=$queued noRetry=true")
+        return queued
+    }
+
     fun returnToRecordModeOnlyFromUi(): Boolean {
         val remote = gatt.tcsRemoteState.value
         if (!_pairingCodeAccepted.value || !gatt.tcsPairingState.value.acceptWritten) {
@@ -2103,6 +2165,11 @@ class AtomosViewModel(app: Application) : AndroidViewModel(app) {
         }
 
         val ok = gatt.sendOfficialRemoteCommand("prepare-record-mode")
+        if (ok) {
+            mediaU0522PlaybackIntent = false
+            mediaU0547RecordToPlaybackAtMs = 0L
+            mediaU0551WatchRecoveryAfterMode("record")
+        }
         _commandStatus.value = if (ok) {
             "Returning recorder to Record mode..."
         } else {
@@ -2127,6 +2194,15 @@ class AtomosViewModel(app: Application) : AndroidViewModel(app) {
             return false
         }
         val queued = gatt.sendOfficialRemoteCommand("prepare-playback-mode")
+        if (queued) {
+            mediaU0522PlaybackIntent = true
+            mediaU0547RecordToPlaybackAtMs = android.os.SystemClock.elapsedRealtime()
+            // AG2 Record -> Playback can restart the recorder/BLE transport.
+            // Existing UI will poll readiness until this stability window ends.
+            mediaU0529HoldMoviePicker(14_000L, "record-to-playback-reboot")
+            mediaU0522Arm("operator-record-to-playback")
+            mediaU0551WatchRecoveryAfterMode("playback")
+        }
         _commandStatus.value = if (queued) "Playback mode requested (0x0132); verify recorder screen." else
             "Playback mode could not be queued."
         Log.i("AtomRemoteMediaU01", "MODE_REQUEST target=playback queued=$queued recorderConfirmed=false")
@@ -2144,7 +2220,7 @@ class AtomosViewModel(app: Application) : AndroidViewModel(app) {
         val uiState = remoteTransportUiController.state.value
         if (!_pairingCodeAccepted.value || !gatt.tcsPairingState.value.acceptWritten ||
             !remote.available || uiState.mode != RemoteTransportUiController.Mode.PLAYBACK ||
-            uiState.recoveryRequired
+            uiState.recoveryRequired || uiState.pendingAction != null
         ) {
             _commandStatus.value = "Playback control blocked: linked Playback mode has not been tracked."
             return false
@@ -2239,12 +2315,626 @@ class AtomosViewModel(app: Application) : AndroidViewModel(app) {
         return queued
     }
 
+
+    /** U05.16: operator selection sends one guarded FilePlay on E8. No automatic retries. */
+    fun requestMediaU0516PlaySelectedClip(index: Int): Boolean {
+        val state = remoteTransportUiController.state.value
+        val page = gatt.mediaSsdFileListState.value
+        if (!_pairingCodeAccepted.value || !gatt.tcsPairingState.value.acceptWritten ||
+            !gatt.tcsRemoteState.value.available ||
+            state.mode != RemoteTransportUiController.Mode.PLAYBACK ||
+            state.recoveryRequired || state.pendingAction != null ||
+            page.pending || page.modeReadback != 1 || !page.recorderValidated ||
+            !page.entries.any { it.index == index }) {
+            _commandStatus.value = "FilePlay blocked: MoviePicker or verified filename unavailable."
+            return false
+        }
+        val queued = gatt.mediaU0516PlaySelectedFileE8(index)
+        _commandStatus.value = if (queued)
+            "Requested selected clip from recorder; waiting for actual FilePlay response."
+        else "FilePlay request not admitted. Existing selected clip preserved."
+        return queued
+    }
+
+    // U05.31: Direct MoviePicker re-entry for EVERY different ACTIVE clip.
+    // Confirmed U05.30 trace: 0x81FD mode=1 -> 0x81FC result=0.
+    // Previously a normal-first FilePlay sent a known reject=2; no longer.
+    // Only fresh recorder acknowledgements permit the existing Play command.
+    private val _mediaU0532ClipSwitchBusy = MutableStateFlow(false)
+    val mediaU0532ClipSwitchBusy: StateFlow<Boolean> = _mediaU0532ClipSwitchBusy
+    private var mediaU0522SelectPlayJob: Job? = null
+    fun mediaU0522SelectAndPlay(index: Int): Boolean {
+        if (mediaU0522SelectPlayJob?.isActive == true) {
+            _commandStatus.value = "Clip change is pending. Wait for recorder acknowledgement."
+            Log.w("AtomRemoteMediaU0530", "SWITCH_BUSY index=$index noTx=true")
+            return false
+        }
+        val page = gatt.mediaSsdFileListState.value
+        val session = remoteTransportUiController.state.value
+        if (!_pairingCodeAccepted.value || !gatt.tcsPairingState.value.acceptWritten ||
+            !gatt.tcsRemoteState.value.available ||
+            session.mode != RemoteTransportUiController.Mode.PLAYBACK ||
+            session.recoveryRequired || session.pendingAction != null ||
+            !page.recorderValidated || page.modeReadback != 1 || page.pending ||
+            !page.entries.any { it.index == index }) {
+            _commandStatus.value = "Clip selection blocked: Remote, MoviePicker or file list unavailable."
+            Log.w("AtomRemoteMediaU0530", "SWITCH_GATE index=$index active=${page.activeIndex} " +
+                "pending=${page.pending} recovery=${session.recoveryRequired} noTx=true")
+            return false
+        }
+        if (page.activeIndex == index) {
+            val queued = sendMediaPlaybackOnlyFromUi("play")
+            Log.i("AtomRemoteMediaU0530", "ALREADY_ACTIVE_PLAY index=$index queued=$queued")
+            return queued
+        }
+        val fromIndex = page.activeIndex
+        val mustPause = fromIndex != null && fromIndex != index
+        if (mustPause) {
+            val pause = sendMediaPlaybackOnlyFromUi("pause")
+            Log.i("AtomRemoteMediaU0530", "SWITCH_PAUSE from=$fromIndex to=$index queued=$pause " +
+                "recorderAckUnverified=true")
+            if (!pause) return false
+        }
+        _mediaU0532ClipSwitchBusy.value = true
+        mediaU0522SelectPlayJob = viewModelScope.launch {
+            suspend fun waitReady(): Boolean = withTimeoutOrNull(3_000L) {
+                while (isActive) {
+                    val st = remoteTransportUiController.state.value
+                    val remote = gatt.tcsRemoteState.value
+                    if (st.recoveryRequired || st.pendingAction != null ||
+                        st.mode != RemoteTransportUiController.Mode.PLAYBACK || !remote.available)
+                        return@withTimeoutOrNull false
+                    if (remote.phase in setOf("linked", "packet-ready", "transport-ready") &&
+                        !gatt.mediaSsdFileListState.value.pending) return@withTimeoutOrNull true
+                    delay(100L)
+                }
+                false
+            } == true
+
+            suspend fun waitFilePlay(indexToCheck: Int): Boolean = withTimeoutOrNull(6_000L) {
+                while (isActive) {
+                    val actual = gatt.mediaSsdFileListState.value
+                    val st = remoteTransportUiController.state.value
+                    if (!gatt.tcsRemoteState.value.available || st.recoveryRequired ||
+                        st.mode != RemoteTransportUiController.Mode.PLAYBACK)
+                        return@withTimeoutOrNull false
+                    if (actual.activeIndex == indexToCheck &&
+                        actual.status.startsWith("Recorder FilePlay ACK for"))
+                        return@withTimeoutOrNull true
+                    if (actual.status.startsWith("Recorder FilePlay returned") ||
+                        actual.status.startsWith("Recorder ForceFilePlay returned"))
+                        return@withTimeoutOrNull false
+                    delay(100L)
+                }
+                false
+            } == true
+
+            suspend fun reopenPicker(): Boolean {
+                if (!waitReady()) return false
+                // U05.31: every different already-active clip uses the U05.30
+                // hardware-verified E8 re-entry route FIRST. GATT still bounds
+                // the admission and requires fresh 0x81FD ACK for this clip.
+                val queued = gatt.mediaU0530ReopenMoviePickerForClip(index)
+                Log.i("AtomRemoteMediaU0530", "REENTER_ATTEMPT index=$index queued=$queued " +
+                    "validated=${gatt.mediaU0530PickerReentryValidated()} noRetry=true")
+                if (!queued) return false
+                val ack = withTimeoutOrNull(8_000L) {
+                    while (isActive) {
+                        val st = remoteTransportUiController.state.value
+                        if (st.recoveryRequired || st.mode != RemoteTransportUiController.Mode.PLAYBACK ||
+                            !gatt.tcsRemoteState.value.available) return@withTimeoutOrNull false
+                        if (gatt.mediaU0530PickerAckAtMs.value > 0L)
+                            return@withTimeoutOrNull true
+                        delay(90L)
+                    }
+                    false
+                } == true
+                Log.i("AtomRemoteMediaU0530", "REENTER_ACK_RESULT index=$index ack=$ack " +
+                    "noFilePlayIfFalse=true")
+                if (!ack) return false
+                delay(300L)
+                return waitReady()
+            }
+
+            suspend fun filePlay(): Boolean {
+                if (!waitReady()) return false
+                val queued = requestMediaU0516PlaySelectedClip(index)
+                Log.i("AtomRemoteMediaU0530", "SWITCH_FILEPLAY index=$index queued=$queued " +
+                    "noRetry=true")
+                return queued && waitFilePlay(index)
+            }
+
+            try {
+                if (mustPause) delay(1_000L)
+                val routeValidated = gatt.mediaU0530PickerReentryValidated()
+                var reopened = false
+                var accepted = false
+                if (fromIndex != null) {
+                    // U05.31: Do NOT preflight a FilePlay that AG2 rejects.
+                    // Go directly to a fresh MoviePicker ACK, then FilePlay.
+                    Log.i("AtomRemoteMediaU0531", "DIRECT_SWITCH index=$index " +
+                        "from=$fromIndex validated=$routeValidated noPreReject=true")
+                    reopened = reopenPicker()
+                    if (reopened) accepted = filePlay()
+                } else {
+                    // When no ACTIVE clip exists yet, keep the proven U05.30
+                    // initial selection path with no unnecessary re-entry.
+                    accepted = filePlay()
+                }
+                if (!accepted && routeValidated) {
+                    gatt.mediaU0530DisableValidatedReentry("validated-reentry-did-not-accept")
+                }
+                if (accepted) {
+                    if (reopened) gatt.mediaU0530MarkReentryValidated(index)
+                    delay(250L)
+                    val played = sendMediaPlaybackOnlyFromUi("play")
+                    _commandStatus.value = if (played)
+                        "Clip $index accepted and Play queued. Confirm picture on recorder."
+                    else "Clip $index ACTIVE by ACK; Play was not queued."
+                    Log.i("AtomRemoteMediaU0530", "SWITCH_RESULT index=$index accepted=true " +
+                        "reentered=$reopened playQueued=$played hardwarePictureUnverified=true")
+                } else {
+                    val actual = gatt.mediaSsdFileListState.value
+                    _commandStatus.value = "Clip $index not ACTIVE. Recorder replied: ${actual.status}. " +
+                        "Previous active clip preserved."
+                    Log.w("AtomRemoteMediaU0530", "SWITCH_RESULT index=$index accepted=false " +
+                        "reentered=$reopened active=${actual.activeIndex} status=${actual.status} " +
+                        "noPlayTx=true noFurtherRetry=true")
+                }
+            } finally {
+                _mediaU0532ClipSwitchBusy.value = false
+                Log.i("AtomRemoteMediaU0530", "SWITCH_IDLE index=$index")
+            }
+        }
+        return true
+    }
+
+
+    /** U05.45 isolated, manual-only test of Mac FastForwardRewindSet 0x019B. */
+    fun mediaU0545FastForwardRewindPilot(direction: Int): Boolean {
+        val ui = remoteTransportUiController.state.value
+        val remote = gatt.tcsRemoteState.value
+        val page = gatt.mediaSsdFileListState.value
+        val hasVerifiedPlaybackSelection = page.activeIndex == null ||
+            page.entries.any { it.index == page.activeIndex }
+        if (direction !in listOf(-1, 1) || !_pairingCodeAccepted.value ||
+            !gatt.tcsPairingState.value.acceptWritten || !remote.available ||
+            ui.mode != RemoteTransportUiController.Mode.PLAYBACK || ui.recoveryRequired ||
+            ui.pendingAction != null || _mediaU0532ClipSwitchBusy.value ||
+            mediaU0515BatchBusy.value || page.pending || !page.recorderValidated ||
+            page.modeReadback != 1 || page.entries.isEmpty() ||
+            !hasVerifiedPlaybackSelection) {
+            _commandStatus.value = "U0546 0x019B pilot blocked: stable verified ACTIVE clip required."
+            Log.w("AtomRemoteMediaU0545", "VM_GATE_BLOCK direction=$direction noTx=true")
+            return false
+        }
+        val buffered = gatt.mediaU0545FastForwardRewindSetPilot(direction)
+        _commandStatus.value = if (buffered)
+            "U0545 0x019B candidate buffered. Inspect TX/RX and physical recorder; NOT verified."
+        else "U0546 shuttle NOT queued: check transport gates, active clip, or cooldown."
+        Log.i("AtomRemoteMediaU0545", "VM_PILOT_RESULT direction=$direction buffered=$buffered")
+        return buffered
+    }
+
+    /** U05.32 operator-driven Mac FF/Rewind static pilot, no automatic TX. */
+    fun mediaU0532ShuttlePilot(direction: Int): Boolean {
+        val ui = remoteTransportUiController.state.value
+        val remote = gatt.tcsRemoteState.value
+        if (direction !in listOf(-1, 1) || !_pairingCodeAccepted.value ||
+            !gatt.tcsPairingState.value.acceptWritten || !remote.available ||
+            ui.mode != RemoteTransportUiController.Mode.PLAYBACK || ui.recoveryRequired ||
+            ui.pendingAction != null || _mediaU0532ClipSwitchBusy.value ||
+            mediaU0515BatchBusy.value || gatt.mediaSsdFileListState.value.pending) {
+            _commandStatus.value = "Mac shuttle pilot blocked: stable ACTIVE clip/idle transport required."
+            return false
+        }
+        val queued = gatt.mediaU0532ShuttleSpeedPilot(direction)
+        _commandStatus.value = if (queued)
+            "Mac shuttle ${if (direction > 0) "forward" else "rewind"} PILOT queued. Verify recorder physically."
+        else "Mac shuttle pilot not queued. No recorder speed state is assumed."
+        return queued
+    }
+
+    /**
+     * U05.27: user-confirmed, one-shot Mac ForceFilePlay pilot for a clip
+     * the recorder *just* rejected using ordinary FilePlay result=2.
+     * This is intentionally NOT an automatic fallback until confirmed on AG2.
+     */
+    fun mediaU0527ConfirmForceFilePlayPilot(index: Int): Boolean {
+        val ui = remoteTransportUiController.state.value
+        val page = gatt.mediaSsdFileListState.value
+        if (mediaU0522SelectPlayJob?.isActive == true ||
+            !gatt.tcsRemoteState.value.available || !gatt.tcsPairingState.value.acceptWritten ||
+            ui.mode != RemoteTransportUiController.Mode.PLAYBACK || ui.recoveryRequired ||
+            ui.pendingAction != null || page.pending || page.modeReadback != 1 ||
+            !page.entries.any { it.index == index } ||
+            !page.status.startsWith("Recorder FilePlay returned 2")) {
+            _commandStatus.value = "ForceFilePlay pilot blocked: no fresh result=2 on the selected clip."
+            Log.w("AtomRemoteMediaU0527", "PILOT_GATE_BLOCK index=$index noTx=true")
+            return false
+        }
+        val queued = gatt.mediaU0527ForceSelectedFileE8(index, explicitPilot = true)
+        if (!queued) {
+            _commandStatus.value = "ForceFilePlay pilot not admitted: transport busy or pilot already used."
+            return false
+        }
+        _commandStatus.value = "Mac ForceFilePlay pilot queued for selected clip; awaiting real 0x8201 result."
+        mediaU0522SelectPlayJob = viewModelScope.launch {
+            val confirmed = withTimeoutOrNull(8_000L) {
+                while (isActive) {
+                    val state = remoteTransportUiController.state.value
+                    val now = gatt.mediaSsdFileListState.value
+                    if (!gatt.tcsRemoteState.value.available || state.recoveryRequired ||
+                        state.mode != RemoteTransportUiController.Mode.PLAYBACK) return@withTimeoutOrNull false
+                    if (now.activeIndex == index && now.status.startsWith("Recorder ForceFilePlay ACK for"))
+                        return@withTimeoutOrNull true
+                    if (now.status.startsWith("Recorder ForceFilePlay returned"))
+                        return@withTimeoutOrNull false
+                    delay(100L)
+                }
+                false
+            } == true
+            if (confirmed) {
+                delay(250L)
+                val played = sendMediaPlaybackOnlyFromUi("play")
+                _commandStatus.value = if (played) "Mac ForceFilePlay ACK; PLAY queued. Next/Prev pilot route enabled for this session."
+                    else "Mac ForceFilePlay ACK; PLAY not queued. Use existing PLAY."
+                Log.i("AtomRemoteMediaU0527", "PILOT_ACK_THEN_PLAY index=$index queued=$played")
+            } else {
+                _commandStatus.value = "Mac ForceFilePlay pilot not verified. Original ACTIVE clip preserved."
+                Log.w("AtomRemoteMediaU0527", "PILOT_ACK_MISSING index=$index noPlayTx=true")
+            }
+        }
+        return true
+    }
+
+    /**
+     * U04.90: one explicit Load SSD Files tap, no hidden retries or speculative opcodes.
+     * Recorder-changing MoviePicker ModeStart was reconstructed from the Mac binary,
+     * but AG2 acceptance is not proven. Require a fresh mode=1 response before GET.
+     * Read-only FileList page still uses the existing frozen GATT PacketLink sender.
+     */
+    private var mediaU0490BrowseJob: Job? = null
+
+    fun requestMediaU0490OneTapBrowse(): Boolean {
+        val remote = gatt.tcsRemoteState.value
+        val uiState = remoteTransportUiController.state.value
+        if (!_pairingCodeAccepted.value || !gatt.tcsPairingState.value.acceptWritten ||
+            !remote.available || uiState.mode != RemoteTransportUiController.Mode.PLAYBACK ||
+            uiState.recoveryRequired || uiState.pendingAction != null ||
+            gatt.mediaSsdFileListState.value.pending || mediaU0490BrowseJob?.isActive == true) {
+            _commandStatus.value = "SSD initialization blocked: check Playback, pairing, link and pending action."
+            Log.w("AtomRemoteMediaU0490", "ONE_TAP_BLOCKED noTx=true")
+            return false
+        }
+        mediaU0490BrowseJob = viewModelScope.launch {
+            val existingMode = gatt.mediaSsdFileListState.value.modeReadback == 1
+            if (!existingMode) {
+                // Reset only dedicated FileBrowser evidence/one-shot admission counters.
+                // Never resets GATT, transport, pairing, Play/Pause or other tabs.
+                gatt.mediaU02ResetFileList()
+                val earlier = gatt.events.value.toList()
+                _commandStatus.value = "SSD 1/2: Starting MoviePicker (0x01FD); awaiting real recorder ACK."
+                val sent = gatt.mediaK016RequestModeStartOnce()
+                Log.i("AtomRemoteMediaU0490", "ONE_TAP_MODE_START queued=$sent opcode=0x01FD mode=1 local=false")
+                if (!sent) {
+                    _commandStatus.value = "SSD: ModeStart was not queued. No FileList sent."
+                    return@launch
+                }
+                val startMs = android.os.SystemClock.elapsedRealtime()
+                var acknowledged = false
+                while (isActive && android.os.SystemClock.elapsedRealtime() - startMs < 8_000L) {
+                    if (!gatt.tcsRemoteState.value.available ||
+                        remoteTransportUiController.state.value.recoveryRequired) break
+                    if (com.atomosremote.nativeapp.media.U0490MacInitEvidence.hasFreshMoviePickerAck(
+                            gatt.events.value, earlier)) {
+                        acknowledged = true
+                        break
+                    }
+                    delay(90L)
+                }
+                Log.i("AtomRemoteMediaU0490", "ONE_TAP_MODE_ACK fresh=$acknowledged timeoutMs=8000")
+                Log.i("AtomRemoteMediaU0493", "MODE_RX_DIAGNOSTIC " +
+                    com.atomosremote.nativeapp.media.U0493RxVisibility.summarize(gatt.events.value, earlier))
+                if (!acknowledged) {
+                    _commandStatus.value = "SSD: No fresh 0x81FD MoviePicker ACK. FileList NOT sent."
+                    return@launch
+                }
+            } else Log.i("AtomRemoteMediaU0490", "ONE_TAP_MODE_ALREADY_VERIFIED readback=1")
+
+            _commandStatus.value = "SSD 2/2: MoviePicker acknowledged; requesting FileList (0x01FB)."
+            // Wait only for scheduler admission, not for retransmission.
+            // GATT queues exactly one FileList when admitted, or none if not ready.
+            val beforeList = gatt.events.value.toList()
+            var queued = false
+            for (attempt in 0 until 24) {
+                if (!isActive || !gatt.tcsRemoteState.value.available) break
+                if (gatt.mediaK01RequestFileListGetOnce(0, localRoute = false)) {
+                    queued = true
+                    break
+                }
+                delay(175L)
+            }
+            Log.i("AtomRemoteMediaU0490", "ONE_TAP_LIST_TX queued=$queued opcode=0x01FB route=E0 infoType=existingWire")
+            if (!queued) {
+                _commandStatus.value = "SSD: FileList not queued after mode ACK (credit/MTU busy)."
+                return@launch
+            }
+            val listMs = android.os.SystemClock.elapsedRealtime()
+            var verified = false
+            while (isActive && android.os.SystemClock.elapsedRealtime() - listMs < 14_500L) {
+                if (!gatt.tcsRemoteState.value.available ||
+                    remoteTransportUiController.state.value.recoveryRequired) break
+                val page = com.atomosremote.nativeapp.media.U0490MacInitEvidence.freshFileListPage(
+                    gatt.events.value, beforeList, 0)
+                if (page != null) {
+                    verified = true
+                    _commandStatus.value = "SSD: live 0x81FB received (${page.entries.size} filenames, total ${page.total})."
+                    Log.i("AtomRemoteMediaU0490", "ONE_TAP_LIST_OK page=${page.entries.size} total=${page.total} live=true")
+                    break
+                }
+                delay(100L)
+            }
+            if (!verified) {
+                _commandStatus.value = "SSD: No validated 0x81FB in this live request window. No files claimed."
+                Log.w("AtomRemoteMediaU0490", "ONE_TAP_LIST_TIMEOUT noFakeSuccess=true")
+                Log.i("AtomRemoteMediaU0493", "LIST_RX_DIAGNOSTIC " +
+                    com.atomosremote.nativeapp.media.U0493RxVisibility.summarize(gatt.events.value, beforeList))
+            }
+        }
+        return true // sequence accepted, NOT evidence of recorder TX or loaded files
+    }
+
     /** K016: only entries obtained from raw, structurally decoded FileBrowser RX are shown. */
     val mediaSsdFileListState: StateFlow<com.atomosremote.nativeapp.media.SsdBrowserState> = gatt.mediaSsdFileListState
     val mediaU0465ProbeState: StateFlow<com.atomosremote.nativeapp.media.U0465ProbeState> = gatt.mediaU0465ProbeState
 
+    /**
+     * U05.01: ONE operator-requested sequence. No ModeStart, SET, FilePlay, auto-retry,
+     * transport reconfiguration or background recorder command. Both GET callbacks
+     * already existed in U04.65; this only chains them on actual correlated RX.
+     */
+    private var mediaU0501InitJob: Job? = null
+    private var mediaU0501Attempted = false
+
+    fun requestMediaU0501GuidedInit(): Boolean {
+        val uiState = remoteTransportUiController.state.value
+        val remote = gatt.tcsRemoteState.value
+        val probe = gatt.mediaU0465ProbeState.value
+        // GATT resets the dedicated probe state on disconnect/session reset.
+        // Release the local one-shot admission only after that reset, never
+        // while the previous coroutine or its RX window remains active.
+        if (mediaU0501Attempted && mediaU0501InitJob?.isActive != true &&
+            probe.phase == "idle" && probe.consumedNames.isEmpty()) {
+            mediaU0501Attempted = false
+        }
+        if (mediaU0501Attempted || mediaU0501InitJob?.isActive == true ||
+            !_pairingCodeAccepted.value || !gatt.tcsPairingState.value.acceptWritten ||
+            !remote.available || uiState.mode != RemoteTransportUiController.Mode.PLAYBACK ||
+            uiState.recoveryRequired || uiState.pendingAction != null ||
+            gatt.mediaSsdFileListState.value.pending || probe.phase == "waiting") {
+            _commandStatus.value = "U05.01 blocked: require connected Playback and idle FileBrowser; one attempt per session."
+            Log.w("AtomRemoteMediaU0501", "INIT_BLOCKED noTx=true attempted=$mediaU0501Attempted probe=${probe.phase}")
+            return false
+        }
+        // Never attempt another 0x01FD. This procedure contains only two Mac
+        // GET candidates and one known read-only FileList request.
+        mediaU0501Attempted = true
+        mediaU0501InitJob = viewModelScope.launch {
+            fun sessionOk(): Boolean {
+                val state = remoteTransportUiController.state.value
+                return gatt.tcsRemoteState.value.available &&
+                    gatt.tcsPairingState.value.acceptWritten &&
+                    state.mode == RemoteTransportUiController.Mode.PLAYBACK &&
+                    !state.recoveryRequired && state.pendingAction == null
+            }
+            suspend fun runStage(name: String, expected: Int, label: String): Boolean {
+                if (!sessionOk()) return false
+                // Scheduler admission polling, NOT a repeated TX. Exactly one successful
+                // queue acceptance ends this loop, and no second send is attempted.
+                var queued = false
+                for (i in 0 until 15) {
+                    if (!isActive || !sessionOk()) return false
+                    if (gatt.mediaU0465ManualGetOnce(name, localRoute = true)) { queued = true; break }
+                    delay(200L)
+                }
+                if (!queued) {
+                    _commandStatus.value = "SSD $label: GET not queued (busy/consumed). No next command."
+                    Log.w("AtomRemoteMediaU0501", "STAGE_NOT_QUEUED name=$name noTx=true")
+                    return false
+                }
+                val generation = gatt.mediaU0465ProbeState.value.generation
+                Log.i("AtomRemoteMediaU0501", "STAGE_QUEUED name=$name expected=0x${expected.toString(16)} generation=$generation")
+                _commandStatus.value = "SSD $label: GET queued, waiting for actual 0x${expected.toString(16)} reply."
+                val t0 = android.os.SystemClock.elapsedRealtime()
+                while (isActive && sessionOk() && android.os.SystemClock.elapsedRealtime() - t0 < 12_000L) {
+                    val rx = gatt.mediaU0465ProbeState.value
+                    if (rx.generation != generation || rx.name != name) {
+                        Log.w("AtomRemoteMediaU0501", "STAGE_STALE name=$name generation=$generation")
+                        return false
+                    }
+                    if (rx.phase == "rx" && rx.responseOpcode == expected &&
+                        rx.responseLocal == true) {
+                        Log.i("AtomRemoteMediaU0501", "STAGE_RX_OK name=$name response=0x${expected.toString(16)} bytesHex=${rx.responseHex.take(96)}")
+                        return true
+                    }
+                    delay(100L)
+                }
+                gatt.mediaU0465Expire(generation)
+                _commandStatus.value = "SSD $label: no matching 0x${expected.toString(16)} RX. Stopped; no further requests."
+                Log.w("AtomRemoteMediaU0501", "STAGE_UNCONFIRMED name=$name expected=0x${expected.toString(16)} noNextTx=true")
+                return false
+            }
+
+            Log.i("AtomRemoteMediaU0504", "GUIDED_START route=E8 manual=true noModeStart=true noSet=true oneShot=true modeGate=true")
+            if (!runStage("dir-info", 0x81F7, "1/4 directory")) return@launch
+            if (!runStage("current-index-inferred", 0x81F6, "2/4 current index")) return@launch
+            // U05.03 had directory/index RX but 0x01FB produced an unclassified
+            // 0xFFFF. Do not repeat any FileList request without a live ModeGet.
+            if (!runStage("mode-get", 0x81FF, "3/4 MoviePicker ModeGet")) return@launch
+            val modeHex = gatt.mediaU0465ProbeState.value.responseHex
+            val mode = runCatching {
+                if (modeHex.length % 2 != 0) null else
+                    com.atomosremote.nativeapp.media.U0459FileBrowserWire.parseMode(
+                        modeHex.chunked(2).map { it.toInt(16).toByte() }.toByteArray())
+            }.getOrNull()
+            Log.i("AtomRemoteMediaU0504", "MODE_PREFLIGHT_RX mode=$mode expected=1 raw=$modeHex recorderReply=true")
+            if (mode != com.atomosremote.nativeapp.media.U0459FileBrowserWire.MODE_MOVIE_PICKER) {
+                _commandStatus.value = "SSD STOP: FileBrowser ModeGet returned ${mode ?: "unrecognized"}; MoviePicker=1 required. No FileList TX."
+                Log.w("AtomRemoteMediaU0504", "MODE_PREFLIGHT_BLOCK noFileListTx=true mode=$mode")
+                return@launch
+            }
+            if (!sessionOk()) {
+                _commandStatus.value = "SSD initialization stopped: Playback link changed."
+                return@launch
+            }
+            // U05.10: Mac's dynamic 0x01FB pagination builder uses positive
+            // page size, start=page*size and infoType 0 or 2 according to a
+            // controller-state flag. 0/0/1/3 occurs near UI dismissal and is
+            // NOT verified as a filename pagination request.
+            // Operator-confirmed E8 MoviePicker, directory, index and mode=1
+            // gates above remain unchanged. No 0x0202 SET or FilePlay.
+            _commandStatus.value = "SSD 4/4: mode=1 verified. Requesting ONE file (start=0 count=1), bounded GET."
+            var listQueued = false
+            for (i in 0 until 15) {
+                if (!isActive || !sessionOk()) return@launch
+                if (gatt.mediaK01RequestFileListGetOnce(startIndex = 0, localRoute = true, countOverride = 1)) {
+                    listQueued = true
+                    break
+                }
+                delay(200L)
+            }
+            Log.i("AtomRemoteMediaU0511", "SINGLE_FILE_GET_QUEUED accepted=$listQueued mode=1 start=0 count=1 infoType=2 route=E8 noSet=true noAutoRetry=true")
+            _commandStatus.value = if (listQueued)
+                "U05.11 one-file GET sent; awaiting complete 0x81FB and real filename. No retry."
+                else "U05.11 one-file GET blocked or already sent; no retry."
+        }
+        return true
+    }
+
+    /**
+     * U05.07 operator-confirmed ONE TAP workflow: E8 MoviePicker ModeStart ONCE,
+     * require fresh actual 0x81FD body=08 01, THEN reuse U05.01's existing
+     * E8 directory/index/mode-get + one name-page pipeline. No auto trigger
+     * on Playback entry, no command from RX callback, and no TX after timeout.
+     */
+    private var mediaU0507StartJob: Job? = null
+    private var mediaU0507Attempted = false
+
+    fun requestMediaU0507MoviePickerAndFilesOnce(): Boolean {
+        val state = remoteTransportUiController.state.value
+        val probe = gatt.mediaU0465ProbeState.value
+        if (mediaU0507Attempted || mediaU0507StartJob?.isActive == true ||
+            mediaU0501Attempted || mediaU0501InitJob?.isActive == true ||
+            !_pairingCodeAccepted.value || !gatt.tcsPairingState.value.acceptWritten ||
+            !gatt.tcsRemoteState.value.available ||
+            state.mode != RemoteTransportUiController.Mode.PLAYBACK ||
+            state.recoveryRequired || state.pendingAction != null ||
+            gatt.mediaSsdFileListState.value.pending || probe.phase == "waiting" ||
+            probe.consumedNames.any { it == "dir-info" || it == "current-index-inferred" }) {
+            _commandStatus.value = "U05.07 blocked: require fresh connected Playback session and unused SSD browser sequence."
+            Log.w("AtomRemoteMediaU0507", "ONE_TAP_BLOCK noTx=true attempted=$mediaU0507Attempted probe=${probe.phase}")
+            return false
+        }
+        // This method is only called after the Media tab confirmation dialog.
+        // Admission is consumed before queueing; cannot send a second ModeStart.
+        mediaU0507Attempted = true
+        mediaU0507StartJob = viewModelScope.launch {
+            fun sessionOk(): Boolean {
+                val now = remoteTransportUiController.state.value
+                return gatt.tcsPairingState.value.acceptWritten &&
+                    gatt.tcsRemoteState.value.available &&
+                    now.mode == RemoteTransportUiController.Mode.PLAYBACK &&
+                    !now.recoveryRequired && now.pendingAction == null
+            }
+            if (!sessionOk()) {
+                _commandStatus.value = "U05.07 stopped: Playback link changed before ModeStart."
+                return@launch
+            }
+            // U05.12: U05.11 observed one complete-looking E8 response with an
+            // AtomMessage declaring 47 data bytes, but the Android GATT read
+            // exposed only 22 bytes (ATT MTU=23-sized). A long-read attempt
+            // returned an ATT error before Android produced the truncated value.
+            // Negotiate using the EXISTING serialized ATT MTU helper, once,
+            // before ANY new recorder command. NO SET or PacketLink changes.
+            val minMtuForOneFile = 61 // 53-byte E8 packet fits, with headroom.
+            var observedMtu = gatt.mediaU0512NegotiatedMtu()
+            if (observedMtu < minMtuForOneFile) {
+                val queuedMtu = gatt.requestR21OutputPageMtu()
+                Log.i("AtomRemoteMediaU0512",
+                    "MTU_PREFLIGHT before=$observedMtu requested=185 queued=$queuedMtu required=$minMtuForOneFile noRecorderTx=true")
+                if (!queuedMtu) {
+                    _commandStatus.value = "SSD stopped: BLE MTU upgrade not queued. No MoviePicker/FileList TX."
+                    return@launch
+                }
+                _commandStatus.value = "SSD: Negotiating BLE MTU before reading filenames. No recorder TX yet."
+                val mtuStart = android.os.SystemClock.elapsedRealtime()
+                while (isActive && sessionOk() &&
+                    android.os.SystemClock.elapsedRealtime() - mtuStart < 10_000L) {
+                    observedMtu = gatt.mediaU0512NegotiatedMtu()
+                    if (observedMtu >= minMtuForOneFile) break
+                    delay(100L)
+                }
+                observedMtu = gatt.mediaU0512NegotiatedMtu()
+                Log.i("AtomRemoteMediaU0512",
+                    "MTU_PREFLIGHT_RESULT mtu=$observedMtu sufficient=${observedMtu >= minMtuForOneFile} sessionOk=${sessionOk()} elapsedMs=${android.os.SystemClock.elapsedRealtime() - mtuStart}")
+                if (observedMtu < minMtuForOneFile || !sessionOk()) {
+                    _commandStatus.value = "SSD stopped: negotiated MTU $observedMtu < $minMtuForOneFile (or link changed). No recorder commands sent."
+                    return@launch
+                }
+            } else {
+                Log.i("AtomRemoteMediaU0512", "MTU_PREFLIGHT_ALREADY_READY mtu=$observedMtu required=$minMtuForOneFile")
+            }
+            // Existing U05.07 one-shot E8 ModeStart + U05.01 verified GET chain.
+            // U05.11 final request remains count=1, infoType=2, exactly once.
+            val ackBefore = gatt.mediaU0507ModeStartAckAtMs.value
+            val queued = gatt.mediaK016RequestModeStartOnce()
+            Log.i("AtomRemoteMediaU0507", "ONE_TAP_MODESTART_E8 queued=$queued opcode=0x01FD oneShot=true")
+            if (!queued) {
+                _commandStatus.value = "U05.07 ModeStart not queued. No follow-up requests."
+                return@launch
+            }
+            _commandStatus.value = "SSD 1/5: E8 MoviePicker ModeStart sent. Awaiting live 0x81FD mode=1."
+            val begin = android.os.SystemClock.elapsedRealtime()
+            var ackConfirmed = false
+            while (isActive && sessionOk() &&
+                android.os.SystemClock.elapsedRealtime() - begin < 10_000L) {
+                val ackAt = gatt.mediaU0507ModeStartAckAtMs.value
+                if (ackAt > ackBefore && ackAt >= begin) {
+                    ackConfirmed = true
+                    Log.i("AtomRemoteMediaU0507", "ONE_TAP_E8_ACK_OK ackAtMs=$ackAt ageMs=${ackAt - begin}")
+                    break
+                }
+                delay(75L)
+            }
+            if (!ackConfirmed || !sessionOk()) {
+                _commandStatus.value = "SSD stopped: no fresh E8 0x81FD mode=1 ACK or link changed. No FileList TX."
+                Log.w("AtomRemoteMediaU0507", "ONE_TAP_E8_ACK_UNCONFIRMED noFurtherTx=true")
+                return@launch
+            }
+            // Let the existing PacketLink scheduler settle. This is NOT a retry.
+            delay(350L)
+            if (!sessionOk()) {
+                _commandStatus.value = "SSD stopped: connection changed after ACK."
+                return@launch
+            }
+            // Existing chain independently requires fresh 0x81F7, 0x81F6 and
+            // 0x81FF(mode=1); only then sends one 0x01FB GET. No blind SET.
+            val started = requestMediaU0501GuidedInit()
+            Log.i("AtomRemoteMediaU0507",
+                "ONE_TAP_CHAIN_REQUEST accepted=$started stages=dir-index-modeget-filelist " +
+                "noAutoRetry=true noFilePlay=true")
+            if (!started) {
+                _commandStatus.value = "MoviePicker ACK verified, but read-only SSD chain was blocked. No FileList TX."
+            }
+        }
+        return true
+    }
+
     /** U04.65: only allowlisted read-only GETs; Playback + pairing checked in UI and GATT. */
     fun requestMediaU0465ProbeOnce(name: String): Boolean {
+        if (name == "moviepicker-and-files") return requestMediaU0507MoviePickerAndFilesOnce()
+        if (name == "mac-init-sequence") return requestMediaU0501GuidedInit()
         val uiState = remoteTransportUiController.state.value
         val remote = gatt.tcsRemoteState.value
         if (!_pairingCodeAccepted.value || !gatt.tcsPairingState.value.acceptWritten ||
@@ -2281,6 +2971,126 @@ class AtomosViewModel(app: Application) : AndroidViewModel(app) {
         else "FileListGet not queued: MTU, pending request, or link not ready"
         Log.i("AtomRemoteMediaU04", "TEST_ROUTE_REQUEST cmd=0x01FB local=$local start=$startIndex queued=$queued recorderConfirmed=false")
         return queued
+    }
+
+    // U05.13: user-initiated bounded forward pagination. NO retries and NO SETs.
+    // The working one-tap MoviePicker bootstrap is intentionally untouched.
+    private var mediaU0513LoadBatchJob: Job? = null
+    // U05.15: UI observes the batch lifecycle, never assumes pending=false
+    // between two sequential GETs means the whole batch is finished.
+    private val _mediaU0515BatchBusy = MutableStateFlow(false)
+    val mediaU0515BatchBusy: StateFlow<Boolean> = _mediaU0515BatchBusy
+
+    fun requestMediaU0513LoadNextEight(startIndex: Int, maxFiles: Int = 8): Boolean {
+        if (maxFiles !in 1..8) return false
+        val page = gatt.mediaSsdFileListState.value
+        val remote = gatt.tcsRemoteState.value
+        val uiState = remoteTransportUiController.state.value
+        val nextExpected = page.entries.maxOfOrNull { it.index }?.plus(1)
+        if (mediaU0513LoadBatchJob?.isActive == true ||
+            !_pairingCodeAccepted.value || !gatt.tcsPairingState.value.acceptWritten ||
+            !remote.available || uiState.mode != RemoteTransportUiController.Mode.PLAYBACK ||
+            uiState.recoveryRequired || uiState.pendingAction != null ||
+            gatt.mediaU0512NegotiatedMtu() < 61 ||
+            page.pending || !page.recorderValidated || page.modeReadback != 1 ||
+            page.entries.isEmpty() || nextExpected != startIndex ||
+            (page.totalFiles != null && startIndex >= page.totalFiles)) {
+            Log.w("AtomRemoteMediaU0514", "BATCH_GATE_DETAIL next=$startIndex " +
+                "jobActive=${mediaU0513LoadBatchJob?.isActive == true} " +
+                "pairAccepted=${_pairingCodeAccepted.value} paired=${gatt.tcsPairingState.value.acceptWritten} " +
+                "remote=${remote.available} playback=${uiState.mode == RemoteTransportUiController.Mode.PLAYBACK} " +
+                "recovery=${uiState.recoveryRequired} actionPending=${uiState.pendingAction != null} " +
+                "mtu=${gatt.mediaU0512NegotiatedMtu()} pending=${page.pending} " +
+                "validated=${page.recorderValidated} mode=${page.modeReadback} " +
+                "entries=${page.entries.size} expected=$nextExpected total=${page.totalFiles} noTx=true")
+            Log.w("AtomRemoteMediaU0513", "BATCH_BLOCKED next=$startIndex noTx=true")
+            _commandStatus.value = "SSD next page blocked. Require live mode=1, negotiated MTU, verified prior filename and idle link."
+            return false
+        }
+        // Exactly one operator tap authorizes at most EIGHT sequential proven
+        // read-only E8 one-file GETs. It never automatically retries failed GETs.
+        val stopAt = minOf(startIndex + maxFiles, page.totalFiles ?: startIndex + maxFiles)
+        _mediaU0515BatchBusy.value = true
+        mediaU0513LoadBatchJob = viewModelScope.launch {
+            var loaded = 0
+            try {
+            fun sessionOk(): Boolean {
+                val now = remoteTransportUiController.state.value
+                return _pairingCodeAccepted.value && gatt.tcsPairingState.value.acceptWritten &&
+                    gatt.tcsRemoteState.value.available &&
+                    now.mode == RemoteTransportUiController.Mode.PLAYBACK &&
+                    !now.recoveryRequired && now.pendingAction == null &&
+                    gatt.mediaU0512NegotiatedMtu() >= 61
+            }
+            for (index in startIndex until stopAt) {
+                val current = gatt.mediaSsdFileListState.value
+                if (!sessionOk() || current.pending || current.modeReadback != 1 ||
+                    !current.recorderValidated || current.entries.maxOfOrNull { it.index }?.plus(1) != index) {
+                    Log.w("AtomRemoteMediaU0513", "BATCH_STOP index=$index reason=state-gate noTx=true")
+                    break
+                }
+                val queued = gatt.mediaK01RequestFileListGetOnce(
+                    startIndex = index, localRoute = true, countOverride = 1)
+                if (!queued) {
+                    Log.w("AtomRemoteMediaU0513", "BATCH_STOP index=$index reason=not-queued noRetry=true")
+                    break
+                }
+                val requestedGeneration = gatt.mediaSsdFileListState.value.generation
+                Log.i("AtomRemoteMediaU0513", "E8_NEXT_FILE_TX index=$index count=1 generation=$requestedGeneration")
+                val gotPage = withTimeoutOrNull(15_000L) {
+                    while (isActive) {
+                        delay(100L)
+                        val rx = gatt.mediaSsdFileListState.value
+                        if (!sessionOk() || rx.generation != requestedGeneration || rx.modeReadback != 1) {
+                            return@withTimeoutOrNull false
+                        }
+                        if (!rx.pending) {
+                            return@withTimeoutOrNull rx.recorderValidated && rx.entries.any { it.index == index }
+                        }
+                    }
+                    false
+                } == true
+                if (!gotPage) {
+                    // U05.28: The worker's 15s verified-RX timeout MUST also
+                    // release the matching FileList pending gate. Previously the
+                    // worker stopped here but GATT.pending stayed true for up
+                    // to 45s. User clip taps were deferred behind that stale
+                    // GET even though no further page was being requested.
+                    // Preserve verified prior filenames; no retry and no TX.
+                    val timedOutState = gatt.mediaSsdFileListState.value
+                    if (timedOutState.pending &&
+                        timedOutState.generation == requestedGeneration &&
+                        sessionOk()) {
+                        gatt.mediaU02ExpireFileList(requestedGeneration)
+                        Log.w("AtomRemoteMediaU0528",
+                            "GET_TIMEOUT_RELEASE index=$index generation=$requestedGeneration " +
+                            "pendingWasTrue=true mode=playback noTx=true noRetry=true " +
+                            "retained=${timedOutState.entries.size} " +
+                            "clipSelectionCanResume=true")
+                    } else {
+                        Log.w("AtomRemoteMediaU0528",
+                            "GET_TIMEOUT_NO_RELEASE index=$index generation=$requestedGeneration " +
+                            "pending=${timedOutState.pending} currentGeneration=${timedOutState.generation} " +
+                            "sessionOk=${sessionOk()} noTx=true")
+                    }
+                    Log.w("AtomRemoteMediaU0513", "BATCH_STOP index=$index reason=no-verified-rx noRetry=true")
+                    _commandStatus.value = "SSD pagination stopped at index $index: no fresh verified filename. Previous files retained."
+                    break
+                }
+                loaded++
+                _commandStatus.value = "SSD: $loaded new filename(s) received. " +
+                    "Total ${gatt.mediaSsdFileListState.value.entries.size} files loaded."
+                Log.i("AtomRemoteMediaU0513", "E8_NEXT_FILE_RX_OK index=$index loaded=$loaded")
+            }
+            Log.i("AtomRemoteMediaU0513", "BATCH_DONE requested=${stopAt - startIndex} loaded=$loaded noRetries=true")
+            } finally {
+                _mediaU0515BatchBusy.value = false
+                Log.i("AtomRemoteMediaU0515", "BATCH_IDLE start=$startIndex loadedCount=$loaded noRetry=true")
+            }
+        }
+        _commandStatus.value = "Loading next up to ${stopAt - startIndex} SSD filenames, one verified E8 GET at a time."
+        Log.i("AtomRemoteMediaU0513", "BATCH_START start=$startIndex count=${stopAt - startIndex} manual=true noSet=true")
+        return true
     }
 
     /** MEDIA-K01: manual one-shot SSD listing evidence. No user-selected FilePlay. */
@@ -2345,7 +3155,99 @@ class AtomosViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
+    // U05.51: cache a DISPLAY LABEL only. Cache never grants FilePlay or a
+    // recorder-active index, and is scoped to the selected device address.
+    private val _mediaU0551LastKnownClipName = MutableStateFlow<String?>(null)
+    val mediaU0551LastKnownClipName: StateFlow<String?> = _mediaU0551LastKnownClipName
+    private var mediaU0551LabelDevice: String? = null
+    fun mediaU0551CheckMediaDevice(address: String?) {
+        if (mediaU0551LabelDevice != address) {
+            mediaU0551LabelDevice = address
+            _mediaU0551LastKnownClipName.value = null
+        }
+    }
+    fun mediaU0551RememberClipName(filename: String) {
+        if (filename.isBlank()) return
+        val address = _selected.value?.address ?: return
+        mediaU0551CheckMediaDevice(address)
+        _mediaU0551LastKnownClipName.value = filename
+    }
+
+    private val _mediaU0551Repairing = MutableStateFlow(false)
+    val mediaU0551Repairing: StateFlow<Boolean> = _mediaU0551Repairing
+    private var mediaU0551TransitionSequence = 0L
+    private var mediaU0551TransitionWatch: Job? = null
+
+    // Observe the *actual* Recover Remote gate after a user-requested mode
+    // switch. Never exit just because the link briefly reports available.
+    // Calls the same trusted recovery path as the working manual button.
+    // No guessed SETs, FilePlay, or automatic mode replay.
+    private fun mediaU0551WatchRecoveryAfterMode(target: String) {
+        mediaU0551TransitionSequence++
+        val sequence = mediaU0551TransitionSequence
+        mediaU0551TransitionWatch?.cancel()
+        mediaU0551TransitionWatch = viewModelScope.launch {
+            val started = android.os.SystemClock.elapsedRealtime()
+            val deadline = started + 48_000L
+            val rebootSettleMs = if (target == "playback") 16_000L else 7_000L
+            try {
+                while (android.os.SystemClock.elapsedRealtime() < deadline) {
+                    if (sequence != mediaU0551TransitionSequence) return@launch
+                    val state = remoteTransportUiController.state.value
+                    if (state.recoveryRequired) {
+                        // Show the user a loader immediately on an actual
+                        // Recover-required state, while allowing AG2 to finish
+                        // its recorder reboot before reconnecting the GATT link.
+                        _mediaU0551Repairing.value = true
+                        if (android.os.SystemClock.elapsedRealtime() - started < rebootSettleMs) {
+                            delay(350L)
+                            continue
+                        }
+                        if (mediaU0529RecoveryJob?.isActive == true) {
+                            delay(500L)
+                            continue
+                        }
+                        Log.i("AtomRemoteMediaU0551", "AUTO_REPAIR_START seq=$sequence target=$target manualPath=true")
+                        var restored = false
+                        try {
+                            for (attempt in 1..2) {
+                                if (sequence != mediaU0551TransitionSequence) break
+                                if (attempt > 1) delay(5_000L)
+                                if (!remoteTransportUiController.state.value.recoveryRequired &&
+                                    gatt.tcsRemoteState.value.available) {
+                                    restored = true
+                                    break
+                                }
+                                Log.i("AtomRemoteMediaU0551", "AUTO_REPAIR_ATTEMPT seq=$sequence count=$attempt")
+                                recoverRemoteSessionFromUi()
+                                mediaU0529RecoveryJob?.join()
+                                restored = !remoteTransportUiController.state.value.recoveryRequired &&
+                                    gatt.tcsRemoteState.value.available
+                                if (restored) break
+                            }
+                        } finally {
+                            _mediaU0551Repairing.value = false
+                        }
+                        Log.i("AtomRemoteMediaU0551", "AUTO_REPAIR_END seq=$sequence success=$restored")
+                        return@launch
+                    }
+                    _mediaU0551Repairing.value = false
+                    delay(350L)
+                }
+                Log.i("AtomRemoteMediaU0551", "AUTO_REPAIR_NO_PROMPT seq=$sequence noDisconnect=true")
+            } finally {
+                _mediaU0551Repairing.value = false
+            }
+        }
+    }
+
+    private var mediaU0529RecoveryJob: Job? = null
     fun recoverRemoteSessionFromUi() {
+        // Avoid overlapping user recovery taps and duplicate BLE reconnect jobs.
+        if (mediaU0529RecoveryJob?.isActive == true) {
+            Log.w("AtomRemoteMediaU0529", "RECOVERY_ALREADY_RUNNING noDuplicateConnect=true")
+            return
+        }
         val ad = _selected.value
         if (ad == null) {
             _commandStatus.value = "No recorder selected for recovery."
@@ -2361,7 +3263,7 @@ class AtomosViewModel(app: Application) : AndroidViewModel(app) {
         remoteTransportUiController.startRecovery()
         _commandStatus.value = "Recovering Remote connection..."
 
-        viewModelScope.launch {
+        mediaU0529RecoveryJob = viewModelScope.launch {
             runCatching {
                 gatt.disconnect()
                 delay(450)
@@ -2397,11 +3299,70 @@ class AtomosViewModel(app: Application) : AndroidViewModel(app) {
                 }
 
                 remoteTransportUiController.recovered()
-                _commandStatus.value = "Remote recovered. Controls are ready."
+                // Do not send MoviePicker into a just-rebooted recorder on the
+                // first packet-ready signal. Manual RECOVER stays available.
+                val sincePlaybackRequestMs = android.os.SystemClock.elapsedRealtime() -
+                    mediaU0547RecordToPlaybackAtMs
+                val relatedPlaybackReboot = mediaU0522PlaybackIntent &&
+                    mediaU0547RecordToPlaybackAtMs > 0L &&
+                    sincePlaybackRequestMs in 0L..45_000L
+                if (relatedPlaybackReboot) {
+                    // The existing 14s timer started when the recorder was told to reboot.
+                    // Do not STACK a new 12s after connection comes back. No early TX
+                    // is allowed: mediaU0522ReadyToBootstrap still gates that 14s timer.
+                    Log.i("AtomRemoteMediaU0547",
+                        "MOVIEPICKER_HOLD_REUSED sinceSwitchMs=$sincePlaybackRequestMs " +
+                            "remainingMs=${(mediaU0529MoviePickerNotBeforeMs - android.os.SystemClock.elapsedRealtime()).coerceAtLeast(0L)} " +
+                            "guard=original-14s noTx=true")
+                } else {
+                    mediaU0529HoldMoviePicker(12_000L, "trusted-recovery-stabilizing")
+                }
+                // U05.21: a *successful new trusted BLE session* invalidates
+                // earlier MoviePicker one-shot/probe admission. No TX here.
+                // Keep the operator's manual RECOVER REMOTE action unchanged.
+                mediaU0507StartJob?.cancel()
+                mediaU0501InitJob?.cancel()
+                mediaU0513LoadBatchJob?.cancel()
+                _mediaU0515BatchBusy.value = false
+                mediaU0507Attempted = false
+                mediaU0501Attempted = false
+                gatt.mediaU02ResetFileList()
+                // If the operator explicitly requested Playback before the intentional
+                // recorder reconnect, restore ONLY the UI intent. Recorder mode is
+                // still unverified until the guarded 0x81FD / 0x81FF replies.
+                if (mediaU0522PlaybackIntent) {
+                    remoteTransportUiController.markPlayback()
+                    mediaU0522Arm("trusted-recover-after-playback-request")
+                }
+                Log.i("AtomRemoteMediaU0521",
+                    "TRUSTED_RECOVERY_BROWSER_RESET oneShotClear=true noTx=true")
+                _commandStatus.value = "Remote recovered. SSD browser may initialize in confirmed Playback."
             }.onFailure {
                 _commandStatus.value = "Remote recovery failed: ${it.message}"
             }
         }
+    }
+
+    /** U05.21: operator explicitly confirms recorder's physical Playback screen.
+     * This does NOT send a mode-changing command, and only arms the caller's
+     * existing ACK-gated MoviePicker workflow on a healthy recovered session. */
+    fun confirmMediaPlaybackVisibleForResume(): Boolean {
+        val st = remoteTransportUiController.state.value
+        if (!_pairingCodeAccepted.value || !gatt.tcsPairingState.value.acceptWritten ||
+            !gatt.tcsRemoteState.value.available || st.recoveryRequired ||
+            st.pendingAction != null) {
+            _commandStatus.value = "SSD resume blocked: RECOVER REMOTE first."
+            return false
+        }
+        remoteTransportUiController.markPlayback()
+        val ok = remoteTransportUiController.state.value.mode ==
+            RemoteTransportUiController.Mode.PLAYBACK
+        if (ok) {
+            mediaU0522PlaybackIntent = true
+            mediaU0522Arm("operator-confirms-physical-playback")
+        }
+        Log.i("AtomRemoteMediaU0521", "OPERATOR_CONFIRMED_PLAYBACK accepted=$ok noRecorderTx=true")
+        return ok
     }
 
     fun reconnectSaved() {

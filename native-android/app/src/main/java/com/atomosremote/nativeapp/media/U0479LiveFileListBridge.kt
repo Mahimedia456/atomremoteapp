@@ -34,8 +34,10 @@ object U0479LiveFileListBridge {
             val bytes = try { ByteArray(count) {
                 i -> hex.substring(i * 2, i * 2 + 2).toInt(16).toByte()
             } } catch (_: NumberFormatException) { continue }
-            val page = U0459FileBrowserWire.parseFileList(
-                bytes, state.requestedStartIndex) ?: continue
+            // Mac hardware-confirmed 0x81FB envelope + protobuf schema.
+            // This is a LIVE RX body only, never a bundled Mac sample.
+            val page = U0489MacRxEvidenceGate.decodeComplete(
+                opcode, bytes, state.requestedStartIndex) ?: continue
             if (page.start != state.requestedStartIndex ||
                 page.entries.isEmpty() || page.entries.size > 64 ||
                 page.entries.any { it.index !in 0..1_000_000 } ||

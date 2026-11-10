@@ -1,0 +1,851 @@
+package com.atomosremote.nativeapp.media
+
+import androidx.compose.foundation.BorderStroke
+import androidx.compose.foundation.Canvas
+import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.rememberLazyListState
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.verticalScroll
+import androidx.compose.material3.*
+import androidx.compose.runtime.*
+import androidx.compose.runtime.saveable.rememberSaveable
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.geometry.Size
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.Path
+import androidx.compose.ui.graphics.drawscope.Stroke
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
+import com.atomosremote.nativeapp.viewmodel.RemoteTransportUiController
+
+// Media uses the existing Remote tab palette. No emoji/yellow control artwork.
+private val PlayerMint = Color(0xFF19E7D3)
+private val PlayerBackground = Color(0xFF02090C)
+private val PlayerSurface = Color(0xFF06110F)
+private val PlayerPanel = Color(0xFF0C171B)
+private val PlayerStroke = Color(0xFF24474C)
+private val PlayerMuted = Color(0xFF98AEB2)
+private val PlayerQuiet = Color(0xFF71878C)
+
+/**
+ * U05.18. Keep proven U05.14 E8 SSD Get, U05.12 MTU preflight, and existing
+ * recorder Play/Pause. File selection uses guarded U05.16 E8 FilePlay pilot;
+ * only an actual 0x81FC success changes recorder activeIndex. No auto retries.
+ * U05.33 adaptive SSD: initial min(total,20), then +20 on user pagination.
+ * All wire GET batches remain at most eight verified filenames.
+ */
+@Composable
+@Suppress("UNUSED_PARAMETER")
+fun MediaModePlaybackScreen(
+    modifier: Modifier = Modifier,
+    recorderName: String,
+    ui: RemoteTransportUiController.State,
+    mediaFileList: SsdBrowserState,
+    batchBusy: Boolean,
+    clipSwitchBusy: Boolean,
+    fileListEventLines: List<String> = emptyList(),
+    browserProbe: U0465ProbeState,
+    remoteAvailable: Boolean,
+    remotePhase: String,
+    commandStatus: String?,
+    onPlaybackMode: () -> Unit,
+    onRecordMode: () -> Unit,
+    onPlay: () -> Boolean,
+    onPause: () -> Boolean,
+    onSsdListTimeout: (Long) -> Unit,
+    onSsdListReset: () -> Unit,
+    onFilePlay: (Int) -> Boolean,
+    onForceFilePlayPilot: (Int) -> Boolean,
+    onPageRequest: (Int, Int) -> Boolean,
+    onShuttlePilot: (Int) -> Boolean,
+    onConfirmPlaybackAndResume: () -> Unit,
+    onBrowserProbeGet: (String) -> Boolean,
+    onRecover: () -> Unit
+) {
+    val playback = ui.mode == RemoteTransportUiController.Mode.PLAYBACK
+    val transportBusy = remotePhase in setOf("queued", "sending", "requesting-credit",
+        "awaiting-credit", "awaiting-response", "bootstrapping")
+    val ready = remoteAvailable && playback && !ui.locked && !transportBusy &&
+        !ui.recoveryRequired && ui.pendingAction == null
+    val entries = remember(mediaFileList.entries, mediaFileList.recorderValidated) {
+        if (mediaFileList.recorderValidated) mediaFileList.entries.distinctBy { it.index }
+            .sortedBy { it.index } else emptyList()
+    }
+    val total = mediaFileList.totalFiles ?: entries.size
+    val verifiedMode = mediaFileList.modeReadback == 1
+    val loading = mediaFileList.pending || batchBusy
+    val hasMore = entries.isNotEmpty() && entries.size < total
+
+    var browserOpen by remember { mutableStateOf(false) }
+    var diagnosticsOpen by remember { mutableStateOf(false) }
+    var selectedIndex by rememberSaveable { mutableStateOf<Int?>(null) }
+    // Initial automatic window is min(recorder total, 20), then explicit 20-file pages.
+    // Never schedule an entire large SSD in the background.
+    var targetVisible by remember { mutableIntStateOf(1) }
+    var initialWindowAuthorized by remember { mutableStateOf(false) }
+    var scrollPageIntent by remember { mutableStateOf(false) }
+    var shuttleConfirmation by remember { mutableStateOf<Int?>(null) }
+    var shuttleUsedUi by remember { mutableStateOf(setOf<Int>()) }
+    var attemptedStarts by remember { mutableStateOf(setOf<Int>()) }
+    var lastScrollExpandedWindow by remember { mutableIntStateOf(0) }
+    var pageResumeGeneration by remember { mutableIntStateOf(0) }
+    // One operator-selected clip may wait for the current, bounded E8 GET batch
+    // to finish. This does NOT retry failed FilePlay or alter recorder commands.
+    var pendingClipRequest by remember { mutableStateOf<Pair<Int, String>?>(null) }
+    var playbackHold by remember { mutableStateOf(false) }
+    var playbackHoldGeneration by remember { mutableIntStateOf(0) }
+    var localFeedback by remember { mutableStateOf("") }
+    // UI-only: do not equate a local highlight with a recorder ACK.
+    var selectedRequestPending by remember { mutableStateOf<Int?>(null) }
+    // U05.29: a prior clip's result=2 status can remain visible during the
+    // new clip's PAUSE/idle phase. Ignore that stale rejection until this
+    // clip's actual FilePlay TX is observed (or exact ACK index is verified).
+    var selectedRequestTxSeen by remember { mutableStateOf(false) }
+    var lastRejectedIndex by remember { mutableStateOf<Int?>(null) }
+    var confirmForceIndex by remember { mutableStateOf<Int?>(null) }
+    var forcePilotAttempted by remember { mutableStateOf(false) }
+    var transportCommandPending by remember { mutableStateOf<String?>(null) }
+    var moviePickerWaitExpired by remember { mutableStateOf(false) }
+    val sheetListState = rememberLazyListState()
+
+    val chosenIndex = selectedIndex ?: mediaFileList.activeIndex ?: entries.firstOrNull()?.index
+    val chosenFile = entries.firstOrNull { it.index == chosenIndex }
+    val shownFiles = entries.take(targetVisible)
+    val selectedPosition = entries.indexOfFirst { it.index == chosenIndex }
+
+    LaunchedEffect(playback) {
+        if (!playback) {
+            // Keep the already-decoded verified files visible during transient
+            // recorder reboot/reconnect; clear UI selection only on mode exit.
+            browserOpen = false
+            selectedIndex = null
+            targetVisible = 1
+            initialWindowAuthorized = false
+            attemptedStarts = emptySet()
+            lastScrollExpandedWindow = 0
+            scrollPageIntent = false
+            shuttleUsedUi = emptySet()
+            pendingClipRequest = null
+            selectedRequestPending = null
+            selectedRequestTxSeen = false
+            transportCommandPending = null
+            lastRejectedIndex = null
+            confirmForceIndex = null
+            forcePilotAttempted = false
+            playbackHold = false
+        }
+    }
+    LaunchedEffect(mediaFileList.pending, mediaFileList.generation) {
+        if (mediaFileList.pending) {
+            kotlinx.coroutines.delay(45_000L)
+            onSsdListTimeout(mediaFileList.generation)
+        }
+    }
+
+    // U05.24: visual request phase is driven only by a fresh FileResult status.
+    // result=2 is a *recorder rejection*; it must never trigger PLAY for a
+    // different, previously active clip. This adds ZERO wire commands.
+    LaunchedEffect(selectedRequestPending, mediaFileList.status, mediaFileList.activeIndex) {
+        val pendingIndex = selectedRequestPending
+        if (pendingIndex != null) {
+            val status = mediaFileList.status
+            if (status.startsWith("Selected clip $pendingIndex requested via E8") ||
+                status.startsWith("Recorder ForceFilePlay pending for clip $pendingIndex")) {
+                selectedRequestTxSeen = true
+            }
+            when {
+                (status.startsWith("Recorder FilePlay ACK for") ||
+                    status.startsWith("Recorder ForceFilePlay ACK for")) &&
+                    mediaFileList.activeIndex == pendingIndex -> {
+                    selectedRequestPending = null
+                    lastRejectedIndex = null
+                    localFeedback = "Recorder accepted clip ${pendingIndex + 1}; PLAY is requested by the ACK-gated controller."
+                    android.util.Log.i("AtomRemoteMediaU0524", "SELECTION_ACK index=$pendingIndex verified=true")
+                }
+                selectedRequestTxSeen &&
+                    (status.startsWith("Recorder FilePlay returned") ||
+                        status.startsWith("Recorder ForceFilePlay returned")) -> {
+                    selectedRequestPending = null
+                    lastRejectedIndex = pendingIndex
+                    localFeedback = "Clip ${pendingIndex + 1} rejected: $status. PLAY not sent to avoid playing the wrong clip."
+                    android.util.Log.w("AtomRemoteMediaU0524", "SELECTION_REJECT index=$pendingIndex status=$status")
+                }
+            }
+        }
+    }
+    LaunchedEffect(selectedRequestPending) {
+        val pendingIndex = selectedRequestPending
+        if (pendingIndex != null) {
+            kotlinx.coroutines.delay(12_000L)
+            if (selectedRequestPending == pendingIndex) {
+                selectedRequestPending = null
+                lastRejectedIndex = pendingIndex
+                localFeedback = "Clip ${pendingIndex + 1}: no verified FilePlay response within 12 seconds."
+                android.util.Log.w("AtomRemoteMediaU0524", "SELECTION_UI_TIMEOUT index=$pendingIndex noTx=true")
+            }
+        }
+    }
+    LaunchedEffect(transportCommandPending) {
+        if (transportCommandPending != null) {
+            kotlinx.coroutines.delay(950L)
+            transportCommandPending = null
+        }
+    }
+    val moviePickerAwaiting = playback && remoteAvailable &&
+        !ui.recoveryRequired && !verifiedMode && entries.isEmpty()
+    LaunchedEffect(moviePickerAwaiting) {
+        moviePickerWaitExpired = false
+        if (moviePickerAwaiting) {
+            kotlinx.coroutines.delay(25_000L)
+            moviePickerWaitExpired = true
+        }
+    }
+
+    // U05.33: once recorder validates total count and first filename,
+    // authorize up to 20 (or every file if <=20) without a Browse tap.
+    // Larger SSDs never auto-load past the first 20: further windows need
+    // a real user scroll/tap. The E8 wire GET/decoder is untouched.
+    LaunchedEffect(playback, verifiedMode, total, entries.size) {
+        if (playback && verifiedMode && entries.isNotEmpty() && total > 0 &&
+            !initialWindowAuthorized) {
+            val initialCount = minOf(total, 20)
+            targetVisible = maxOf(targetVisible, initialCount)
+            initialWindowAuthorized = true
+            android.util.Log.i("AtomRemoteMediaU0533",
+                "ADAPTIVE_INITIAL total=$total target=$targetVisible " +
+                    "autoAll=${total <= 20} wireBatchMax=8")
+        }
+    }
+
+    // User controls take precedence over background filename prefetch.
+    // Existing FilePlay / Play / Pause operations remain 100% unchanged.
+    LaunchedEffect(playbackHoldGeneration) {
+        if (playbackHoldGeneration > 0) {
+            kotlinx.coroutines.delay(650L)
+            playbackHold = false
+        }
+    }
+
+    // Loading 6 files requires only the remaining five E8 GETs and no scroll.
+    // Loading 97 files stops at 20 until the user requests another 20.
+    // Underlying verified RX-gated wire batches stay capped at eight names.
+    // A failed GET start index is not automatically retried.
+    LaunchedEffect(ready, verifiedMode, loading, clipSwitchBusy, entries.size, targetVisible, total,
+        ui.pendingAction, ui.recoveryRequired, remotePhase, attemptedStarts,
+        pageResumeGeneration, pendingClipRequest, playbackHold, browserOpen,
+        initialWindowAuthorized) {
+        // UI adapts to actual recorder count; transport keeps the proven sequential E8
+        // single-file GETs. If remote Play/Pause is still pending, DEFER rather
+        // than silently abandoning a user-authorized page window.
+        if (initialWindowAuthorized && hasMore && entries.size < targetVisible && !loading &&
+            pendingClipRequest == null && selectedRequestPending == null &&
+            !clipSwitchBusy && !playbackHold) {
+            if (!ready || !verifiedMode) {
+                android.util.Log.i("AtomRemoteMediaU0519",
+                    "WINDOW_DEFER loaded=${entries.size} target=$targetVisible " +
+                    "ready=$ready mode=$verifiedMode pending=${ui.pendingAction} " +
+                    "recovery=${ui.recoveryRequired} phase=$remotePhase noTx=true")
+            } else {
+                // Original 450ms wait was repeated after every 8-file batch.
+                // RX-gated worker has already completed before starting another.
+                kotlinx.coroutines.delay(100L)
+                // Recheck after suspension. A clip tap has priority; do not start
+                // another eight-file GET while a switch has just begun.
+                if (pendingClipRequest != null || selectedRequestPending != null || clipSwitchBusy ||
+                    playbackHold || !ready) return@LaunchedEffect
+                val start = entries.lastOrNull()?.index?.plus(1) ?: 0
+                if (start > 0 && start !in attemptedStarts) {
+                    val count = minOf(8, targetVisible - entries.size, total - entries.size)
+                    if (count > 0) {
+                        // Remember only accepted GET batches. A transport
+                        // gate failure never consumes the user's page window.
+                        val queued = onPageRequest(start, count)
+                        if (queued) attemptedStarts = attemptedStarts + start
+                        android.util.Log.i("AtomRemoteMediaU0519",
+                            "WINDOW_PAGE start=$start count=$count target=$targetVisible " +
+                            "queued=$queued noRetry=true")
+                        if (!queued) localFeedback =
+                            "SSD loading paused: waiting for idle connected Playback. ${entries.size}/$total saved."
+                    }
+                }
+            }
+        }
+    }
+
+    // U05.32: Preserve a real scroll's next-page intent even if it happens
+    // while a FileList batch or clip switch is in progress. Only a true user
+    // scroll is admitted, never a short initial list's layout event.
+    val latestShownCount by rememberUpdatedState(shownFiles.size)
+    val latestTarget by rememberUpdatedState(targetVisible)
+    val latestTotal by rememberUpdatedState(total)
+    LaunchedEffect(browserOpen) {
+        if (browserOpen) {
+            snapshotFlow {
+                Triple(sheetListState.isScrollInProgress,
+                    sheetListState.layoutInfo.visibleItemsInfo.lastOrNull()?.index ?: -1,
+                    latestShownCount)
+            }.collect { (userScrolling, lastVisible, count) ->
+                if (userScrolling && count > 0 && latestTarget < latestTotal &&
+                    lastVisible >= (count - 3).coerceAtLeast(0)) {
+                    scrollPageIntent = true
+                    android.util.Log.i("AtomRemoteMediaU0532",
+                        "SCROLL_INTENT_QUEUED target=$latestTarget count=$count " +
+                            "loaded=${entries.size} busy=$loading switch=$clipSwitchBusy")
+                }
+            }
+        }
+    }
+    LaunchedEffect(scrollPageIntent, browserOpen, entries.size, targetVisible,
+        loading, clipSwitchBusy, pendingClipRequest, selectedRequestPending, playbackHold) {
+        if (browserOpen && scrollPageIntent && !loading && !clipSwitchBusy &&
+            pendingClipRequest == null && selectedRequestPending == null && !playbackHold &&
+            entries.size >= targetVisible && targetVisible < total) {
+            val oldWindow = targetVisible
+            targetVisible = minOf(oldWindow + 20, total)
+            scrollPageIntent = false
+            android.util.Log.i("AtomRemoteMediaU0532",
+                "SCROLL_INTENT_RESUMED old=$oldWindow target=$targetVisible batch=20")
+        }
+    }
+
+    fun selectAndPlay(index: Int, origin: String) {
+        selectedIndex = index
+        val clip = entries.firstOrNull { it.index == index }
+        if (clip == null) return
+        if (remoteAvailable && playback && !ui.recoveryRequired && verifiedMode) {
+            if (loading || clipSwitchBusy || !ready || playbackHold || selectedRequestPending != null) {
+                // One selected-file request is deferred until the verified
+                // filename batch becomes idle. New tap replaces old intent.
+                pendingClipRequest = index to origin
+                localFeedback = "${clip.filename}: waiting for the current SSD read to finish."
+                android.util.Log.i("AtomRemoteMediaU0523",
+                    "SELECT_DEFER index=$index batchBusy=$batchBusy listPending=${mediaFileList.pending} noTx=true")
+            } else {
+                val queued = onFilePlay(index) // recorder result=0 required before PLAY
+                if (queued) {
+                    selectedRequestTxSeen = false
+                    selectedRequestPending = if (mediaFileList.activeIndex == index) null else index
+                    lastRejectedIndex = null
+                    playbackHold = true
+                    playbackHoldGeneration++
+                }
+                localFeedback = if (queued)
+                    "Clip requested: ${clip.filename}. PLAY follows verified FilePlay ACK."
+                else "Clip selected, but recorder did not accept FilePlay request."
+                android.util.Log.i("AtomRemoteMediaU0523",
+                    "FILE_SELECT index=$index from=$origin queued=$queued ackUnverified=true")
+            }
+        } else {
+            localFeedback = "${clip.filename} selected locally. Playback needs verified MoviePicker and connection."
+            android.util.Log.w("AtomRemoteMediaU0523", "FILE_SELECT_BLOCK index=$index from=$origin noTx=true")
+        }
+    }
+
+    // The latest explicitly tapped filename has priority at the first idle
+    // point between eight-file GET batches. No repeat after a denied admission.
+    LaunchedEffect(pendingClipRequest, ready, verifiedMode, loading, clipSwitchBusy, playbackHold,
+        selectedRequestPending) {
+        val request = pendingClipRequest
+        if (request != null && ready && verifiedMode && !loading && !clipSwitchBusy && !playbackHold &&
+            selectedRequestPending == null) {
+            pendingClipRequest = null
+            val queued = onFilePlay(request.first)
+            if (queued) {
+                selectedRequestTxSeen = false
+                selectedRequestPending = if (mediaFileList.activeIndex == request.first) null else request.first
+                lastRejectedIndex = null
+                playbackHold = true
+                playbackHoldGeneration++
+            }
+            localFeedback = if (queued)
+                "Selected clip sent. Awaiting recorder response before PLAY."
+            else "Clip request not admitted. You may tap it again when link is ready."
+            android.util.Log.i("AtomRemoteMediaU0523",
+                "SELECT_DEFERRED_SEND index=${request.first} queued=$queued oneShot=true")
+        }
+    }
+
+    if (confirmForceIndex != null) {
+        AlertDialog(
+            onDismissRequest = { confirmForceIndex = null },
+            title = { Text("Mac ForceFilePlay pilot") },
+            text = { Text("Recorder rejected this clip with result=2. This test sends the Mac app's " +
+                "separate ForceFilePlay 0x0201 command ONCE to the selected verified filename. " +
+                "It may interrupt current playback. Continue?") },
+            confirmButton = {
+                TextButton(onClick = {
+                    val index = confirmForceIndex
+                    confirmForceIndex = null
+                    if (index != null) {
+                        val accepted = onForceFilePlayPilot(index)
+                        if (accepted) {
+                            forcePilotAttempted = true
+                            selectedRequestPending = index
+                            lastRejectedIndex = null
+                            localFeedback = "Mac ForceFilePlay pilot sent once; waiting for actual recorder result."
+                        } else {
+                            localFeedback = "Mac ForceFilePlay pilot blocked; current active clip unchanged."
+                        }
+                        android.util.Log.i("AtomRemoteMediaU0527", "PILOT_UI_OPERATOR_CONFIRM index=$index queued=$accepted")
+                    }
+                }) { Text("SEND ONCE") }
+            },
+            dismissButton = { TextButton(onClick = { confirmForceIndex = null }) { Text("CANCEL") } }
+        )
+    }
+
+    if (shuttleConfirmation != null) {
+        val direction = shuttleConfirmation!!
+        AlertDialog(
+            onDismissRequest = { shuttleConfirmation = null },
+            title = { Text("Mac Shuttle Pilot: ${if (direction > 0) "Forward" else "Rewind"}") },
+            text = { Text("Static Mac 0x019C, candidate proto " +
+                (if (direction > 0) "0D 00 00 80 3F (+1.0)" else "0D 00 00 80 BF (-1.0)") +
+                ". NOT confirmed by the 9 Nov Terminal capture or Shogun Ultra AG2 RX. " +
+                "Send one manual test to the verified active SSD clip? Check the recorder " +
+                "physically; PLAY/PAUSE remain available. No automatic repeats.") },
+            confirmButton = {
+                TextButton(onClick = {
+                    shuttleConfirmation = null
+                    val sent = onShuttlePilot(direction)
+                    if (sent) shuttleUsedUi = shuttleUsedUi + direction
+                    localFeedback = if (sent)
+                        "${if (direction > 0) "FWD" else "REW"} pilot 0x019C queued once; " +
+                        "TX is not proof of recorder action. Observe AG2, then use PLAY/PAUSE."
+                    else "${if (direction > 0) "FWD" else "REW"} blocked; no command sent. " +
+                        "Requires verified playback mode, active clip, idle transport and unused direction."
+                }) { Text("SEND ONCE") }
+            },
+            dismissButton = {
+                TextButton(onClick = { shuttleConfirmation = null }) { Text("CANCEL") }
+            }
+        )
+    }
+
+    // U05.26: the browser overlays the *entire* Media player. Transport dock
+    // remains rendered under the scrim, not in front of a cramped sheet.
+    Box(modifier.fillMaxSize().background(PlayerBackground)) {
+        Column(Modifier.fillMaxSize()) {
+        Box(Modifier.weight(1f).fillMaxWidth()) {
+            Column(
+                Modifier.fillMaxSize().verticalScroll(rememberScrollState())
+                    .padding(horizontal = 16.dp, vertical = 12.dp),
+                verticalArrangement = Arrangement.spacedBy(14.dp)
+            ) {
+                Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                    Column(Modifier.weight(1f)) {
+                        Text("MEDIA", color = Color.White, fontSize = 19.sp, fontWeight = FontWeight.Bold)
+                        Text(recorderName, color = PlayerMuted, fontSize = 11.sp,
+                            maxLines = 1, overflow = TextOverflow.Ellipsis)
+                    }
+                    Text(if (remoteAvailable) "CONNECTED" else "OFFLINE",
+                        color = if (remoteAvailable) PlayerMint else PlayerMuted,
+                        fontWeight = FontWeight.Bold, fontSize = 10.sp)
+                }
+                Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                    PlayerModeChoice("RECORD MODE", !playback, remoteAvailable && playback && ready,
+                        onRecordMode, Modifier.weight(1f))
+                    PlayerModeChoice("PLAYBACK", playback, remoteAvailable && !playback &&
+                        !ui.recoveryRequired && ui.pendingAction == null && !transportBusy,
+                        onPlaybackMode, Modifier.weight(1f))
+                }
+                // U05.24: response-driven wheel for both mode directions and
+                // MoviePicker / SSD. No fake percentage while total is unknown.
+                val transitionStage = when {
+                    ui.recoveryRequired -> null // Manual RECOVER button stays actionable.
+                    ui.pendingAction == "return-record-mode" -> "Returning recorder to RECORD mode"
+                    ui.pendingAction == "enter-playback-mode" -> "Switching recorder to PLAYBACK mode"
+                    ui.pendingAction != null -> "Waiting for recorder command response"
+                    !remoteAvailable && playback -> "Waiting for recorder reconnection"
+                    moviePickerAwaiting && !moviePickerWaitExpired -> "Waiting for MoviePicker and first SSD count"
+                    loading -> "Reading SSD clips: ${entries.size} of $total verified"
+                    else -> null
+                }
+                if (transitionStage != null) {
+                    Surface(color = PlayerPanel, shape = RoundedCornerShape(12.dp),
+                        border = BorderStroke(1.dp, PlayerStroke)) {
+                        Row(Modifier.fillMaxWidth().padding(13.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+                            CircularProgressIndicator(modifier = Modifier.size(24.dp),
+                                strokeWidth = 2.dp, color = PlayerMint)
+                            Column(Modifier.weight(1f)) {
+                                Text(transitionStage, color = Color.White,
+                                    fontSize = 12.sp, fontWeight = FontWeight.SemiBold)
+                                Text(when {
+                                    ui.pendingAction != null -> "Waiting for transport state / recorder response"
+                                    loading -> "Background FileList GETs continue sequentially"
+                                    else -> "No mode-switch commands are sent by this loader"
+                                }, color = PlayerMuted, fontSize = 10.sp)
+                            }
+                        }
+                    }
+                }
+                Surface(color = PlayerPanel, shape = RoundedCornerShape(17.dp),
+                    border = BorderStroke(1.dp, PlayerStroke)) {
+                    Column(Modifier.fillMaxWidth().padding(15.dp),
+                        verticalArrangement = Arrangement.spacedBy(11.dp)) {
+                        Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                            Text("SSD CLIPS", color = Color.White, fontSize = 14.sp,
+                                fontWeight = FontWeight.Bold, modifier = Modifier.weight(1f))
+                            if (loading) CircularProgressIndicator(modifier = Modifier.size(17.dp),
+                                color = PlayerMint, strokeWidth = 2.dp)
+                            Text("${entries.size} / $total", color = PlayerMint, fontSize = 13.sp,
+                                fontWeight = FontWeight.Bold)
+                        }
+                        // U05.22 recovery fallback: operator confirms the physical
+                        // Playback screen. No reboot/mode-switch command on this tap.
+                        // U05.26: Never offer a misleading Playback resume
+                        // action while the UI is in RECORD. Recorder physical
+                        // mode is not claimed until its MoviePicker readback.
+                        if (playback && remoteAvailable && !ui.recoveryRequired &&
+                            ui.pendingAction == null && entries.isEmpty() && !loading &&
+                            (!moviePickerAwaiting || moviePickerWaitExpired)) {
+                            TextButton(onClick = onConfirmPlaybackAndResume) {
+                                Text("RETRY SSD READ (PLAYBACK ONLY)",
+                                    color = PlayerMint, fontSize = 11.sp)
+                            }
+                            Text("Check recorder screen is in Playback. This does not switch recorder mode.",
+                                color = PlayerMuted, fontSize = 10.sp)
+                        }
+                        Text(when {
+                            !remoteAvailable && ui.pendingAction != null ->
+                                "Recorder switching mode. Reconnecting in background..."
+                            !remoteAvailable -> "Recorder reconnecting. Existing clip list is preserved."
+                            !playback -> "RECORD mode selected. SSD browser is available only in Playback."
+                            loading && browserOpen -> "Loading verified SSD filenames (${entries.size}/$total)."
+                            loading -> "Loading current SSD clip and count..."
+                            entries.isNotEmpty() -> if (total <= 20) "Loading all $total SSD clips; Browse Files shows them together." else "First 20 SSD clips load automatically; Browse Files loads more on scroll."
+                            moviePickerWaitExpired && moviePickerAwaiting ->
+                                "MoviePicker not confirmed after 25 seconds. Use LOAD SSD after recovery."
+                            else -> "Playback requested. Recorder MoviePicker readback is not yet verified."
+                        }, color = PlayerMuted, fontSize = 12.sp)
+                        LinearProgressIndicator(
+                            progress = { if (total > 0) (entries.size.toFloat() / total).coerceIn(0f, 1f) else 0f },
+                            color = PlayerMint, trackColor = PlayerStroke,
+                            modifier = Modifier.fillMaxWidth()
+                        )
+                        Button(
+                            onClick = {
+                                browserOpen = true
+                                targetVisible = maxOf(targetVisible, minOf(20, total))
+                                android.util.Log.i("AtomRemoteMediaU0525",
+                                    "BROWSE_SHEET_OPEN cached=${entries.size} target=$targetVisible first=${minOf(total, 20)} next=20 adaptive=true")
+                            },
+                            enabled = entries.isNotEmpty(),
+                            modifier = Modifier.fillMaxWidth().height(47.dp),
+                            colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF124F4D)),
+                            shape = RoundedCornerShape(12.dp)
+                        ) {
+                            Text("BROWSE FILES", color = Color.White, fontSize = 12.sp,
+                                fontWeight = FontWeight.Bold)
+                        }
+                    }
+                }
+                if (ui.recoveryRequired) {
+                    Text(ui.error ?: "Connection recovery required", color = PlayerMuted, fontSize = 11.sp)
+                    OutlinedButton(onClick = onRecover) { Text("RECOVER CONNECTION") }
+                }
+                if (!commandStatus.isNullOrBlank())
+                    Text(commandStatus, color = PlayerMuted, fontSize = 11.sp)
+                if (selectedRequestPending != null || pendingClipRequest != null ||
+                    transportCommandPending != null) {
+                    Row(verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(9.dp)) {
+                        CircularProgressIndicator(modifier = Modifier.size(15.dp),
+                            color = PlayerMint, strokeWidth = 2.dp)
+                        Text(when {
+                            selectedRequestPending != null ->
+                                "Waiting for FilePlay ACK: clip ${selectedRequestPending!! + 1}"
+                            pendingClipRequest != null ->
+                                "Selected clip queued until SSD transport is idle"
+                            else -> "Transport request queued; checking recorder state"
+                        }, color = PlayerMuted, fontSize = 11.sp)
+                    }
+                }
+                if (localFeedback.isNotBlank())
+                    Text(localFeedback, color = PlayerMint, fontSize = 11.sp)
+                TextButton(onClick = { diagnosticsOpen = !diagnosticsOpen }) {
+                    Text(if (diagnosticsOpen) "HIDE DETAILS" else "PROTOCOL DETAILS",
+                        color = PlayerQuiet, fontSize = 10.sp)
+                }
+                if (diagnosticsOpen) {
+                    Text("MoviePicker: ${mediaFileList.modeReadback ?: "unverified"}, " +
+                        "FileList: ${mediaFileList.status}", color = PlayerMuted, fontSize = 10.sp)
+                    Text("Live FileList responses: ${mediaFileList.fileListOpcodeRx}",
+                        color = PlayerMuted, fontSize = 10.sp)
+                }
+            }
+
+        }
+
+        // Fixed recorder-style dock: survives opening the file browser.
+        Surface(color = PlayerSurface, border = BorderStroke(1.dp, PlayerStroke),
+            shadowElevation = 12.dp) {
+            Column(Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 10.dp),
+                verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                Text(if (mediaFileList.activeIndex != null && chosenIndex == mediaFileList.activeIndex)
+                    "RECORDER ACTIVE CLIP" else if (selectedIndex == null) "FIRST SSD CLIP"
+                    else "SELECTED FILE (NOT ACTIVE)", color = PlayerMuted, fontSize = 9.sp,
+                    fontWeight = FontWeight.Bold)
+                Text(chosenFile?.filename ?: "No SSD clip selected",
+                    color = Color.White, fontSize = 12.sp, maxLines = 1,
+                    overflow = TextOverflow.Ellipsis)
+                Text(when {
+                    chosenFile == null -> "Use BROWSE FILES to select a recorder clip"
+                    selectedRequestPending == chosenFile.index -> "FILEPLAY PENDING - waiting for recorder response"
+                    lastRejectedIndex == chosenFile.index -> "SELECTION REJECTED - recorder active clip unchanged"
+                    mediaFileList.activeIndex == chosenFile.index -> "Recorder ACK for this clip (not physical PLAY proof)"
+                    mediaFileList.status.contains("FilePlay", ignoreCase = true) -> mediaFileList.status
+                    else -> "BROWSER SELECTION ONLY - recorder active clip unchanged"
+                }, color = PlayerMuted, fontSize = 9.sp, maxLines = 1)
+                Text("RECORDER CLIP TIME  --:-- / --:--  (no live timecode RX yet)",
+                    color = PlayerQuiet, fontSize = 9.sp, maxLines = 1)
+                Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceEvenly,
+                    verticalAlignment = Alignment.CenterVertically) {
+                    PlayerDockButton("prev", "PREV", remoteAvailable && playback && !ui.locked && verifiedMode && selectedPosition > 0,
+                        Modifier.weight(1f)) {
+                        selectAndPlay(entries[selectedPosition - 1].index, "prev")
+                    }
+                    PlayerDockButton("rewind", "REW", remoteAvailable && playback && verifiedMode &&
+                        !ui.locked && !loading && !clipSwitchBusy &&
+                        chosenIndex == mediaFileList.activeIndex && -1 !in shuttleUsedUi,
+                        Modifier.weight(1f)) { shuttleConfirmation = -1 }
+                    PlayerDockButton("play", "PLAY", remoteAvailable && playback && !ui.locked &&
+                        !ui.recoveryRequired && selectedRequestPending == null,
+                        Modifier.weight(1f)) {
+                        val accepted = onPlay()
+                        transportCommandPending = if (accepted) "PLAY" else null
+                        localFeedback = if (accepted) "PLAY queued for recorder-active clip; awaiting device evidence."
+                            else "PLAY blocked by recorder transport. Check connection / mode."
+                        android.util.Log.i("AtomRemoteMediaU0524", "TRANSPORT_PLAY accepted=$accepted")
+                    }
+                    PlayerDockButton("pause", "PAUSE", remoteAvailable && playback && !ui.locked &&
+                        !ui.recoveryRequired, Modifier.weight(1f)) {
+                        val accepted = onPause()
+                        transportCommandPending = if (accepted) "PAUSE" else null
+                        localFeedback = if (accepted) "PAUSE queued for recorder-active clip; awaiting device evidence."
+                            else "PAUSE blocked by recorder transport. Check connection / mode."
+                        android.util.Log.i("AtomRemoteMediaU0524", "TRANSPORT_PAUSE accepted=$accepted")
+                    }
+                    PlayerDockButton("forward", "FWD", remoteAvailable && playback && verifiedMode &&
+                        !ui.locked && !loading && !clipSwitchBusy &&
+                        chosenIndex == mediaFileList.activeIndex && 1 !in shuttleUsedUi,
+                        Modifier.weight(1f)) { shuttleConfirmation = 1 }
+                    PlayerDockButton("next", "NEXT", remoteAvailable && playback && !ui.locked && verifiedMode &&
+                        selectedPosition >= 0 && selectedPosition < entries.lastIndex,
+                        Modifier.weight(1f)) {
+                        selectAndPlay(entries[selectedPosition + 1].index, "next")
+                    }
+                    PlayerDockButton("record", "REC", ready, Modifier.weight(1f)) { onRecordMode() }
+                }
+                Text("REW/FWD are manual one-shot 0x019C CANDIDATE tests only, " +
+                    "not AG2-confirmed. PREV/NEXT require recorder FilePlay result=0; " +
+                    "rejection never auto-plays another clip.",
+                    color = PlayerQuiet, fontSize = 9.sp, maxLines = 2)
+            }
+        }
+    }
+            if (browserOpen) {
+                // U05.26: browser draws above the complete player, including
+                // footer transport buttons. No controls overlap sheet content.
+                Box(Modifier.fillMaxSize().background(Color.Black.copy(alpha = 0.47f))
+                    .clickable { browserOpen = false })
+                Surface(
+                    modifier = Modifier.align(Alignment.BottomCenter).fillMaxWidth()
+                        .fillMaxHeight(0.90f),
+                    color = PlayerSurface,
+                    shape = RoundedCornerShape(topStart = 23.dp, topEnd = 23.dp),
+                    shadowElevation = 16.dp,
+                    border = BorderStroke(1.dp, PlayerStroke)
+                ) {
+                    Column(Modifier.fillMaxSize().padding(horizontal = 12.dp, vertical = 8.dp)) {
+                        Box(Modifier.align(Alignment.CenterHorizontally).width(44.dp).height(4.dp)
+                            .background(PlayerQuiet, RoundedCornerShape(3.dp)))
+                        Spacer(Modifier.height(7.dp))
+                        Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                            Column(Modifier.weight(1f)) {
+                                Text("SSD FILE BROWSER", color = Color.White, fontSize = 16.sp,
+                                    fontWeight = FontWeight.Bold)
+                                Text("${shownFiles.size} shown   •   ${entries.size} loaded / $total " +
+                                     if (total <= 20) "(all clips)" else "(20/page)",
+                                    color = PlayerMint, fontSize = 11.sp)
+                            }
+                            TextButton(onClick = { browserOpen = false }) {
+                                Text("CLOSE", color = PlayerMint)
+                            }
+                        }
+                        Text("Tap to select. ACTIVE requires recorder ACK; SELECTED is local only.",
+                            color = PlayerMuted, fontSize = 10.sp, maxLines = 1)
+                        // Static Mac x86 evidence: FilePlay=0x01FC; ForceFilePlay=0x0201.
+                        // This pilot appears only after live FilePlay result=2 and is
+                        // never sent automatically. On pilot success Next/Prev can
+                        // use the Mac route with the same ACK-gated PLAY controller.
+                        if (!forcePilotAttempted && chosenIndex != null &&
+                            lastRejectedIndex == chosenIndex &&
+                            mediaFileList.status.startsWith("Recorder FilePlay returned 2")) {
+                            OutlinedButton(
+                                onClick = { confirmForceIndex = chosenIndex },
+                                modifier = Modifier.fillMaxWidth(),
+                                border = BorderStroke(1.dp, PlayerMint),
+                                shape = RoundedCornerShape(10.dp)
+                            ) {
+                                Text("TEST MAC FORCE PLAY FOR SELECTED CLIP",
+                                    color = PlayerMint, fontSize = 11.sp, fontWeight = FontWeight.Bold)
+                            }
+                        }
+                        Spacer(Modifier.height(5.dp))
+                        LazyColumn(
+                            modifier = Modifier.fillMaxWidth().weight(1f),
+                            state = sheetListState,
+                            verticalArrangement = Arrangement.spacedBy(4.dp),
+                            contentPadding = PaddingValues(bottom = 12.dp)
+                        ) {
+                            items(shownFiles, key = { it.index }) { clip ->
+                                val selected = clip.index == chosenIndex
+                                val recorderActive = clip.index == mediaFileList.activeIndex
+                                Surface(
+                                    modifier = Modifier.fillMaxWidth()
+                                        .clickable { selectAndPlay(clip.index, "sheet") },
+                                    shape = RoundedCornerShape(9.dp),
+                                    color = if (selected) Color(0xFF10383A) else Color(0xFF102025),
+                                    border = BorderStroke(if (selected) 1.5.dp else 1.dp,
+                                        if (selected) PlayerMint else PlayerStroke)
+                                ) {
+                                    Row(Modifier.fillMaxWidth().heightIn(min = 46.dp)
+                                        .padding(horizontal = 11.dp, vertical = 7.dp),
+                                        verticalAlignment = Alignment.CenterVertically) {
+                                        Text("${clip.index + 1}", color = PlayerMuted, fontSize = 11.sp,
+                                            modifier = Modifier.width(35.dp))
+                                        Text(clip.filename, color = Color.White, fontSize = 12.sp,
+                                            maxLines = 1, overflow = TextOverflow.Ellipsis,
+                                            modifier = Modifier.weight(1f))
+                                        if (recorderActive) Text("ACTIVE", color = PlayerMint,
+                                            fontSize = 9.sp, fontWeight = FontWeight.Bold)
+                                        else if (lastRejectedIndex == clip.index) Text("REJECTED", color = PlayerMuted,
+                                            fontSize = 9.sp, fontWeight = FontWeight.Bold)
+                                        else if (selected) Text("SELECTED", color = PlayerMint,
+                                            fontSize = 9.sp)
+                                    }
+                                }
+                            }
+                            item(key = "page-status") {
+                                Text(when {
+                                    loading -> "Loading next verified filenames..."
+                                    entries.size >= total -> "All $total recorder files loaded"
+                                    !ready && entries.size < targetVisible ->
+                                        "Waiting for stable Playback transport to load the requested page"
+                                    entries.size >= targetVisible -> "Scroll to bottom or tap LOAD NEXT 20"
+                                    else -> "Loading requested SSD filenames"
+                                }, modifier = Modifier.fillMaxWidth().padding(13.dp),
+                                    color = PlayerMuted, fontSize = 11.sp)
+                            }
+                        }
+                        HorizontalDivider(color = PlayerStroke)
+                        Row(Modifier.fillMaxWidth().padding(top = 7.dp),
+                            verticalAlignment = Alignment.CenterVertically) {
+                            Text("${shownFiles.size} / $total", color = PlayerMuted,
+                                fontSize = 11.sp, modifier = Modifier.weight(1f))
+                            if (targetVisible < total || entries.size < targetVisible) {
+                                val stalled = entries.size < targetVisible
+                                TextButton(
+                                    enabled = !loading && ready && verifiedMode,
+                                    onClick = {
+                                        if (stalled) {
+                                            // Explicit operator request permits ONE fresh
+                                            // GET batch at the same index; no automatic retry.
+                                            attemptedStarts = emptySet()
+                                            pageResumeGeneration++
+                                        } else {
+                                            targetVisible = minOf(targetVisible + 20, total)
+                                        }
+                                        android.util.Log.i("AtomRemoteMediaU0521",
+                                            "BROWSE_USER_NEXT20 stalled=$stalled target=$targetVisible " +
+                                                "loaded=${entries.size} noAutomaticRetry=true")
+                                    }
+                                ) {
+                                    Text(if (stalled) "RETRY CURRENT PAGE" else "LOAD NEXT 20",
+                                        color = PlayerMint, fontSize = 11.sp)
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+    }
+}
+
+@Composable
+private fun PlayerModeChoice(label: String, selected: Boolean, enabled: Boolean,
+                             onClick: () -> Unit, modifier: Modifier = Modifier) {
+    Surface(modifier = modifier.height(44.dp).clickable(enabled = enabled, onClick = onClick),
+        shape = RoundedCornerShape(12.dp),
+        color = if (selected) Color(0xFF0C3436) else Color(0xFF101C20),
+        border = BorderStroke(if (selected) 1.5.dp else 1.dp,
+            if (selected) PlayerMint else PlayerStroke)) {
+        Box(contentAlignment = Alignment.Center) {
+            Text(label, color = if (selected) Color.White else PlayerMuted, fontSize = 11.sp,
+                fontWeight = FontWeight.SemiBold)
+        }
+    }
+}
+
+// Vector-drawn rather than Unicode emoji: system emoji renderer cannot tint them yellow.
+@Composable
+private fun PlayerDockButton(kind: String, label: String, enabled: Boolean,
+                             modifier: Modifier = Modifier, onClick: () -> Unit) {
+    Column(modifier.clickable(enabled = enabled, onClick = onClick)
+        .padding(vertical = 3.dp), horizontalAlignment = Alignment.CenterHorizontally) {
+        val tint = if (enabled) Color.White else Color(0xFF64797D)
+        Canvas(Modifier.size(31.dp)) {
+            val w = size.width
+            val h = size.height
+            fun tri(x1: Float, y1: Float, x2: Float, y2: Float, x3: Float, y3: Float) {
+                val path = Path().apply {
+                    moveTo(x1, y1); lineTo(x2, y2); lineTo(x3, y3); close()
+                }
+                drawPath(path, color = tint)
+            }
+            drawCircle(if (kind == "record") Color(0xFFD74343) else Color(0xFF5D6870),
+                radius = w * 0.44f, center = Offset(w / 2, h / 2),
+                style = Stroke(width = w * 0.038f))
+            when (kind) {
+                "play" -> tri(w*.40f,h*.31f,w*.70f,h*.50f,w*.40f,h*.69f)
+                "pause" -> {
+                    drawRect(tint, Offset(w*.36f,h*.33f), Size(w*.10f,h*.34f))
+                    drawRect(tint, Offset(w*.55f,h*.33f), Size(w*.10f,h*.34f))
+                }
+                "prev" -> {
+                    drawRect(tint,Offset(w*.28f,h*.32f),Size(w*.065f,h*.36f))
+                    tri(w*.37f,h*.50f,w*.68f,h*.30f,w*.68f,h*.70f)
+                }
+                "next" -> {
+                    tri(w*.32f,h*.30f,w*.64f,h*.50f,w*.32f,h*.70f)
+                    drawRect(tint,Offset(w*.67f,h*.32f),Size(w*.065f,h*.36f))
+                }
+                "rewind" -> {
+                    tri(w*.29f,h*.50f,w*.50f,h*.33f,w*.50f,h*.67f)
+                    tri(w*.51f,h*.50f,w*.72f,h*.33f,w*.72f,h*.67f)
+                }
+                "forward" -> {
+                    tri(w*.28f,h*.33f,w*.49f,h*.50f,w*.28f,h*.67f)
+                    tri(w*.50f,h*.33f,w*.72f,h*.50f,w*.50f,h*.67f)
+                }
+                "record" -> drawCircle(Color(0xFFD74343), radius = w*.15f,
+                    center = Offset(w/2,h/2))
+            }
+        }
+        Spacer(Modifier.height(4.dp))
+        Text(label, color = if (enabled) Color.White else PlayerQuiet, fontSize = 8.sp,
+            fontWeight = FontWeight.Bold, maxLines = 1)
+    }
+}

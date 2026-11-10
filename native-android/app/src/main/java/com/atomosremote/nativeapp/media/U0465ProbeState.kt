@@ -4,6 +4,7 @@ package com.atomosremote.nativeapp.media
 data class U0465ProbeState(
     val name: String = "none",
     val opcode: Int? = null,
+    val requestLocal: Boolean = false, // U05.02: E0 vs E8 request-route correlation
     val generation: Long = 0L,
     val phase: String = "idle", // idle, waiting, rx, timeout, blocked
     val responseOpcode: Int? = null,

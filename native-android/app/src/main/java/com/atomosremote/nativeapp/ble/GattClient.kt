@@ -147,6 +147,28 @@ class GattClient(context: Context) {
     // U04.66: at most one explicitly tapped local E8 FileList GET each connected Media session.
     private var mediaU0466LocalFileListUsed = false
     private var mediaK016ModeStartAttempted = false
+    // U05.06: keep local-route mode start one-shot even if SSD UI evidence is reset.
+    private var mediaU0506E8ModeStartAttempted = false
+    private var mediaU0506ModeStartAtMs = 0L
+    // U05.07: genuine fresh, local 0x81FD with parsed MoviePicker=1 only.
+    // Published for a ViewModel-initiated, operator-confirmed one-shot flow.
+    // This does NOT change the GATT scheduler, packet parser, or recorder mode.
+    private val _mediaU0507ModeStartAckAtMs = MutableStateFlow(0L)
+    val mediaU0507ModeStartAckAtMs: StateFlow<Long> = _mediaU0507ModeStartAckAtMs
+    // U05.30: isolated, bounded MoviePicker re-entry used ONLY after a real
+    // FilePlay result=2 on a different recorder-backed clip. The ordinary
+    // one-shot MoviePicker admission, BLE transport and GATT scheduler stay frozen.
+    private var mediaU0530ReentryPilotUsed = false
+    private var mediaU0530ReentryValidated = false
+    private var mediaU0530ReentryAtMs = 0L
+    private var mediaU0530ReentryIndex = -1
+    private val _mediaU0530PickerAckAtMs = MutableStateFlow(0L)
+    val mediaU0530PickerAckAtMs: StateFlow<Long> = _mediaU0530PickerAckAtMs
+    // U05.32: Static macOS FastForwardRewindSet 0x019C (float signed speed).
+    // AG2 behavior UNKNOWN. Operator-confirmed per-direction one-shot only.
+    // This is NOT called from connection bootstrap, scrolling, or clip select.
+    private var mediaU0532ShuttleUsedMask = 0
+    private var mediaU0532ShuttleLastMs = 0L
     private var mediaU02Generation = 0L
     /** K011: manual read-only General.MediaStateGet evidence. */
     private var mediaK011GetQueued = false
@@ -565,6 +587,7 @@ class GattClient(context: Context) {
     // AtomRemote pairing/PacketLink command. The negotiated value is used
     // only to assess whether a full 0x8644 page can physically fit in one read.
     private var outputR21MtuRequested = false
+    @Volatile
     private var outputR21MtuBytes = 23  // default ATT MTU until callback proves otherwise
     private var outputR21MtuResult = "not-requested"
     // TCS19.12.17.10 LOW LEVEL PLINK EPOCH GUARD
@@ -7906,6 +7929,10 @@ private fun b0123TryEmbedOneShot(desired: Int): Boolean {
      * This method issues NO recorder RemoteApi command and NO pairing write.
      */
     @SuppressLint("MissingPermission")
+    /** U05.12 read-only snapshot of the existing connection-scoped ATT MTU.
+     * Does not mutate GATT, PacketLink, pairing, or queue ownership. */
+    fun mediaU0512NegotiatedMtu(): Int = outputR21MtuBytes
+
     fun requestR21OutputPageMtu(): Boolean {
         val live = gatt ?: return false
         // R22: queue eligibility is connection-scoped. R21 incorrectly required
@@ -10338,18 +10365,31 @@ private fun b0123TryEmbedOneShot(desired: Int): Boolean {
     /** U04.59: macOS FileBrowser.ModeStart = 0x01FD with ModeMsg(mode=MoviePicker=1). */
     @SuppressLint("MissingPermission")
     fun mediaK016RequestModeStartOnce(): Boolean {
-        if (mediaK016ModeStartAttempted) return false
+        if (mediaK016ModeStartAttempted || mediaU0506E8ModeStartAttempted) {
+            android.util.Log.w("AtomRemoteMediaU0506", "E8_MODESTART_BLOCK alreadyAttempted=true noTx=true")
+            return false
+        }
         val proto = com.atomosremote.nativeapp.media.U0459FileBrowserWire.startMoviePicker()
         if (!mediaU0459Gate(proto.size)) return false
         val packet = PendingRemotePacket(
             body = buildOfficialAtomMessageBodyWithProtoPayload(0, 0x01FD, proto),
-            purpose = "media-u0459-filebrowser-mode-start",
-            label = "U0459.FileBrowser.ModeStart.MoviePicker",
+            purpose = "media-u0506-e8-moviepicker-mode-start",
+            label = "U0506.FileBrowser.ModeStart.MoviePicker.E8_MANUAL",
             commandId = 0x01FD, packetId = 0, expectedResponseId = null
         )
-        val queued = queueRemotePacket18_8(packet, local = false)
-        if (queued) mediaK016ModeStartAttempted = true
-        android.util.Log.i("AtomRemoteMediaU0459", "MODE_START queued=$queued opcode=0x01FD proto=${proto.toHex()} route=E0 responseUnverified=true")
+        // U05.06: E0 was physically delivered on U05.05 yet fresh E8 ModeGet
+        // still returned NONE (0). Only manual opt-in sends the same known 0x01FD
+        // MoviePicker mode request as a local E8 candidate. No auto TX/retry.
+        // Mac outgoing route remains unverified; ModeGet readback is the authority.
+        val queued = queueRemotePacket18_8(packet, local = true)
+        if (queued) {
+            mediaK016ModeStartAttempted = true
+            mediaU0506E8ModeStartAttempted = true
+            mediaU0506ModeStartAtMs = android.os.SystemClock.elapsedRealtime()
+        }
+        android.util.Log.i("AtomRemoteMediaU0506",
+            "E8_MODESTART_QUEUE queued=$queued opcode=0x01FD proto=${proto.toHex()} " +
+            "route=E8 packetId=0 noAutoRetry=true recorderConfirmed=false")
         return queued
     }
 
@@ -10390,14 +10430,26 @@ private fun b0123TryEmbedOneShot(desired: Int): Boolean {
 
     /** One explicit, page-scoped FileListGet. No automatic retry and no FilePlay. */
     @SuppressLint("MissingPermission")
-    fun mediaK01RequestFileListGetOnce(startIndex: Int = 0, localRoute: Boolean = false): Boolean {
+    fun mediaK01RequestFileListGetOnce(startIndex: Int = 0, localRoute: Boolean = false, countOverride: Int? = null): Boolean {
         val state = _mediaSsdFileListState.value
-        // U04.66: allow exactly one manually triggered read-only local E8 route A/B probe.
-        // Previous E0 path remains unchanged; no automatic retry and no FilePlay.
+        // U05.13: local E8 start=0 remains one-shot. Continuation is admitted ONLY
+        // after a REAL decoded previous page, sequential index, MoviePicker=1,
+        // one-file count, and existing one-shot authorization for this session.
+        // Never change the E0 behavior or allow out-of-order/automatic retries.
+        val nextExpectedIndex = state.entries.maxOfOrNull { it.index }?.plus(1)
+        val verifiedE8Continuation = localRoute && startIndex > 0 &&
+            mediaU0466LocalFileListUsed && state.recorderValidated &&
+            state.modeReadback == 1 && countOverride == 1 &&
+            nextExpectedIndex == startIndex &&
+            (state.totalFiles == null || startIndex < state.totalFiles)
         if (startIndex !in 0..1_000_000 || state.pending || mediaU0459PageRequests >= 128 ||
-            (localRoute && (startIndex != 0 || mediaU0466LocalFileListUsed))) return false
-        // A QueryCountLimitMsg has not yet been observed; default to conservative count=1.
-        val count = (state.pageCountLimit ?: com.atomosremote.nativeapp.media.U0459FileBrowserWire.DEFAULT_UNVERIFIED_COUNT)
+            (localRoute && if (startIndex == 0) mediaU0466LocalFileListUsed else !verifiedE8Continuation)) return false
+        // U05.11: The live 0x81FB response in U05.10 declared 353 bytes but GATT
+        // delivered only 65 application bytes. This operator-confirmed one-file
+        // GET is deliberately bounded to reduce the response below the observed
+        // read size. It is a diagnosis, NOT automatic pagination or a SET.
+        if (countOverride != null && countOverride !in 1..com.atomosremote.nativeapp.media.U0459FileBrowserWire.MAX_PAGE_LIMIT) return false
+        val count = countOverride ?: (state.pageCountLimit ?: com.atomosremote.nativeapp.media.U0459FileBrowserWire.DEFAULT_UNVERIFIED_COUNT)
             .coerceIn(1, com.atomosremote.nativeapp.media.U0459FileBrowserWire.MAX_PAGE_LIMIT)
         val proto = com.atomosremote.nativeapp.media.U0459FileBrowserWire.fileListQuery(startIndex, count)
         if (!mediaU0459Gate(proto.size)) return false
@@ -10414,7 +10466,7 @@ private fun b0123TryEmbedOneShot(desired: Int): Boolean {
         if (!queued) return false
         if (localRoute) {
             mediaU0466LocalFileListUsed = true
-            android.util.Log.i("AtomRemoteMediaU0466", "LOCAL_E8_PILOT_QUEUED opcode=0x01FB packetId=$packetId count=$count manual=true oneShot=true")
+            android.util.Log.i("AtomRemoteMediaU0466", "LOCAL_E8_PILOT_QUEUED opcode=0x01FB packetId=$packetId start=$startIndex count=$count manual=true oneShotPerPage=true")
         }
         mediaU0459PageRequests++
         mediaU0459ListPacketId = packetId
@@ -10422,8 +10474,95 @@ private fun b0123TryEmbedOneShot(desired: Int): Boolean {
         mediaK016ListWindowOpenedAtMs = android.os.SystemClock.elapsedRealtime()
         mediaU02Generation++
         _mediaSsdFileListState.value = state.copy(
-            status = "Loading recorder page from SSD (15s evidence window)",
+            status = "Loading recorder page from SSD (45s evidence window)",
             requestedStartIndex = startIndex,
+            pending = true, generation = mediaU02Generation,
+            localApplicationRx = 0, nonLocalApplicationRx = 0, fileListOpcodeRx = 0,
+            lastApplicationOpcode = null
+        )
+        return true
+    }
+
+    /**
+     * U05.03 bounded Mac-static FileList GET candidate: x86_64 caller passes
+     * (start=0,count=0,forward=1,infoType=3). Sends ONLY on explicit manual
+     * U05.01 guided action, after fresh 0x81F7 and 0x81F6. One attempt per
+     * connection session. Never repeats the existing 8/2 GET automatically.
+     */
+    @SuppressLint("MissingPermission")
+    fun mediaU0503RequestMacStaticRootOnce(): Boolean {
+        val state = _mediaSsdFileListState.value
+        if (state.pending || mediaU0459PageRequests >= 128 || mediaU0466LocalFileListUsed) {
+            android.util.Log.w("AtomRemoteMediaU0503", "ROOT_GET_BLOCKED reason=used-or-pending noTx=true")
+            return false
+        }
+        val proto = com.atomosremote.nativeapp.media.U0459FileBrowserWire.macStaticRootCandidate()
+        if (!mediaU0459Gate(proto.size)) return false
+        val packetId = 0
+        val packet = PendingRemotePacket(
+            body = buildOfficialAtomMessageBodyWithProtoPayload(packetId, 0x01FB, proto),
+            purpose = "media-u0503-mac-root-filelist-get-once",
+            label = "U0503.FileBrowser.MacStaticRootGet.LOCAL_E8",
+            commandId = 0x01FB, packetId = packetId, expectedResponseId = null
+        )
+        val queued = queueRemotePacket18_8(packet, local = true)
+        android.util.Log.i("AtomRemoteMediaU0503",
+            "MAC_ROOT_LIST_QUEUE queued=$queued opcode=0x01FB start=0 count=0 forward=1 infoType=3 " +
+            "route=E8 packetId=0 proto=${proto.toHex()} manual=true oneShot=true noSet=true")
+        if (!queued) return false
+        mediaU0466LocalFileListUsed = true
+        mediaU0459PageRequests++
+        mediaU0459ListPacketId = packetId
+        mediaU04LocalRoute = true
+        mediaK016ListWindowOpenedAtMs = android.os.SystemClock.elapsedRealtime()
+        mediaU02Generation++
+        _mediaSsdFileListState.value = state.copy(
+            status = "Mac static FileList GET sent (0/0/1/3). Awaiting real response (45s max).",
+            requestedStartIndex = 0,
+            pending = true, generation = mediaU02Generation,
+            localApplicationRx = 0, nonLocalApplicationRx = 0, fileListOpcodeRx = 0,
+            lastApplicationOpcode = null
+        )
+        return true
+    }
+
+    /**
+     * U05.04: Mac dynamic pagination path includes infoType=0 and pageSize-derived
+     * count. Candidate: start=0,count=8,forward=1,infoType=0 on local E8.
+     * Only callable after live 0x81F7 + 0x81F6 + ModeGet 0x81FF / field1=1.
+     * This is a NEW one-shot, read-only candidate, NOT an observed Mac TX.
+     */
+    @SuppressLint("MissingPermission")
+    fun mediaU0504RequestMacDynamicNamePageOnce(): Boolean {
+        val state = _mediaSsdFileListState.value
+        if (state.pending || mediaU0459PageRequests >= 128 || mediaU0466LocalFileListUsed) {
+            android.util.Log.w("AtomRemoteMediaU0504", "NAME_PAGE_BLOCKED already-used-or-pending noTx=true")
+            return false
+        }
+        val proto = com.atomosremote.nativeapp.media.U0459FileBrowserWire.fileListQuery(
+            0, 8, com.atomosremote.nativeapp.media.U0459FileBrowserWire.INFO_FILE_NAME_ONLY)
+        if (!mediaU0459Gate(proto.size)) return false
+        val packetId = 0
+        val packet = PendingRemotePacket(
+            body = buildOfficialAtomMessageBodyWithProtoPayload(packetId, 0x01FB, proto),
+            purpose = "media-u0504-dynamic-name-only-page0-once",
+            label = "U0504.FileBrowser.NameOnlyPage0.LOCAL_E8",
+            commandId = 0x01FB, packetId = packetId, expectedResponseId = null
+        )
+        val queued = queueRemotePacket18_8(packet, local = true)
+        android.util.Log.i("AtomRemoteMediaU0504",
+            "NAME_PAGE_QUEUE queued=$queued opcode=0x01FB start=0 count=8 forward=1 infoType=0 route=E8 packetId=0 " +
+            "proto=${proto.toHex()} manual=true oneShot=true noSet=true")
+        if (!queued) return false
+        mediaU0466LocalFileListUsed = true
+        mediaU0459PageRequests++
+        mediaU0459ListPacketId = packetId
+        mediaU04LocalRoute = true
+        mediaK016ListWindowOpenedAtMs = android.os.SystemClock.elapsedRealtime()
+        mediaU02Generation++
+        _mediaSsdFileListState.value = state.copy(
+            status = "U05.04 name-only page 0 GET sent. Awaiting real 0x81FB (45s maximum).",
+            requestedStartIndex = 0,
             pending = true, generation = mediaU02Generation,
             localApplicationRx = 0, nonLocalApplicationRx = 0, fileListOpcodeRx = 0,
             lastApplicationOpcode = null
@@ -10455,6 +10594,280 @@ private fun b0123TryEmbedOneShot(desired: Int): Boolean {
         return queued
     }
 
+    // U05.16: isolated E8 FilePlay pilot. This does not modify legacy E0 FilePlay,
+    // PacketLink scheduling, BLE pairing or any existing transport command.
+    private var mediaU0516PlayAtMs = 0L
+    private var mediaU0516PlayIndex = -1
+
+    // U05.27: Mac x86_64 static: ForceFilePlay 0x0201 shares the index
+    // request constructor with FilePlay 0x01FC (0x10007F690 vs 0x10007F4F0).
+    // Physical AG2 support is UNKNOWN until a single operator-confirmed pilot.
+    private var mediaU0527RejectedIndex = -1
+    private var mediaU0527RejectedAtMs = 0L
+    private var mediaU0527ForceAtMs = 0L
+    private var mediaU0527ForceIndex = -1
+    private var mediaU0527ForcePilotUsed = false
+    private var mediaU0527ForceValidated = false
+
+    fun mediaU0527IsForceFilePlayValidated(): Boolean = mediaU0527ForceValidated
+
+    @SuppressLint("MissingPermission")
+    fun mediaU0516PlaySelectedFileE8(index: Int): Boolean {
+        val now = android.os.SystemClock.elapsedRealtime()
+        val state = _mediaSsdFileListState.value
+        if (!state.recorderValidated || state.modeReadback != 1 || state.pending ||
+            !state.entries.any { it.index == index } || index !in 0..1_000_000 ||
+            (mediaU0516PlayAtMs != 0L && now - mediaU0516PlayAtMs in 0L..10_000L)) {
+            android.util.Log.w("AtomRemoteMediaU0516", "FILEPLAY_E8_BLOCK index=$index reason=mode-list-or-inflight noTx=true")
+            return false
+        }
+        val proto = com.atomosremote.nativeapp.media.U0459FileBrowserWire.playFileIndex(index)
+        if (!mediaU0459Gate(proto.size)) return false
+        // E8 FileBrowser replies use recorder-assigned packet IDs (U05.12/U05.14).
+        val packet = PendingRemotePacket(
+            body = buildOfficialAtomMessageBodyWithProtoPayload(0, 0x01FC, proto),
+            purpose = "media-u0516-fileplay-e8:$index", label = "U0516.FileBrowser.FilePlay.E8",
+            commandId = 0x01FC, packetId = 0, expectedResponseId = null
+        )
+        val queued = queueRemotePacket18_8(packet, local = true)
+        if (queued) {
+            mediaU0516PlayAtMs = now
+            mediaU0516PlayIndex = index
+            _mediaSsdFileListState.value = state.copy(
+                status = "Selected clip $index requested via E8; waiting for recorder FileResult")
+        }
+        android.util.Log.i("AtomRemoteMediaU0516", "FILEPLAY_E8_TX index=$index queued=$queued route=E8 opcode=0x01FC packetId=0 proto=${proto.toHex()} confirmed=false noRetry=true")
+        return queued
+    }
+
+    /**
+     * U05.27 explicit Mac ForceFilePlay pilot. One live result=2 prerequisite,
+     * one operator-confirmed attempt ONLY until real 0x8201 result=0 verifies it.
+     * When verified, subsequently selected clips may use this route, serially.
+     * Never sends 0x0201 from FileList, transport, reconnect, or on its own.
+     * No scheduler, packet framing, BLE pairing or remote command changes.
+     */
+    @SuppressLint("MissingPermission")
+    fun mediaU0527ForceSelectedFileE8(index: Int, explicitPilot: Boolean): Boolean {
+        val now = android.os.SystemClock.elapsedRealtime()
+        val page = _mediaSsdFileListState.value
+        val pilotAllowed = explicitPilot && !mediaU0527ForcePilotUsed &&
+            !mediaU0527ForceValidated && mediaU0527RejectedIndex == index &&
+            mediaU0527RejectedAtMs != 0L && now - mediaU0527RejectedAtMs in 0L..60_000L
+        val validatedAllowed = !explicitPilot && mediaU0527ForceValidated
+        if ((!pilotAllowed && !validatedAllowed) || page.pending ||
+            !page.recorderValidated || page.modeReadback != 1 ||
+            !page.entries.any { it.index == index } ||
+            (mediaU0527ForceAtMs != 0L && now - mediaU0527ForceAtMs in 0L..10_000L) ||
+            mediaU0516PlayIndex != -1) {
+            android.util.Log.w("AtomRemoteMediaU0527",
+                "FORCE_GATE_BLOCK index=$index explicit=$explicitPilot validated=$mediaU0527ForceValidated noTx=true")
+            return false
+        }
+        val proto = com.atomosremote.nativeapp.media.U0459FileBrowserWire.playFileIndex(index)
+        if (!mediaU0459Gate(proto.size)) return false
+        val packet = PendingRemotePacket(
+            body = buildOfficialAtomMessageBodyWithProtoPayload(0, 0x0201, proto),
+            purpose = "media-u0527-force-fileplay:$index",
+            label = "U0527.FileBrowser.ForceFilePlay.E8",
+            commandId = 0x0201, packetId = 0, expectedResponseId = null
+        )
+        val queued = queueRemotePacket18_8(packet, local = true)
+        if (queued) {
+            if (explicitPilot) mediaU0527ForcePilotUsed = true
+            mediaU0527ForceAtMs = now
+            mediaU0527ForceIndex = index
+            _mediaSsdFileListState.value = page.copy(
+                status = "Recorder ForceFilePlay pending for clip $index; ACK unverified")
+        }
+        android.util.Log.i("AtomRemoteMediaU0527", "FORCEPLAY_E8_TX index=$index queued=$queued " +
+            "opcode=0x0201 route=E8 proto=${proto.toHex()} pilot=$explicitPilot noRetry=true")
+        return queued
+    }
+
+    /**
+     * U05.31 direct clip-switch admission, grounded by U0530_RESULTS:
+     * 7 fresh 0x81FD mode=1 and 8 FilePlay result=0. For a new, recorder-
+     * backed clip, re-enter MoviePicker BEFORE FilePlay, avoiding the known
+     * normal-first result=2. One request per user selection, no auto retries.
+     * Existing U05.30 per-session validation remains ACK-gated.
+     * Never use this path on boot, Record, or after connection loss.
+     */
+    /**
+     * U05.32 Mac static FF/REW PILOT, not AG2-verified.
+     * Original universal Mac 0x100085960 builds command 0x019C,
+     * expected response 0x0190, from signed float speed -1..1;
+     * callsite 0x100068c38 uses speed table signed by direction.
+     * protobuf field-1 fixed32 is inferred from PlayFastForwardRewindMsg
+     * layout, NOT proven by an AG2 RX. One operator-confirmed TX per
+     * direction per trusted session, with no auto retry or mode change.
+     */
+
+    /**
+     * U05.45 | ADDITIVE MEDIA-ONLY FF/REW CANDIDATE. Mac U05.44 static evidence:
+     * FastForwardRewindSet opcode 0x019B, expectedMacReply 0x0190,
+     * PlayFastForwardRewindMsg._mode, FF-side 2/3, REW-side 0/1.
+     * Field-one varint is still a CANDIDATE, NOT measured BLE wire bytes.
+     * Explicit manual start per tap, with a cooldown. No automatic retry or timer-driven TX.
+     * Does not change existing GATT transport, PacketLink, GETs, or U05.32.
+     */
+    private var mediaU0546LastFfRewStartMs = 0L
+
+    @SuppressLint("MissingPermission")
+    fun mediaU0545FastForwardRewindSetPilot(direction: Int): Boolean {
+        val mode = when (direction) {
+            -1 -> 0 // REW-side initial mode candidate
+             1 -> 2 // FF-side initial mode candidate
+            else -> return false
+        }
+        val page = _mediaSsdFileListState.value
+        val now = android.os.SystemClock.elapsedRealtime()
+        // U05.51: AG2 can play its own first SSD clip without a FilePlay ACK.
+        // Permit the existing manual 0x019B command only after a fresh verified
+        // Playback MoviePicker/list, with NO foreign/unknown active clip index.
+        val activeMatchesList = page.activeIndex == null ||
+            page.entries.any { it.index == page.activeIndex }
+        if (page.pending || !page.recorderValidated || page.entries.isEmpty() ||
+            page.modeReadback != 1 || !activeMatchesList ||
+            !_tcsRemoteState.value.available || !_tcsPairingState.value.acceptWritten) {
+            android.util.Log.w("AtomRemoteMediaU0545",
+                "FFREW_BLOCK direction=$direction mode=$mode gate=active-or-mode " +
+                    "active=${page.activeIndex} modeReadback=${page.modeReadback} noTx=true")
+            return false
+        }
+        // Inferred protobuf field #1 enum/varint. Especially mode=0 presence
+        // is NOT verified from a Mac live capture. Never claim AG2 acceptance.
+        val candidateProto = byteArrayOf(0x08, mode.toByte())
+        // U05.46: prevent rapid accidental repeated starts while keeping FF and REW
+        // available after the existing PLAY stop. Does not invent an FF/REW release.
+        if (mediaU0546LastFfRewStartMs > 0L &&
+            now - mediaU0546LastFfRewStartMs < 1_500L) {
+            android.util.Log.w("AtomRemoteMediaU0546",
+                "SHUTTLE_COOLDOWN direction=$direction noTx=true")
+            return false
+        }
+        if (!mediaU0459Gate(candidateProto.size)) {
+            android.util.Log.w("AtomRemoteMediaU0545",
+                "FFREW_TRANSPORT_BLOCK mode=$mode noTx=true")
+            return false
+        }
+        val packet = PendingRemotePacket(
+            body = buildOfficialAtomMessageBodyWithProtoPayload(0, 0x019B, candidateProto),
+            purpose = "media-u0545-ffrew-manual-pilot:$mode",
+            label = "U0545.Mac.FastForwardRewindSet.CANDIDATE",
+            commandId = 0x019B, packetId = 0, expectedResponseId = null
+        )
+        val queued = queueRemotePacket18_8(packet, local = true)
+        if (queued) mediaU0546LastFfRewStartMs = now
+        android.util.Log.i("AtomRemoteMediaU0545",
+            "FFREW_PILOT_BUFFER direction=$direction mode=$mode queued=$queued " +
+                "cmd=0x019B expectedMac=0x0190 proto=${candidateProto.toHex()} route=E8 " +
+                "manualRepeatable=true cooldownMs=1500 bufferNotPhysicalWrite=true ag2AckUnverified=true noRetry=true")
+        return queued
+    }
+
+    @SuppressLint("MissingPermission")
+    fun mediaU0532ShuttleSpeedPilot(direction: Int): Boolean {
+        if (direction != -1 && direction != 1) return false
+        val page = _mediaSsdFileListState.value
+        val now = android.os.SystemClock.elapsedRealtime()
+        val bit = if (direction < 0) 1 else 2
+        if (mediaU0532ShuttleUsedMask and bit != 0 ||
+            now - mediaU0532ShuttleLastMs < 3_000L || page.pending ||
+            !page.recorderValidated || page.modeReadback != 1 ||
+            page.activeIndex == null || !page.entries.any { it.index == page.activeIndex } ||
+            !_tcsRemoteState.value.available) {
+            android.util.Log.w("AtomRemoteMediaU0532", "SHUTTLE_BLOCK direction=$direction " +
+                "usedMask=$mediaU0532ShuttleUsedMask active=${page.activeIndex} noTx=true")
+            return false
+        }
+        // SwiftProtobuf PlayFastForwardRewindMsg single float field (candidate).
+        // Mac generated code uses signed speed in [-1,1], not a 2x speed.
+        val proto = java.nio.ByteBuffer.allocate(5)
+            .order(java.nio.ByteOrder.LITTLE_ENDIAN)
+            .put(0x0D.toByte()).putFloat(if (direction > 0) 1f else -1f).array()
+        if (!mediaU0459Gate(proto.size)) return false
+        val packet = PendingRemotePacket(
+            body = buildOfficialAtomMessageBodyWithProtoPayload(0, 0x019C, proto),
+            purpose = "media-u0532-shuttle-pilot:$direction",
+            label = "U0532.Mac.FastForwardRewindSet.PILOT",
+            commandId = 0x019C, packetId = 0, expectedResponseId = null
+        )
+        val queued = queueRemotePacket18_8(packet, local = true)
+        if (queued) {
+            mediaU0532ShuttleUsedMask = mediaU0532ShuttleUsedMask or bit
+            mediaU0532ShuttleLastMs = now
+        }
+        android.util.Log.i("AtomRemoteMediaU0532", "SHUTTLE_PILOT_TX direction=$direction " +
+            "queued=$queued cmd=0x019C expectedMac=0x0190 speed=${if (direction > 0) "+1" else "-1"} " +
+            "proto=${proto.toHex()} route=E8 staticMac=true ag2AckUnverified=true noRetry=true")
+        return queued
+    }
+
+    @SuppressLint("MissingPermission")
+    fun mediaU0530ReopenMoviePickerForClip(index: Int): Boolean {
+        val now = android.os.SystemClock.elapsedRealtime()
+        val page = _mediaSsdFileListState.value
+        // U05.31: recorder-confirmed prior-session sequence allows the FIRST
+        // changed clip to re-enter MoviePicker directly, after one ACTIVE clip
+        // exists and mode=1 is recorder-validated. Still requires fresh live
+        // 0x81FD + 0x81FC result=0 to authorize Play in THIS session.
+        val pilot = !mediaU0530ReentryValidated && !mediaU0530ReentryPilotUsed &&
+            page.activeIndex != null && page.activeIndex != index &&
+            page.modeReadback == 1 && page.recorderValidated
+        val validated = mediaU0530ReentryValidated
+        if ((!pilot && !validated) || page.pending || !page.recorderValidated ||
+            page.modeReadback != 1 || page.activeIndex == null || page.activeIndex == index ||
+            !page.entries.any { it.index == index } ||
+            (mediaU0516PlayIndex != -1 && now - mediaU0516PlayAtMs in 0L..10_000L) ||
+            (mediaU0530ReentryAtMs > 0L && now - mediaU0530ReentryAtMs in 0L..10_000L)) {
+            android.util.Log.w("AtomRemoteMediaU0530", "PICKER_REENTER_BLOCK index=$index " +
+                "pilot=$pilot validated=$validated active=${page.activeIndex} noTx=true")
+            return false
+        }
+        val proto = com.atomosremote.nativeapp.media.U0459FileBrowserWire.startMoviePicker()
+        if (!mediaU0459Gate(proto.size)) return false
+        val packet = PendingRemotePacket(
+            body = buildOfficialAtomMessageBodyWithProtoPayload(0, 0x01FD, proto),
+            purpose = "media-u0530-reopen-picker-for-clip:$index",
+            label = "U0530.FileBrowser.MoviePickerReentry.E8",
+            commandId = 0x01FD, packetId = 0, expectedResponseId = null
+        )
+        val queued = queueRemotePacket18_8(packet, local = true)
+        if (queued) {
+            if (pilot) mediaU0530ReentryPilotUsed = true
+            mediaU0530ReentryAtMs = now
+            mediaU0530ReentryIndex = index
+            _mediaU0530PickerAckAtMs.value = 0L
+            _mediaSsdFileListState.value = page.copy(
+                status = "MoviePicker re-entry pending for clip $index; recorder ACK required")
+        }
+        android.util.Log.i("AtomRemoteMediaU0530",
+            "PICKER_REENTER_TX index=$index queued=$queued pilot=$pilot validated=$validated directFirst=true " +
+                "opcode=0x01FD proto=${proto.toHex()} route=E8 noRetry=true")
+        return queued
+    }
+
+    /** Only the ACK for THIS re-entry + subsequent real FilePlay result=0 validates. */
+    fun mediaU0530MarkReentryValidated(index: Int): Boolean {
+        val page = _mediaSsdFileListState.value
+        val permitted = mediaU0530ReentryIndex == index &&
+            _mediaU0530PickerAckAtMs.value > 0L && page.activeIndex == index &&
+            page.status.startsWith("Recorder FilePlay ACK for")
+        if (permitted) mediaU0530ReentryValidated = true
+        android.util.Log.i("AtomRemoteMediaU0530",
+            "REENTRY_VALIDATE index=$index success=$permitted active=${page.activeIndex} " +
+                "noRecorderTx=true")
+        return permitted
+    }
+
+    fun mediaU0530PickerReentryValidated(): Boolean = mediaU0530ReentryValidated
+
+    fun mediaU0530DisableValidatedReentry(reason: String) {
+        mediaU0530ReentryValidated = false
+        android.util.Log.w("AtomRemoteMediaU0530", "REENTRY_DISABLED reason=$reason noTx=true")
+    }
+
     private fun mediaU0459NextId(): Int {
         tcsCommandSequence = if (tcsCommandSequence >= 255) 1 else tcsCommandSequence + 1
         return tcsCommandSequence
@@ -10482,11 +10895,12 @@ private fun b0123TryEmbedOneShot(desired: Int): Boolean {
      * 0x01F4: inferred only (CurrentIndexGet), advanced opt-in UI.
      */
     @SuppressLint("MissingPermission")
-    fun mediaU0465ManualGetOnce(name: String): Boolean {
+    fun mediaU0465ManualGetOnce(name: String, localRoute: Boolean = false): Boolean {
         val opcode = when (name) {
             "dir-info" -> 0x01F8
             "media-change" -> 0x04C3
             "current-index-inferred" -> 0x01F4
+            "mode-get" -> 0x01FF // Existing ModeGet wrapper; verify MoviePicker before FileList.
             else -> return false
         }
         val previous = _mediaU0465ProbeState.value
@@ -10505,14 +10919,14 @@ private fun b0123TryEmbedOneShot(desired: Int): Boolean {
             label = "U0465.FileBrowser.Get.$name",
             commandId = opcode, packetId = 0, expectedResponseId = null
         )
-        val queued = queueRemotePacket18_8(packet, local = false)
+        val queued = queueRemotePacket18_8(packet, local = localRoute)
         android.util.Log.i("AtomRemoteMediaU0465",
-            "GET_QUEUE name=$name opcode=0x${opcode.toString(16)} packetId=0 route=E0 queued=$queued expectedRxUnverified=true source=${if (name == "current-index-inferred") "inferred" else "mac-static"}")
+            "GET_QUEUE name=$name opcode=0x${opcode.toString(16)} packetId=0 route=${if (localRoute) "E8" else "E0"} queued=$queued expectedRxUnverified=true source=${if (name == "current-index-inferred") "inferred" else "mac-static"}")
         if (queued) {
             mediaU0465Consumed.add(name)
             mediaU0465OpenedAtMs = android.os.SystemClock.elapsedRealtime()
             _mediaU0465ProbeState.value = previous.copy(
-                name = name, opcode = opcode, generation = previous.generation + 1,
+                name = name, opcode = opcode, requestLocal = localRoute, generation = previous.generation + 1,
                 phase = "waiting", responseOpcode = null, responsePacketId = null,
                 responseLocal = null, responseHex = "", lastRawAtomMessages = emptyList(),
                 consumedNames = mediaU0465Consumed.toList(),
@@ -10528,9 +10942,16 @@ private fun b0123TryEmbedOneShot(desired: Int): Boolean {
         if (state.phase != "waiting" || mediaU0465OpenedAtMs == 0L) return
         val age = android.os.SystemClock.elapsedRealtime() - mediaU0465OpenedAtMs
         if (age !in 0L..15_000L) return
-        val isMatch = packetId == 0 && !local && ((opcode and 0x7FFF) == state.opcode)
+        // U05.01: Mac GET request and response opcodes differ for directory/index.
+        // The old normalized-equals-request check rejected legitimate 0x81F7/0x81F6.
+        val isMatch = if (state.opcode == 0x01F8 || state.opcode == 0x01F4 || state.opcode == 0x01FF) {
+            com.atomosremote.nativeapp.media.U0501MacRxContract.matches(
+                state.opcode ?: -1, opcode, packetId, local, state.requestLocal)
+        } else {
+            local == state.requestLocal && (!local || packetId == 0) && ((opcode and 0x7FFF) == state.opcode)
+        }
         val sample = "pkt=$packetId opcode=0x${opcode.toString(16)} route=${if (local) "E8" else "E0"} bytes=${data.size} hex=${data.toHex().take(128)}"
-        android.util.Log.i("AtomRemoteMediaU0465", "GET_WINDOW_RX name=${state.name} ageMs=$age match=$isMatch $sample")
+        android.util.Log.i("AtomRemoteMediaU0465", "GET_WINDOW_RX name=${state.name} ageMs=$age match=$isMatch expected=${com.atomosremote.nativeapp.media.U0501MacRxContract.expectedResponse(state.opcode ?: -1)?.let { "0x" + it.toString(16) } ?: "legacy"} $sample")
         _mediaU0465ProbeState.value = state.copy(
             lastRawAtomMessages = (state.lastRawAtomMessages + sample).takeLast(6),
             phase = if (isMatch) "rx" else "waiting",
@@ -10541,6 +10962,27 @@ private fun b0123TryEmbedOneShot(desired: Int): Boolean {
             status = if (isMatch) "Matching complete application RX captured (raw only; decoder still unverified)"
                 else "Unrelated application RX observed; target reply still pending"
         )
+        // U05.14: the guided GET-only chain used U0465 for E8 0x01FF/0x81FF,
+        // while the FileList continuation guard consults SsdBrowserState.modeReadback.
+        // The old U0459 ModeGet handler only admitted its *own* packetId and
+        // therefore did not publish the U0465 ModeGet result into that state.
+        // Synchronize ONLY a real, correlated E8 ModeGet reply in its live RX
+        // window. Never infer mode from Playback UI, 0x81FD alone, or old events.
+        if (isMatch && state.name == "mode-get" && state.opcode == 0x01FF &&
+            state.requestLocal && local && opcode == 0x81FF) {
+            val observedMode = com.atomosremote.nativeapp.media.U0459FileBrowserWire.parseMode(data)
+            if (observedMode in 0..2) {
+                val before = _mediaSsdFileListState.value
+                _mediaSsdFileListState.value = before.copy(modeReadback = observedMode)
+                android.util.Log.i("AtomRemoteMediaU0514",
+                    "MODE_READBACK_SYNC source=correlated-E8-0x81FF mode=$observedMode " +
+                    "packetId=$packetId probeGeneration=${state.generation} " +
+                    "fileEntries=${before.entries.size} noTx=true")
+            } else {
+                android.util.Log.w("AtomRemoteMediaU0514",
+                    "MODE_READBACK_REJECT unparsed body=${data.toHex().take(96)} noTx=true")
+            }
+        }
         if (isMatch) mediaU0465OpenedAtMs = 0L
     }
 
@@ -10559,21 +11001,85 @@ private fun b0123TryEmbedOneShot(desired: Int): Boolean {
 
     /** The only U04.59 receive hook, called from the existing AtomMessage demultiplexer. */
     private fun mediaU0459OnApplicationRx(packetId: Int, opcode: Int, local: Boolean, body: ByteArray) {
-        val state = _mediaSsdFileListState.value
         val normalized = opcode and 0x7FFF
+        // U05.06 passive correlation ONLY. No synthetic ACK or mode state update.
+        // A recorder-assigned E8 RX packet ID is not expected to equal request ID 0.
+        if (mediaU0506ModeStartAtMs != 0L) {
+            val age = android.os.SystemClock.elapsedRealtime() - mediaU0506ModeStartAtMs
+            if (age in 0L..12000L && local && (normalized == 0x01FD || opcode == 0xFFFF)) {
+                val modeCandidate = if (normalized == 0x01FD)
+                    com.atomosremote.nativeapp.media.U0459FileBrowserWire.parseMode(body) else null
+                android.util.Log.i("AtomRemoteMediaU0506",
+                    "E8_MODESTART_RX_OBSERVED opcode=0x${opcode.toString(16)} packetId=$packetId " +
+                    "ageMs=$age body=${body.toHex().take(96)} modeCandidate=$modeCandidate " +
+                    "unclassifiedFFFF=${opcode == 0xFFFF} modeGetStillRequired=true")
+                if (normalized == 0x01FD && modeCandidate == 1 &&
+                    age <= 10000L && _mediaU0507ModeStartAckAtMs.value == 0L) {
+                    _mediaU0507ModeStartAckAtMs.value = android.os.SystemClock.elapsedRealtime()
+                    android.util.Log.i("AtomRemoteMediaU0507",
+                        "MODESTART_E8_ACK_VERIFIED mode=1 local=true opcode=0x81FD " +
+                        "rxPacketId=$packetId ageMs=$age followupTxFromRx=false")
+                }
+            }
+            if (age > 12000L) mediaU0506ModeStartAtMs = 0L
+        }
+        // U05.30: fresh 0x81FD ACK only from this re-entry window, never
+        // from the original U05.07 MoviePicker request or an unrelated packet.
+        if (local && normalized == 0x01FD && mediaU0530ReentryIndex >= 0 &&
+            mediaU0530ReentryAtMs > 0L) {
+            val age = android.os.SystemClock.elapsedRealtime() - mediaU0530ReentryAtMs
+            if (age in 0L..10_000L) {
+                val mode = com.atomosremote.nativeapp.media.U0459FileBrowserWire.parseMode(body)
+                if (mode == 1) {
+                    _mediaU0530PickerAckAtMs.value = android.os.SystemClock.elapsedRealtime()
+                    mediaU0530ReentryAtMs = 0L // ACK closes in-flight gate; next clip may switch promptly.
+                    android.util.Log.i("AtomRemoteMediaU0530",
+                        "PICKER_REENTER_ACK index=$mediaU0530ReentryIndex mode=1 " +
+                            "opcode=0x81FD ageMs=$age rxPacketId=$packetId " +
+                            "noFilePlayFromRx=true")
+                } else {
+                    android.util.Log.w("AtomRemoteMediaU0530",
+                        "PICKER_REENTER_UNCONFIRMED mode=$mode index=$mediaU0530ReentryIndex noFollowupTx=true")
+                }
+            }
+        }
+        // U04.98: passive live QueryCountLimit observation only. Never TX 0x0202.
+        // Exact Mac witness (12,16,8) is accepted only from real BLE application RX.
+        if (opcode == 0x8202 && local &&
+            body.contentEquals(byteArrayOf(0x08, 0x0C, 0x10, 0x10, 0x18, 0x08))) {
+            val before = _mediaSsdFileListState.value
+            _mediaSsdFileListState.value = before.copy(pageCountLimit = 8)
+            android.util.Log.i("AtomRemoteMediaU0498", "LIVE_QUERY_LIMIT_RX opcode=0x8202 countCombined=8 live=true noTx=true")
+        }
+        val state = _mediaSsdFileListState.value
         if (state.pending && mediaK016ListWindowOpenedAtMs != 0L &&
-            android.os.SystemClock.elapsedRealtime() - mediaK016ListWindowOpenedAtMs in 0L..15_000L) {
+            android.os.SystemClock.elapsedRealtime() - mediaK016ListWindowOpenedAtMs in 0L..45_000L) {
             _mediaSsdFileListState.value = state.copy(
                 localApplicationRx = state.localApplicationRx + if (local) 1 else 0,
                 nonLocalApplicationRx = state.nonLocalApplicationRx + if (local) 0 else 1,
                 fileListOpcodeRx = state.fileListOpcodeRx + if (normalized == 0x01FB) 1 else 0,
                 lastApplicationOpcode = opcode
             )
+            if (opcode == 0xFFFF && local == mediaU04LocalRoute) {
+                // 0xFFFF also appears outside FileList requests. Temporal association
+                // is not an authenticated NACK or matched response packet ID.
+                android.util.Log.w("AtomRemoteMediaU0503",
+                    "UNCLASSIFIED_0xFFFF_DURING_LIST packetId=$packetId " +
+                    "requestRoute=${if (mediaU04LocalRoute) "E8" else "E0"} " +
+                    "ageMs=${android.os.SystemClock.elapsedRealtime() - mediaK016ListWindowOpenedAtMs} " +
+                    "payloadBytes=${body.size} possibleErrorNotProven=true")
+            }
             if (normalized == 0x01FB) {
                 android.util.Log.i("AtomRemoteMediaU0459", "LIST_RX opcode=0x${opcode.toString(16)} pkt=$packetId expected=$mediaU0459ListPacketId route=${if (local) "E8" else "E0"} bytes=${body.size}")
                 // U04.66: correlate to the route actually selected for this ONE request.
                 // Never accept a cross-route or unrelated AtomMessage as FileList evidence.
-                if (packetId == mediaU0459ListPacketId && local == mediaU04LocalRoute) {
+                // U05.02: live E8 replies can carry a recorder-assigned packet ID.
+                // Witness: E8 InputSource GET pkt=0, RX 0x8064 pkt=156.
+                // Strict pkt ID remains required for E0. For E8 require one pending
+                // request, same route/opcode and current 45s window (all checked above).
+                val fileListCorrelated = local == mediaU04LocalRoute &&
+                    (if (local) true else packetId == mediaU0459ListPacketId)
+                if (fileListCorrelated) {
                     val parsed = com.atomosremote.nativeapp.media.U0459FileBrowserWire.parseFileList(
                         body, state.requestedStartIndex)
                     if (parsed != null) {
@@ -10587,9 +11093,66 @@ private fun b0123TryEmbedOneShot(desired: Int): Boolean {
                             status = "Live FileList reply decoded: ${combined.size} recorder filenames"
                         )
                         mediaK016ListWindowOpenedAtMs = 0L
-                        android.util.Log.i("AtomRemoteMediaU0459", "LIST_DECODE_OK entries=${parsed.entries.size} accumulated=${combined.size} total=${parsed.total} correlated=true")
+                        android.util.Log.i("AtomRemoteMediaU0459", "LIST_DECODE_OK entries=${parsed.entries.size} accumulated=${combined.size} total=${parsed.total} correlatedBy=${if (local) "E8-route-opcode-window" else "E0-packetId-route-opcode-window"} rxPacketId=$packetId")
                     } else android.util.Log.w("AtomRemoteMediaU0459", "LIST_DECODE_REJECT opcode=0x${opcode.toString(16)} bytes=${body.size} - no synthetic rows")
                 }
+            }
+        }
+        // U05.16: correlate only fresh E8 FilePlay results to the operator's
+        // selected recorder-backed filename. Never synthesize success.
+        if (normalized == 0x01FC && local && mediaU0516PlayIndex >= 0 &&
+            mediaU0516PlayAtMs != 0L &&
+            android.os.SystemClock.elapsedRealtime() - mediaU0516PlayAtMs in 0L..10_000L) {
+            val result = com.atomosremote.nativeapp.media.U0459FileBrowserWire.parseFileResult(body)
+            val index = mediaU0516PlayIndex
+            val before = _mediaSsdFileListState.value
+            _mediaSsdFileListState.value = when (result) {
+                0 -> before.copy(activeIndex = index,
+                    status = "Recorder FilePlay ACK for ${before.entries.firstOrNull { it.index == index }?.filename ?: index}")
+                1 -> before.copy(status = "Recorder FilePlay loading clip $index; not confirmed yet")
+                else -> before.copy(status = "Recorder FilePlay returned ${result ?: "unparsed"}; active clip unchanged")
+            }
+            android.util.Log.i("AtomRemoteMediaU0516", "FILEPLAY_E8_RX index=$index response=0x${opcode.toString(16)} packetId=$packetId result=$result live=true")
+            if (result == 2) {
+                mediaU0527RejectedIndex = index
+                mediaU0527RejectedAtMs = android.os.SystemClock.elapsedRealtime()
+            } else if (result == 0) {
+                mediaU0527RejectedIndex = -1
+                mediaU0527RejectedAtMs = 0L
+            }
+            if (result != 1) {
+                mediaU0516PlayIndex = -1
+                mediaU0516PlayAtMs = 0L
+            }
+        }
+        // U05.27: only a correlated, current ForceFilePlay 0x8201 result
+        // may change activeIndex or arm the validated session path.
+        if (normalized == 0x0201 && local && mediaU0527ForceIndex >= 0 &&
+            mediaU0527ForceAtMs != 0L &&
+            android.os.SystemClock.elapsedRealtime() - mediaU0527ForceAtMs in 0L..10_000L) {
+            val result = com.atomosremote.nativeapp.media.U0459FileBrowserWire.parseFileResult(body)
+            val index = mediaU0527ForceIndex
+            val before = _mediaSsdFileListState.value
+            when (result) {
+                0 -> {
+                    mediaU0527ForceValidated = true
+                    _mediaSsdFileListState.value = before.copy(activeIndex = index,
+                        status = "Recorder ForceFilePlay ACK for ${before.entries.firstOrNull { it.index == index }?.filename ?: index}")
+                }
+                1 -> _mediaSsdFileListState.value = before.copy(
+                    status = "Recorder ForceFilePlay loading clip $index; waiting for final result")
+                else -> {
+                    // A rejected Force command must never keep automatic Force enabled.
+                    mediaU0527ForceValidated = false
+                    _mediaSsdFileListState.value = before.copy(
+                        status = "Recorder ForceFilePlay returned ${result ?: "unparsed"}; active clip unchanged")
+                }
+            }
+            android.util.Log.i("AtomRemoteMediaU0527",
+                "FORCEPLAY_E8_RX index=$index opcode=0x${opcode.toString(16)} result=$result validated=$mediaU0527ForceValidated")
+            if (result != 1) {
+                mediaU0527ForceIndex = -1
+                mediaU0527ForceAtMs = 0L
             }
         }
         if (normalized == 0x01FC && packetId == mediaU0459PlayPacketId && mediaU0459PlayPacketId != -1) {
@@ -10625,7 +11188,7 @@ private fun b0123TryEmbedOneShot(desired: Int): Boolean {
             mediaK016ListWindowOpenedAtMs = 0L
             _mediaSsdFileListState.value = state.copy(
                 pending = false,
-                status = "No matching FileList application reply in 15 seconds; SSD still contains files, list unavailable"
+                status = "No matching FileList application reply in 45 seconds; SSD contents not confirmed by this request"
             )
             android.util.Log.w("AtomRemoteMediaU0459", "LIST_TIMEOUT packetId=$mediaU0459ListPacketId generation=$generation localRX=${state.localApplicationRx} nonlocalRX=${state.nonLocalApplicationRx} opcodeRX=${state.fileListOpcodeRx}")
         }
@@ -10636,9 +11199,28 @@ private fun b0123TryEmbedOneShot(desired: Int): Boolean {
         mediaU0459ListPacketId = -1
         mediaU0459PlayPacketId = -1
         mediaU0459PageRequests = 0
+        // Clear only new isolated ForceFilePlay pilot state at new browser session.
+        mediaU0527RejectedIndex = -1
+        mediaU0527RejectedAtMs = 0L
+        mediaU0527ForceAtMs = 0L
+        mediaU0527ForceIndex = -1
+        mediaU0527ForcePilotUsed = false
+        mediaU0527ForceValidated = false
+        mediaU0532ShuttleUsedMask = 0
+        mediaU0532ShuttleLastMs = 0L
+        mediaU0530ReentryPilotUsed = false
+        mediaU0530ReentryValidated = false
+        mediaU0530ReentryAtMs = 0L
+        mediaU0530ReentryIndex = -1
+        _mediaU0530PickerAckAtMs.value = 0L
         mediaU0466LocalFileListUsed = false
         mediaU0459FilenameSizeAttempted = false
         mediaK016ModeStartAttempted = false
+        // U05.21: reset E8 one-shot latches and stale ACK on a fresh session.
+        // No recorder TX or PacketLink/pairing change occurs here.
+        mediaU0506E8ModeStartAttempted = false
+        mediaU0506ModeStartAtMs = 0L
+        _mediaU0507ModeStartAckAtMs.value = 0L
         mediaU0465OpenedAtMs = 0L
         mediaU0465Consumed.clear()
         _mediaU0465ProbeState.value = com.atomosremote.nativeapp.media.U0465ProbeState()

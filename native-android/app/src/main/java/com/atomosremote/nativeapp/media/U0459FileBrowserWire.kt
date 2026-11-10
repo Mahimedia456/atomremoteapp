@@ -21,10 +21,11 @@ object U0459FileBrowserWire {
     const val INFO_MOVIE_ONLY = 1
     const val INFO_FILE_NAME_AND_MOVIE = 2
     const val MODE_MOVIE_PICKER = 1
-    // U04.74: original macOS FileBrowserController defaults m_maxFilesPerQuery to 4
-    // (x86_64 0x100022483 / 0x1000226D6). A dynamic response may change it.
-    // This is a read-only page-size candidate, NOT recorder capability proof.
-    const val DEFAULT_UNVERIFIED_COUNT = 4
+    // U04.98: Mac successful RX = 97 entries in 13 pages (fits 8/page);
+    // observed Mac 0x8202 protobuf limits=12,16,8, with 8 a combined-type candidate.
+    // Original controller starts with 4 before negotiation; using 8 here is an
+    // operator-confirmed GET experiment, NOT proof of a recorder-required count.
+    const val DEFAULT_UNVERIFIED_COUNT = 8
     const val MAX_PAGE_LIMIT = 64
 
     private fun putVarint(out: MutableList<Byte>, input: Int) {
@@ -56,6 +57,19 @@ object U0459FileBrowserWire {
             putField(this, 4, infoType)
         }.toByteArray()
     }
+
+    /**
+     * U05.03: Separate Mac x86_64 constructor call 0x10002335C..0x10002336A
+     * passes 0,0,1,3 to FileList builder 0x10007F140. This is a GET
+     * candidate, NOT a captured Mac BLE write, nor confirmed AG2 behavior.
+     * Keep this isolated from normal page request (count >= 1, infoType <= 2).
+     */
+    fun macStaticRootCandidate(): ByteArray = buildList<Byte> {
+        putField(this, 1, 0)  // start
+        putField(this, 2, 0)  // count: special Mac static call, not a page
+        putField(this, 3, 1)  // forward
+        putField(this, 4, 3)  // infoType: special Mac static call
+    }.toByteArray()
 
     /** Mac ModeStart constructor takes mode=1, resumePrevMovie=false.
      *  U04.67 explicitly serializes field 2=false; AG2 response unverified.
@@ -118,6 +132,10 @@ object U0459FileBrowserWire {
     /** Only call with a live, packet-correlated recorder application response. */
     fun parseFileList(body: ByteArray, requestedStart: Int): FileListPage? = try {
         val fields = fields(body)
+        // U05.11: Live AG2 RX at 05:52:48.978 establishes this ACTUAL shape:
+        //   08 61 = field 1 varint total=97; 12 29 = field 2 FileInfo bytes.
+        // The earlier U05.09 static-inventory interpretation was inverted.
+        // Strict validation remains: never render truncated/synthetic rows.
         val totals = fields.filter { it.id == 1 && it.wire == 0 }
         val entries = fields.filter { it.id == 2 && it.wire == 2 }
         val starts = fields.filter { it.id == 3 && it.wire == 0 }
